@@ -1,0 +1,14 @@
+# generated songs
+output/
+*.wav
+*.json
+
+# sample library (not distributed) — keep the empty folder
+samples/*
+!samples/.gitkeep
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
