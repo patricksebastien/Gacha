@@ -30,12 +30,14 @@ from PySide6.QtCore import (QEvent, QPoint, Qt, QRectF, QSettings, QThread,
 from PySide6.QtGui import (QColor, QFont, QFontDatabase, QImage, QKeySequence,
                            QPainter, QRegularExpressionValidator, QShortcut)
 from PySide6.QtCore import QRegularExpression
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+from PySide6.QtMultimedia import (QAudioOutput, QMediaDevices, QMediaPlayer,
+                                  QVideoSink)
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QPlainTextEdit, QPushButton, QSlider, QSpinBox, QStyle,
+    QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox,
+    QStyle,
     QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
     QWidget,
 )
@@ -44,6 +46,7 @@ from gacha_gl import (BLEND_MODES, FrameHistory, GLBackdrop, gl_available,
                       shader_files)
 from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES, WORDS,
                           sample_name)
+from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
 
 BASE = Path(__file__).parent
 GACHA = BASE / "gacha_engine.py"
@@ -753,6 +756,14 @@ class Main(QMainWindow):
         self.hide_timer = QTimer(self)
         self.hide_timer.setSingleShot(True)
         self.hide_timer.timeout.connect(self._hide_ui)
+        # live mode: an audio input and a tap-tempo clock stand in for the
+        # song's loudness envelope and section map
+        self.live = LiveInput(self)
+        self.tempo = TapTempo()
+        self._live_timer = QTimer(self)             # level meter refresh
+        self._live_timer.timeout.connect(self._update_live_meter)
+        self._media_devices = QMediaDevices(self)
+        self._media_devices.audioInputsChanged.connect(self._refresh_live_devices)
 
         # ---------- parameters panel ----------
         params_box = self._build_params()
@@ -885,6 +896,15 @@ class Main(QMainWindow):
             sc.setContext(Qt.ApplicationShortcut)
             sc.activated.connect(lambda n=n: self.select_shader_key(n))
             self.digit_shortcuts.append(sc)
+        # live mode: T taps the tempo, D restarts the bar, L toggles the mode
+        self.live_shortcuts = []
+        for key, slot in ((Qt.Key_T, self.tap_tempo), (Qt.Key_D, self.live_downbeat),
+                          (Qt.Key_L, lambda: self.live_on.toggle()),
+                          (Qt.Key_X, self.live_drop_key)):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ApplicationShortcut)
+            sc.activated.connect(slot)
+            self.live_shortcuts.append(sc)
 
         self.refresh_lists()
 
@@ -920,6 +940,53 @@ class Main(QMainWindow):
             "an ordinary section boundary swaps it about one time in three "
             "after 16 quiet bars.")
         form.addRow("", self.video_switch)
+
+        self.live_on = QCheckBox("live: an audio input drives the effects "
+                                 "instead of a song (L)")
+        self.live_on.setToolTip(
+            "VJ mode. Loudness comes from the chosen input (a mic, a line "
+            "in, or on PipeWire/Pulse a monitor of what the machine plays) "
+            "and the beat from tap tempo: press T on the beat four times, "
+            "starting on the one. D restarts the bar on the current tempo. "
+            "Every 8 bars count as a section for the look, shader and clip "
+            "changes. Turning a song on switches live off.")
+        self.live_on.toggled.connect(self._toggle_live)
+        form.addRow("Live input", self.live_on)
+        self.live_device = QComboBox()
+        self.live_device.setToolTip("Capture device; the list follows what "
+                                    "the system offers")
+        self.live_level = QProgressBar()
+        self.live_level.setRange(0, 100)
+        self.live_level.setTextVisible(False)
+        self.live_level.setFixedHeight(10)
+        self.live_level.setToolTip("Normalised loudness, what the effects see")
+        form.addRow("", self._row([("device", self.live_device),
+                                   ("level", self.live_level)]))
+        self.live_bpm = QDoubleSpinBox(minimum=40.0, maximum=240.0,
+                                       singleStep=1.0, decimals=1, suffix=" bpm")
+        self.live_bpm.setValue(self.tempo.bpm)
+        self.live_bpm.setToolTip("Tempo of the live clock; tapping sets it")
+        self.live_bpm.valueChanged.connect(self._live_bpm_edited)
+        tap_btn = QPushButton("Tap (T)")
+        tap_btn.setToolTip("Tap on the beat, four or more times, the first "
+                           "one on the downbeat")
+        tap_btn.clicked.connect(self.tap_tempo)
+        down_btn = QPushButton("Downbeat (D)")
+        down_btn.setToolTip("Restart the bar now, keeping the tempo")
+        down_btn.clicked.connect(self.live_downbeat)
+        form.addRow("", self._row([("tempo", self.live_bpm), ("", tap_btn),
+                                   ("", down_btn)]))
+        self.live_auto = QCheckBox("auto: tempo, beat and root note from the audio")
+        self.live_auto.setChecked(True)
+        self.live_auto.setToolTip(
+            "Listens along: the tempo and beat phase from the onsets (kicks "
+            "first), the root note from a running chroma for the tint. Needs "
+            "about 4 s of music. Tapping T switches this off and follows "
+            "your taps instead; X marks a drop by hand and restarts the bar.")
+        self.live_status = QLabel("")
+        self.live_status.setProperty("role", "sub")
+        form.addRow("", self._row([("", self.live_auto), ("", self.live_status)]))
+        self._refresh_live_devices()
 
         self.auto_hide = QCheckBox("hide the interface when a song starts, "
                                    "and again after")
@@ -981,7 +1048,7 @@ class Main(QMainWindow):
             form.addRow(title, self._row([(labels[k], self.vfx[k])
                                           for k in keys]))
         hint = QLabel("strength 0 = off; driven by the song's sections and "
-                      "loudness")
+                      "loudness, or by the live input and tap tempo")
         hint.setProperty("role", "sub")
         form.addRow("", hint)
         return self._wrap(form, self._randomize_video)
@@ -1754,6 +1821,146 @@ class Main(QMainWindow):
         """Double-click in the Videos tab: loop that clip right now."""
         self.backdrop.set_video(Path(path))
 
+    # ---------- live input (VJ mode) ----------
+    LIVE_SECTION_BARS = 8       # bars per pseudo-section on the live clock
+    # the analyzer's loudness-based drop detector is off: on rendered songs
+    # it found 4 drops in 22 and fired falsely every 30-60 s. X marks drops.
+    LIVE_AUTO_DROPS = False
+
+    def _live_active(self):
+        return self.live_on.isChecked() and self.live.running
+
+    def _refresh_live_devices(self):
+        """Fill the device combo, keeping the current pick when it survives."""
+        cur = self.live_device.currentText()
+        self.live_device.blockSignals(True)
+        self.live_device.clear()
+        for name, dev in audio_inputs():
+            self.live_device.addItem(name, dev)
+        if cur:
+            i = self.live_device.findText(cur)
+            if i >= 0:
+                self.live_device.setCurrentIndex(i)
+        self.live_device.blockSignals(False)
+
+    def _toggle_live(self, on):
+        """Live mode on: the song stops and its analysis is dropped, the
+        input opens, the clock restarts on a downbeat and the clip is
+        re-picked as for a new song. Off: capture closes, songs work again."""
+        self._sec_idx = -1
+        if on:
+            self.player.stop()
+            self._sections, self._sec_bounds, self._env = [], [], None
+            self._outro, self._song_word = None, None
+            err = self.live.start(self.live_device.currentData())
+            if err:
+                self.log.appendPlainText(f"live: {err}")
+                self.live_on.setChecked(False)
+                return
+            self.tempo.downbeat()
+            self._live_drop_t = None        # monotonic time of the last drop
+            self._live_switch_t = time.monotonic()   # last clip switch
+            self._last_beat_sync = None     # analyzer beat already applied
+            self._last_auto_drop = None
+            self._pick_song_video()
+            self._look_idx = None
+            if self.shader.currentText() == "off" and not self._shader_user_off:
+                self.shader.setCurrentText(self._prev_shader_choice)
+            self._live_timer.start(50)
+            self.log.appendPlainText(
+                f"live: on, {self.live.device_name}, {self.tempo.bpm:.1f} bpm. "
+                "Tap T on the beat, D restarts the bar, L switches off")
+            if self.auto_hide.isChecked():
+                self._hide_ui()
+        else:
+            self._live_timer.stop()
+            if self.live.running:
+                self.live.stop()
+                self.log.appendPlainText("live: off")
+            self.live_level.setValue(0)
+            self._arm_hide()
+
+    def _update_live_meter(self):
+        self.live_level.setValue(int(100 * self.live.loud))
+        an = self.live.analyzer
+        if an is not None and self.live_auto.isChecked():
+            bpm = f"{an.bpm:.0f} bpm" if an.bpm else "listening..."
+            key = NOTE_NAMES[an.root] if an.root >= 0 else "-"
+            self.live_status.setText(f"{bpm}, root {key}")
+        else:
+            self.live_status.setText(f"{self.tempo.bpm:.0f} bpm, tapped")
+
+    def _follow_analyzer(self, now):
+        """Auto mode: pull the clock toward the analyzer's tempo and beat
+        each time it has a new estimate, and take its drops."""
+        an = self.live.analyzer
+        if an is None:
+            return
+        if an.bpm and an.beat_time is not None \
+                and an.beat_time != self._last_beat_sync:
+            self._last_beat_sync = an.beat_time
+            self.tempo.align(an.bpm, an.beat_time)
+            self.live_bpm.blockSignals(True)
+            self.live_bpm.setValue(self.tempo.bpm)
+            self.live_bpm.blockSignals(False)
+        if self.LIVE_AUTO_DROPS and an.drop_time is not None \
+                and an.drop_time != self._last_auto_drop:
+            self._last_auto_drop = an.drop_time
+            self._live_drop(an.drop_time)
+
+    def live_drop_key(self):
+        """X: a drop, by hand, on the one."""
+        if self._live_active():
+            self._live_drop(time.monotonic())
+
+    def _live_drop(self, t):
+        """A drop at monotonic time t: the flash and the shaders' iDrop, the
+        bar restarts there (drops land on the one), and as in a song the
+        clip may switch, or jumps. The restart also counts as a new section,
+        so the look and the shader roll again."""
+        self._live_drop_t = t
+        self.tempo.downbeat(t)
+        bars_since = (t - self._live_switch_t) / (4 * self.tempo.beat_ms / 1000)
+        if self.video_switch.isChecked() and len(self._song_videos()) > 1 \
+                and bars_since >= 4:
+            self.backdrop.pick_random()
+            self._live_switch_t = t
+        elif self.video_jump.isChecked():
+            self.backdrop.jump()
+
+    def _live_bpm_edited(self, bpm):
+        self.tempo.set_bpm(bpm)
+
+    def tap_tempo(self):
+        """T: one tap on the beat. The first tap of a series is the downbeat,
+        the intervals set the tempo (shown in the spinbox)."""
+        if self.live_auto.isChecked():
+            self.live_auto.setChecked(False)
+            self.log.appendPlainText("live: auto off, following your taps")
+        n = self.tempo.tap()
+        if n >= 2:
+            self.live_bpm.blockSignals(True)
+            self.live_bpm.setValue(self.tempo.bpm)
+            self.live_bpm.blockSignals(False)
+
+    def live_downbeat(self):
+        """D: the bar starts now, tempo unchanged."""
+        self.tempo.downbeat()
+
+    def _on_live_section(self, idx, pos):
+        """The live clock crossed into pseudo-section idx: swap the clip
+        now and then (as a song does on quiet section boundaries) or jump."""
+        if idx == 0:
+            return                      # the clip was just picked
+        now = time.monotonic()
+        bars_since = (now - self._live_switch_t) / (4 * self.tempo.beat_ms / 1000)
+        if self.video_switch.isChecked() and len(self._song_videos()) > 1 \
+                and bars_since >= 16 and random.random() < 0.35:
+            self.backdrop.pick_random()
+            self._live_switch_t = now
+        elif self.video_jump.isChecked():
+            self.backdrop.jump()
+
     def _pick_song_video(self):
         """A new song starts: one ticked video plays as is, several pick a
         random one (a different one than now when possible)."""
@@ -1940,23 +2147,45 @@ class Main(QMainWindow):
         return max(0.0, 1.0 - (pos - start) / max(1.0, end - start))
 
     def _video_state(self):
-        """Effect state for the frame being drawn, from the playhead."""
-        if self.player.playbackState() != QMediaPlayer.PlayingState:
-            return None
-        pos = self.player.position()
-        fade = self._outro_fade(pos)
+        """Effect state for the frame being drawn, from the playhead: the
+        song's, or in live mode the tap-tempo clock with the input's loudness."""
+        live = self._live_active()
+        if live:
+            now = time.monotonic()
+            if self.live_auto.isChecked():
+                self._follow_analyzer(now)
+            pos = self.tempo.pos_ms(now)
+            fade = 1.0
+            env = self.live.loud
+            beat_ms = self.tempo.beat_ms
+        else:
+            if self.player.playbackState() != QMediaPlayer.PlayingState:
+                return None
+            pos = self.player.position()
+            fade = self._outro_fade(pos)
+            beat_ms = self._beat_ms
+            env = 0.5
+            if self._env is not None and len(self._env):
+                env = float(self._env[min(len(self._env) - 1, int(pos // 50))])
         v = {k: sp.value() for k, sp in self.vfx.items()}
-        env = 0.5
-        if self._env is not None and len(self._env):
-            env = float(self._env[min(len(self._env) - 1, int(pos // 50))])
         idx, sec, kind = 0, None, "groove"
-        if self._sections and self._sec_bounds:
+        sec_start_ms = 0
+        if live:
+            # no section map: every 8 bars count as a section, so the look,
+            # the shader and the clip keep changing the way they do in a song
+            sec_len = self.LIVE_SECTION_BARS * 4 * beat_ms
+            idx = int(pos // sec_len)
+            sec_start_ms = idx * sec_len
+            if idx != self._sec_idx:
+                self._sec_idx = idx
+                self._on_live_section(idx, pos)
+        elif self._sections and self._sec_bounds:
             idx = max(0, bisect.bisect_right(self._sec_bounds, pos) - 1)
             sec = self._sections[idx]
             kind = sec["kind"]
+            sec_start_ms = self._sec_bounds[idx]
         # bars counted from the section's own first bar, so phrases line up
-        sec_start_ms = self._sec_bounds[idx] if self._sec_bounds else 0
-        bar_i = int(max(0, pos - sec_start_ms) // (4 * self._beat_ms))
+        bar_i = int(max(0, pos - sec_start_ms) // (4 * beat_ms))
         self._roll_look(idx, bar_i // 4)
         lk = lambda k: v[k] * self._look.get(k, 1.0)     # strength x look
 
@@ -1965,16 +2194,37 @@ class Main(QMainWindow):
         root = sec.get("root") if sec is not None else None
         total_ms = self._sections[-1]["end_sec"] * 1000 if self._sections else 0
         drop = 0.0
-        if sec is not None and sec.get("transition"):
+        drop_age = None                       # ms since a live drop
+        if live:
+            an = self.live.analyzer
+            if self.live_auto.isChecked() and an is not None and an.root >= 0:
+                root = NOTE_NAMES[an.root]
+            if self._live_drop_t is not None:
+                drop_age = (now - self._live_drop_t) * 1000.0
+                drop = max(0.0, 1 - drop_age / 400.0)
+        elif sec is not None and sec.get("transition"):
             drop = max(0.0, 1 - (pos - self._sec_bounds[idx]) / 400.0)
         st = {"music": {
-            "loud": env, "beat": (pos % self._beat_ms) / self._beat_ms,
-            "bar": (pos % (4 * self._beat_ms)) / (4 * self._beat_ms),
-            "bpm": 60000.0 / self._beat_ms, "section": sec_id,
+            "loud": env, "beat": (pos % beat_ms) / beat_ms,
+            "bar": (pos % (4 * beat_ms)) / (4 * beat_ms),
+            "bpm": 60000.0 / beat_ms, "section": sec_id,
             "root": int(round(NOTE_HUES[root] * 12)) if root in NOTE_HUES else -1,
-            "drop": drop, "song_pos": pos / total_ms if total_ms else 0.0}}
+            "drop": drop,
+            # live: no song to be a fraction of; a slow 5-minute loop keeps
+            # the shaders that age with it (vhs) moving
+            "song_pos": (pos / 300000.0) % 1.0 if live
+            else pos / total_ms if total_ms else 0.0}}
         if v["pump"]:
             st["brightness"] = 0.7 + 0.7 * v["pump"] * env
+        if live:
+            # the song-side colour moves, on the live clock's pseudo-sections
+            if v["color"]:
+                st["hue"] = v["color"] * ((idx * 0.37) % 1.0) * 0.5
+                st["saturation"] = 1 + 0.5 * v["color"]
+            if lk("tint") and root in NOTE_HUES:
+                st["tint"] = (NOTE_HUES[root], 0.6 * lk("tint"))
+            if v["flash"] and drop_age is not None and drop_age < 120 * v["flash"]:
+                st["invert"] = True            # the drop hits
         if sec is not None:
             if v["color"]:
                 st["hue"] = v["color"] * ((idx * 0.37) % 1.0) * 0.5
@@ -2035,7 +2285,7 @@ class Main(QMainWindow):
             if nxt < len(self._sections):           # cymbal swell: rewind into
                 for t in self._sections[nxt].get("transition", []):   # the drop
                     if t.startswith("cymbal:"):
-                        length = float(t[7:].rstrip("bar")) * 4 * self._beat_ms
+                        length = float(t[7:].rstrip("bar")) * 4 * beat_ms
                         left = self._sec_bounds[nxt] - pos
                         if 0 <= left < length:
                             st["reverse"] = 1.0 + 2.0 * (1 - left / length)
@@ -2046,9 +2296,9 @@ class Main(QMainWindow):
         if self._words_phrase == self._look_idx:
             # a new cloud every half beat (1/8 of a bar): new words, new
             # places; loudness sets how many words and how bright
-            phrase_ms = 16 * self._beat_ms
+            phrase_ms = 16 * beat_ms
             t_in = (pos - sec_start_ms) - (bar_i // 4) * phrase_ms
-            slot = int(t_in // (self._beat_ms / 2))
+            slot = int(t_in // (beat_ms / 2))
             if slot != self._words_slot:
                 self._words_slot = slot
                 sec_d = sec if sec is not None else {}
@@ -2063,8 +2313,8 @@ class Main(QMainWindow):
                 self.backdrop.set_overlay(make_word_cloud(
                     self.backdrop.size(), words, self.font_families, rng, hue, n,
                     frame_palette(frame, rng)))
-            edge = min(1.0, t_in / (0.2 * self._beat_ms),
-                       (phrase_ms - t_in) / (0.2 * self._beat_ms))
+            edge = min(1.0, t_in / (0.2 * beat_ms),
+                       (phrase_ms - t_in) / (0.2 * beat_ms))
             st["words"] = min(1.0, max(0.0, edge) * (0.6 + 0.6 * env)
                               * min(1.0, 0.5 + self.vfx["words"].value()))
         if fade < 1.0:                                 # outro: fade to black
@@ -2083,6 +2333,8 @@ class Main(QMainWindow):
         self._play_path(item.data(Qt.UserRole))
 
     def _play_path(self, path):
+        if self.live_on.isChecked():
+            self.live_on.setChecked(False)          # a song takes over
         self._segment = None
         self._load_sections(path)
         self._shader_on_for_song()
@@ -2117,18 +2369,21 @@ class Main(QMainWindow):
             self._arm_hide()                # song over, paused or stopped: show
 
     # ---------- auto-hide of the interface ----------
+    def _visuals_running(self):
+        """A song is playing or live mode is on: the effects are moving."""
+        return self.player.playbackState() == QMediaPlayer.PlayingState \
+            or self._live_active()
+
     def _arm_hide(self, *_):
         """(Re)start the idle timer while playing; otherwise show the UI."""
-        playing = self.player.playbackState() == QMediaPlayer.PlayingState
-        if playing and self.auto_hide.isChecked():
+        if self._visuals_running() and self.auto_hide.isChecked():
             self.hide_timer.start(int(self.hide_after.value() * 1000))
         else:
             self.hide_timer.stop()
             self._show_ui()
 
     def _hide_ui(self, force=False):
-        if force or (self.player.playbackState() == QMediaPlayer.PlayingState
-                     and self.auto_hide.isChecked()):
+        if force or (self._visuals_running() and self.auto_hide.isChecked()):
             self._travel = 0
             self._last_mouse = None
             self.ui.hide()
@@ -2204,6 +2459,7 @@ class Main(QMainWindow):
     def closeEvent(self, event):
         self._show_ui()                         # never leave the cursor hidden
         self.player.stop()
+        self.live.stop()
         if self.worker and self.worker.isRunning():
             self.worker.wait(2000)
         event.accept()
