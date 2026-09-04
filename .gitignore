@@ -7,8 +7,15 @@ output/
 samples/*
 !samples/.gitkeep
 
+# backdrop videos: only the stock clip ships with the repo
+videos/*
+!videos/gacha.mp4
+
 # python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# fonts: binaries not distributed (license + readme still tracked)
+fonts/*.ttf
