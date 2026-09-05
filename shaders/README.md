@@ -57,5 +57,5 @@ give `iDrop` a moment.
 | `slitscan.frag` | slit-scan sweeping once per bar, freezing motion into streaks |
 | `sparks.frag` | tiny particles born on bright spots, drifting up and fading |
 | `thermal.frag` | thermal camera palette with animated iso-lines |
-| `vhs.frag` | worn VHS: tracking wobble, chroma bleed, dropouts on the beat |
+| `vhs.frag` | worn VHS over the whole frame: a tracking band rolling the full height every 2 bars, frame roll, wobble, chroma bleed, dropouts on the beat |
 | `warp.frag` | the picture melted by noise, ripped apart on a drop |

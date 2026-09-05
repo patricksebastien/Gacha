@@ -94,7 +94,7 @@ Everything about the backdrop lives in the **Video** tab of the parameter panel:
 | Tone | **mono** grayscale where each section rolls its tone count: smooth gray, or black and white at a random threshold, or 3, 4, 6 or 8 tones, with strength setting how often the hard tones win. **solarize**, **edges**, **scanlines**. |
 | Grain | **grain**. |
 | Motion | **zoom** punches in with loudness. **trails** bright parts linger. **glitch** horizontal tears, more when loud, a few bands at a time. Each section picks a flavour: thin sharp lines of 0.4 to 1% of the frame height, medium bands of 4 to 14%, or anything from 4% up to 38% slabs. **rgb shift** chromatic aberration pulsing with loudness. **reverse** rewind: now and then a 4-bar phrase runs a bar or two backwards, and a reverse cymbal swell rewinds the picture faster and faster into the drop. The player cannot play backwards, so the backdrop keeps the last 5 seconds of frames at half size and steps through them. |
-| Frame | **vignette**. **kaleido** upright kaleidoscope with 4, 6 or 8 mirrored segments; strength is how often a section gets it. **words** now and then a 4-bar phrase fills the screen with a cloud of random words in mixed sizes, opacities and fonts, including the song's own name; strength is how often. Fonts are the `.ttf` files in `fonts/` (open-licensed terminal-style monospace faces ship with the repo, drop in your own). |
+| Frame | **vignette**. **kaleido** upright kaleidoscope with 4, 6 or 8 mirrored segments; strength is how often a section gets it. **words** now and then a 4-bar phrase fills the screen with a cloud of keys and values from the render's JSON in mixed sizes, opacities and fonts (`bpm: 121`, `style = clave`, `"root": E`, the knobs, some of the samples it was made from, the playing section's kind, bars, root and transition) plus the song's own name; the live input, which has no JSON, gets random words instead. Strength is how often. Fonts are the `.ttf` files in `fonts/` (open-licensed terminal-style monospace faces ship with the repo, drop in your own). **clean** on a downbeat, with probability = strength, a 1/16-note flash of the video as it is: no effects, no shader layer, no words. |
 
 The Randomize button rolls new strengths for all of them.
 
@@ -120,7 +120,7 @@ The Randomize button rolls new strengths for all of them.
 | `slitscan` | A slit sweeps per bar and freezes time slices behind it. |
 | `sparks` | Particles born on bright pixels, drifting up. |
 | `thermal` | Heat palette with animated iso-lines, cold in breaks. |
-| `vhs` | Tracking wobble, chroma bleed, dropouts on the beat, wearing out toward the end. |
+| `vhs` | A tracking band rolling up the full height every 2 bars, frame roll and wobble top to bottom, chroma bleed, dropouts on the beat, wearing out toward the end. |
 | `warp` | The video melted by noise, torn by drops. |
 
 Keys `1` to `9` reach the first nine in this alphabetical order; the combo and `Space` reach them all. Compile errors show in the render log. Shaders you bring in from elsewhere keep their own licence.
@@ -290,4 +290,3 @@ The JSON section map is what powers the Mixer tab. Finals stitched in the Mixer 
 - sidechain
 - apply fx on main for one bar (ie: reverb)
 - libpd?
-- show clear vid (no fx, shader) on beat from time to time

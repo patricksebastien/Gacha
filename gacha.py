@@ -81,6 +81,74 @@ def frame_palette(img, rng, count=12):
     return [c for _, c in picks[:count] if c.valueF() > 0.25]
 
 
+def _fact_value(v):
+    """A JSON value as a short word; None for the ones not worth showing."""
+    if v is None or v == "" or isinstance(v, dict):
+        return None
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    if isinstance(v, float):
+        return f"{v:.3g}"
+    if isinstance(v, list):
+        if not v or any(isinstance(x, (dict, list)) for x in v):
+            return None
+        return " ".join(str(x) for x in v)
+    return str(v)
+
+
+def json_facts(meta):
+    """(key, value) pairs from a render's JSON, for the word cloud: the song's
+    seed, bpm, style, outro, pan, every knob that was set and the samples it
+    was made from. Sections are handled per section by section_facts()."""
+    facts = []
+    for k, v in meta.items():
+        if k in ("sections", "samples"):
+            continue
+        if isinstance(v, dict):                    # outro, pan, knobs: flatten
+            for kk, vv in v.items():
+                val = _fact_value(vv)
+                if val is not None:
+                    facts.append((kk, val))
+        else:
+            val = _fact_value(v)
+            if val is not None:
+                facts.append((k, val))
+    for smp in meta.get("samples") or []:
+        facts.append(("sample", Path(str(smp)).stem))
+    return facts
+
+
+def section_facts(sec):
+    """(key, value) pairs describing one section of the section map."""
+    facts = []
+    for k, v in sec.items():
+        if k == "i":
+            continue
+        val = _fact_value(v)
+        if val is not None:
+            facts.append((k, val))
+    return facts
+
+
+def fact_words(facts, rng):
+    """Render (key, value) pairs as cloud words in a mix of JSON-ish shapes:
+    `bpm: 121`, `bpm = 121`, `"bpm": 121`, or just the value or the key."""
+    out = []
+    for k, v in facts:
+        shape = rng.random()
+        if shape < 0.35:
+            out.append(f"{k}: {v}")
+        elif shape < 0.55:
+            out.append(f"{k} = {v}")
+        elif shape < 0.7:
+            out.append(f'"{k}": {v}')
+        elif shape < 0.9:
+            out.append(v)
+        else:
+            out.append(k)
+    return out
+
+
 def make_word_cloud(size, words, families, rng, hue=None, n=None, palette=()):
     """A transparent image filled with random words in random fonts, sizes
     and opacities: the 'word cloud' the backdrop shows now and then. Some
@@ -245,6 +313,10 @@ VIDEO_EFFECTS = [
     ("kaleido", "kaleido", 0.15, "Kaleidoscope with 4, 6 or 8 mirrored "
                                  "segments, upright. Strength = how often a "
                                  "section gets it"),
+    ("clean", "clean", 0.3, "Clean video: on a downbeat, with probability = "
+                            "strength, a 1/16-note flash of the video as it "
+                            "is, with no effects, no shader layer and no "
+                            "words. 0 = never, 1 = every bar"),
 ]
 NOTE_HUES = {n: i / 12 for i, n in enumerate(
     ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"])}
@@ -253,7 +325,8 @@ NOTE_HUES = {n: i / 12 for i, n in enumerate(
 # thin sharp lines, medium bands, anything up to big slabs
 GLITCH_MODES = [(0.004, 0.01), (0.04, 0.14), (0.04, 0.38)]
 
-LOOK_EXEMPT = {"color", "pump", "flash", "pixel", "kaleido", "words", "reverse"}
+LOOK_EXEMPT = {"color", "pump", "flash", "pixel", "kaleido", "words", "reverse",
+               "clean"}
 
 
 class VideoFX:
@@ -475,7 +548,7 @@ class VideoBackdrop(QWidget):
         self._history.push(live, time.monotonic())
         if not (st and st.get("reverse")):
             self._history.stop()
-        if st and any(k != "music" for k in st):
+        if st and any(k not in ("music", "clean") for k in st):
             now = time.monotonic()
             if now - self._last_fx < FX_INTERVAL:
                 return              # throttle: keep showing the last frame
@@ -748,7 +821,10 @@ class Main(QMainWindow):
         self._words_phrase = None   # (section, phrase) currently showing words
         self._reverse_plan = None   # (phrase key, first bar, bars) to run backwards
         self._words_slot = None     # half-beat slot of the cloud on screen
+        self._clean_bar = None      # (section, bar) last rolled for clean video
+        self._clean_on = False      # this bar shows the video with no effects
         self._song_word = None      # the word in the playing render's file name
+        self._song_facts = []       # (key, value) pairs from the render's JSON
         self.font_families = load_fonts()
         self._kaleido = 0
         self._mono = (0, 0.5)
@@ -1042,7 +1118,7 @@ class Main(QMainWindow):
                 ("Tone", ("mono", "solar", "edges", "lines")),
                 ("Grain", ("grain",)),
                 ("Motion", ("zoom", "trails", "glitch", "rgb", "reverse")),
-                ("Frame", ("vign", "kaleido", "words"))]
+                ("Frame", ("vign", "kaleido", "words", "clean"))]
         labels = {k: lbl for k, lbl, _, _ in VIDEO_EFFECTS}
         for title, keys in rows:
             form.addRow(title, self._row([(labels[k], self.vfx[k])
@@ -2036,8 +2112,10 @@ class Main(QMainWindow):
         self._outro = None
         parts = Path(wav).stem.split("_")
         self._song_word = parts[1] if len(parts) > 2 and parts[0] == "gacha" else None
+        self._song_facts = []
         try:
             meta = json.loads(Path(wav).with_suffix(".json").read_text())
+            self._song_facts = json_facts(meta)
             self._sections = meta["sections"]
             self._sec_bounds = [int(s["start_sec"] * 1000)
                                 for s in self._sections]
@@ -2214,6 +2292,21 @@ class Main(QMainWindow):
             # the shaders that age with it (vhs) moving
             "song_pos": (pos / 300000.0) % 1.0 if live
             else pos / total_ms if total_ms else 0.0}}
+        # clean video: rolled once per bar, on its downbeat, with probability
+        # = strength; the first 1/16 note of the bar then flashes the video as
+        # it is (no effects, no shader layer, no words), only the outro fade
+        # still applies
+        bar_key = (idx, bar_i)
+        if bar_key != self._clean_bar:
+            self._clean_bar = bar_key
+            self._clean_on = random.random() < v["clean"]
+        in_bar = (pos - sec_start_ms) - bar_i * 4 * beat_ms
+        if self._clean_on and in_bar < beat_ms / 4:
+            st["clean"] = True
+            if fade < 1.0:
+                st["brightness"] = fade
+            st["music"]["swell"] = 0.0
+            return st
         if v["pump"]:
             st["brightness"] = 0.7 + 0.7 * v["pump"] * env
         if live:
@@ -2304,11 +2397,20 @@ class Main(QMainWindow):
                 sec_d = sec if sec is not None else {}
                 root = sec_d.get("root")
                 hue = NOTE_HUES.get(root) if root in NOTE_HUES else None
-                words = list(WORDS)
+                rng = random.Random(random.random())
+                # the render's own JSON: the song's keys and values, some of
+                # its samples, the playing section's facts (kind, bars, root,
+                # transition) several times over, and the song's own name.
+                # Only the live input, which has no JSON, gets random words.
+                core = [f for f in self._song_facts if f[0] != "sample"]
+                smp = [f for f in self._song_facts if f[0] == "sample"]
+                facts = core + rng.sample(smp, min(len(smp), 16))
+                if sec is not None:
+                    facts += section_facts(sec) * 3
+                words = fact_words(facts, rng) if facts else list(WORDS)
                 if self._song_word:
                     words += [self._song_word] * 6       # the song's own name, often
                 n = int(40 + 140 * env)
-                rng = random.Random(random.random())
                 frame = self.backdrop.last_frame() if hasattr(self.backdrop, "last_frame") else None
                 self.backdrop.set_overlay(make_word_cloud(
                     self.backdrop.size(), words, self.font_families, rng, hue, n,
@@ -2316,7 +2418,7 @@ class Main(QMainWindow):
             edge = min(1.0, t_in / (0.2 * beat_ms),
                        (phrase_ms - t_in) / (0.2 * beat_ms))
             st["words"] = min(1.0, max(0.0, edge) * (0.6 + 0.6 * env)
-                              * min(1.0, 0.5 + self.vfx["words"].value()))
+                              * min(1.0, 0.5 + self.vfx["words"].value())) * 0.85
         if fade < 1.0:                                 # outro: fade to black
             st["brightness"] = st.get("brightness", 1.0) * fade
         st["music"]["swell"] = st.get("swell", 0.0)

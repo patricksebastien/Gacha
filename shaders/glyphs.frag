@@ -1,6 +1,7 @@
 // gacha shader: the picture rebuilt from a small set of procedural glyphs,
 // brightness picking a denser glyph. Glyphs refresh on every beat, the
-// column count grows with loudness, colours stay the video's own.
+// loudness sets their size (tiny when quiet, four times bigger when loud),
+// colours stay the video's own.
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float glyph(int id, vec2 f) {                          // f in 0..1 inside the cell
     vec2 c = abs(f - 0.5);
@@ -14,7 +15,8 @@ float glyph(int id, vec2 f) {                          // f in 0..1 inside the c
 }
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 uv = fragCoord / iResolution.xy;
-    float cols = 200.0 + 120.0 * iLoud;                // fine grid: 200 to 320 columns
+    float size = 0.5 + 1.5 * iLoud;                    // glyph size x0.5 quiet .. x2 loud
+    float cols = 200.0 / size;                         // 400 columns down to 100
     vec2 grid = vec2(cols, cols / (iResolution.x / iResolution.y));
     vec2 cell = floor(uv * grid), f = fract(uv * grid);
     vec3 vc = texture(iChannel0, (cell + 0.5) / grid).rgb;

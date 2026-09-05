@@ -649,7 +649,8 @@ class GLBackdrop(QOpenGLWidget):
             self._compile_gen(self._prewarm.pop(0))
         opacity = max(float(self.shader_mix),
                       self._gen_min_opacity.get(self.shader_path, 0.0))
-        gen_on = self._gen_prog is not None and opacity > 0
+        gen_on = self._gen_prog is not None and opacity > 0 \
+            and not st.get("clean")              # clean bar: video only
         if gen_on:
             self._fbo_gen[cur].bind()
             gl.glViewport(0, 0, W, H)
