@@ -18,12 +18,10 @@ context exists.
 import random
 import re
 import time
-from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QOpenGLContext, QSurfaceFormat, QVector2D
-from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
 from PySide6.QtOpenGL import (
     QOpenGLBuffer, QOpenGLFramebufferObject, QOpenGLShader,
     QOpenGLShaderProgram, QOpenGLTexture, QOpenGLVersionFunctionsFactory,
@@ -32,49 +30,10 @@ from PySide6.QtOpenGL import (
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QVBoxLayout
 
+from gacha_video import VideoSource
+
 SHADERS_DIR = Path(__file__).parent / "shaders"
 
-
-class FrameHistory:
-    """The last few seconds of decoded video, downscaled and sparse, so the
-    backdrop can run backwards for a bar or two. QMediaPlayer cannot play
-    in reverse and a shader only ever sees the current frame, so the past
-    has to be kept somewhere: 12 frames a second at half size for 5 s is
-    about 120 MB at 1080p, and the effects run on top as usual."""
-
-    def __init__(self, seconds=5.0, fps=12.0, scale=0.5):
-        self.span, self.step, self.scale = seconds, 1.0 / fps, scale
-        self.frames = deque()            # (time, QImage), oldest first
-        self._last = 0.0
-        self.rev_start = None            # wall time a reverse run began
-
-    def push(self, img, now):
-        if now - self._last < self.step * 0.9 or img.isNull():
-            return
-        self._last = now
-        small = img.scaled(max(2, int(img.width() * self.scale)),
-                           max(2, int(img.height() * self.scale)),
-                           Qt.IgnoreAspectRatio, Qt.FastTransformation)
-        self.frames.append((now, small))
-        while self.frames and now - self.frames[0][0] > self.span:
-            self.frames.popleft()
-
-    def rewind(self, now, speed=1.0):
-        """Frame for a reverse run: time runs back from the moment the run
-        began, `speed` times faster than real time. Holds the oldest frame
-        when the history runs out."""
-        if not self.frames:
-            return None
-        if self.rev_start is None:
-            self.rev_start = now
-        target = self.rev_start - (now - self.rev_start) * speed
-        for t, img in reversed(self.frames):
-            if t <= target:
-                return img
-        return self.frames[0][1]
-
-    def stop(self):
-        self.rev_start = None
 
 # GL constants (PySide6 does not export them)
 GL_TRIANGLE_STRIP, GL_FLOAT = 0x0005, 0x1406
@@ -326,11 +285,12 @@ class GLBackdrop(QOpenGLWidget):
         self.child = child
         self.state_fn = None
         self.current = None
+        self.input = None                # live capture device while video in is on
         self.videos_fn, self.default_video = videos_fn, default_video
         self._start_random = False
-        self._pending = None             # newest decoded frame (QImage)
+        self._shown = None               # Frame now on the video texture
+        self._src_error = None           # last decoder error already logged
         self._frozen = False
-        self._history = FrameHistory()   # for the reverse effect
         self._gl_ok = False
         self._t0 = time.monotonic()
         self._frame_n = 0
@@ -352,14 +312,9 @@ class GLBackdrop(QOpenGLWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
         lay.addWidget(child)
-        # video source
-        self._vplayer = None
-        if videos_fn():
-            self._sink = QVideoSink()
-            self._sink.videoFrameChanged.connect(self._on_frame)
-            self._vplayer = QMediaPlayer()          # no audio output = silent
-            self._vplayer.setVideoSink(self._sink)
-            self._vplayer.setLoops(QMediaPlayer.Loops.Infinite)
+        # video source: decoded on its own thread, polled from paintGL
+        self.source = VideoSource(parent=self) if videos_fn() else None
+        if self.source is not None:
             if default_video.exists():
                 self.set_video(default_video)
             else:
@@ -369,39 +324,35 @@ class GLBackdrop(QOpenGLWidget):
         self._timer.start(16)
 
     # ---- video source (same behaviour as the numpy backdrop) ----
+    def set_input(self, device):
+        """Live video in: show a V4L2 capture device (`/dev/videoN`) instead
+        of the clips, and ignore clip changes until `None` switches back."""
+        if self.source is None:
+            return
+        self.input = device
+        if device:
+            self.source.open(device)
+        elif self.current is not None:
+            self.source.open(self.current, random_start=True)
+
     def set_video(self, path, random_start=False):
-        if self._vplayer is None:
+        if self.source is None or self.input:
             return None
         self.current = Path(path)
-        self._start_random = random_start
-        self._vplayer.stop()
-        self._vplayer.setSource(QUrl.fromLocalFile(str(self.current)))
-        self._vplayer.play()
+        self.source.open(self.current, random_start)
         return self.current
 
     def pick_random(self):
         files = self.videos_fn()
-        if self._vplayer is None or not files:
+        if self.source is None or not files:
             return None
         files = [f for f in files if f != self.default_video] or files
         pool = [f for f in files if f != self.current] or files
         return self.set_video(random.choice(pool), random_start=True)
 
     def jump(self):
-        if self._vplayer is not None and self._vplayer.duration() > 0:
-            self._vplayer.setPosition(random.randrange(self._vplayer.duration()))
-
-    def _on_frame(self, frame):
-        if not frame.isValid():
-            return
-        if self._start_random:
-            self._start_random = False
-            self.jump()
-            return
-        img = frame.toImage()
-        self._history.push(img, time.monotonic())
-        if not self._frozen:
-            self._pending = img
+        if self.source is not None and not self.input:
+            self.source.jump()
 
     # ---- generative layer ----
     def last_frame(self):
@@ -576,7 +527,7 @@ class GLBackdrop(QOpenGLWidget):
         self._video_tex.bind()
         self.gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, fmt,
                                 GL_UNSIGNED_BYTE, img.constBits())
-        self._frame_img = img            # keep the buffer alive for the call
+        self._frame_img = img            # what last_frame() hands out
 
     def _bind_tex(self, unit, tex_id):
         self.gl.glActiveTexture(GL_TEXTURE0 + unit)
@@ -598,17 +549,19 @@ class GLBackdrop(QOpenGLWidget):
         gl = self.gl
         st = (self.state_fn() if self.state_fn else None) or {}
         self._frozen = bool(st.get("repeat") or st.get("freeze"))
-        rev = st.get("reverse")
-        if rev:                                  # play the history backwards
-            img = self._history.rewind(time.monotonic(), float(rev))
-            if img is not None:
-                self._upload_frame(img)
-            self._pending = None
-        else:
-            self._history.stop()
-            if self._pending is not None:
-                self._upload_frame(self._pending)
-                self._pending = None
+        if self.source is not None:
+            if self.source.error and self.source.error != self._src_error:
+                self._src_error = self.source.error
+                self.log.append(f"video: {self._src_error}")
+            rev = st.get("reverse")              # a real rewind, any speed
+            if "speed" in st:                    # the song's sample timeline
+                self.source.set_speed(float(st["speed"]))
+            else:
+                self.source.set_speed(-float(rev) if rev else 1.0)
+            fr = self.source.latest()
+            if fr is not None and fr is not self._shown and not self._frozen:
+                self._upload_frame(fr.img)
+                self._shown = fr                 # keeps fr.arr alive with it
         if self._overlay_img is not None:
             self._upload_overlay()
         if self._video_tex is None:

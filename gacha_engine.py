@@ -16,8 +16,10 @@ a JSON job file and runs ``python3 gacha_engine.py job.json`` in a subprocess,
 streaming the printed log. See run_job() for the job format.
 """
 
+import hashlib
 import json
 import random
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -36,6 +38,7 @@ from pedalboard import (
 SR = 44100
 SAMPLES_DIR = Path(__file__).parent / "samples"
 OUT_DIR = Path(__file__).parent / "output"
+VIDEO_AUDIO_DIR = Path(__file__).parent / "videos" / ".audio"   # extracted tracks
 
 DEFAULT_SECTION_BARS = [4, 4, 8, 8, 16]
 RANDOM_START_MODES = ["off", "one-shots", "all"]
@@ -161,6 +164,34 @@ def sample_name(path):
         return path.relative_to(SAMPLES_DIR).as_posix()
     except ValueError:
         return path.name
+
+
+def extract_video_audio(videos):
+    """The audio tracks of video files as 44.1 kHz stereo wavs, cached under
+    videos/.audio (keyed by path, size and mtime), so a video can be sample
+    material. Returns {wav sample_name: video path}; videos without an
+    audio track, or that ffmpeg cannot read, are skipped with a note."""
+    out = {}
+    for v in videos:
+        v = Path(v)
+        if not v.is_file():
+            continue
+        st = v.stat()
+        key = hashlib.sha1(f"{v.resolve()}|{st.st_size}|{st.st_mtime_ns}"
+                           .encode()).hexdigest()[:8]
+        wav = VIDEO_AUDIO_DIR / f"{v.stem}_{key}.wav"
+        if not wav.is_file():
+            VIDEO_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(v), "-vn",
+                                "-ac", "2", "-ar", str(SR), "-c:a", "pcm_s16le",
+                                str(wav)], capture_output=True, text=True)
+            if r.returncode or not wav.is_file() or wav.stat().st_size < 1024:
+                wav.unlink(missing_ok=True)
+                print(f"  ! no audio from {v.name}: "
+                      f"{(r.stderr or 'no audio track').strip().splitlines()[-1]}")
+                continue
+        out[sample_name(wav)] = v
+    return out
 
 
 def load_samples(files):
@@ -1137,8 +1168,20 @@ def random_texture_board(rng, beat, fx_min=1, fx_max=3, saturation=0.5):
 def compose(seed, duration, sample_files, intro_bars=None,
             intro_style="ambient", bpm=None, pan_drums=0.3, pan_layers=0.6,
             pan_events=0.5, num_samples=None, drum_style="random", knobs=None,
-            outro_style="random"):
+            outro_style="random", video_sources=None):
+    """Render one song. Besides the audio, the meta records `events`: every
+    placed sound that came from a sample, as [t, src, off, dur, rate, role]
+    (song seconds, sample name, source seconds at the start of the event,
+    song seconds it lasts, source seconds per song second with the sign as
+    direction, and kick/snare/hihat/ohat/ride/glitch/texture/chop/swell/
+    collage/oneshot). With `video_sources` ({sample name: video path}) the
+    GUI can then show the very frames the sound was cut from."""
     k = (knobs or Knobs()).sanitized()
+    events = []
+
+    def ev(t, src, off, dur, rate, role):
+        events.append([round(t / SR, 4), src, round(max(0, off) / SR, 4),
+                       round(dur / SR, 4), round(rate, 4), role])
     if intro_bars is not None and intro_bars < 1:   # 0 bars = no intro at all
         intro_bars, intro_style = None, "none"
     rng = random.Random(seed)
@@ -1179,10 +1222,12 @@ def compose(seed, duration, sample_files, intro_bars=None,
     sgains = {"kick": k.synth_kick, "snare": k.synth_snare,
               "hihat": k.synth_hihat, "ohat": k.synth_ohat, "ride": k.synth_ride}
     kit = {}
+    kit_src = {}                  # role -> [(sample name, onset sample)] per variant
     kit_sources = set()
     hat_sources = []
     for role in ("kick", "snare", "hihat", "ride"):
         variants = []
+        kit_src[role] = []
         # a role at sample volume 0 claims no samples (they stay free for
         # textures and one-shots); the hihat source also feeds the open hat
         want = gains[role] > 0 or (role == "hihat" and gains["ohat"] > 0)
@@ -1192,6 +1237,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
             kit_sources.add(src)
             used.add(src)
             variants.append(velocity_layers(carve_drum(rng, bank[src], role)))
+            kit_src[role].append((src, strongest_onset(bank[src])))
             if role == "hihat":
                 hat_sources.append(src)
             print(f"  {role:6s} <- {src}")
@@ -1199,6 +1245,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
     # the open hat is the same instrument as the closed one: same sources
     kit["ohat"] = [velocity_layers(carve_drum(rng, bank[src], "ohat"))
                    for src in hat_sources]
+    kit_src["ohat"] = [(src, strongest_onset(bank[src])) for src in hat_sources]
     # synthesized kit, layered at its own levels (all 0 by default)
     synth = {}
     if any(v > 0 for v in sgains.values()):
@@ -1300,8 +1347,12 @@ def compose(seed, duration, sample_files, intro_bars=None,
                         # sample hit and synth hit layer on the same step
                         layers = []
                         if gains[role] > 0 and kit[role]:
-                            layers.append((pick_layer(rng.choice(kit[role]), vel),
+                            vi = rng.randrange(len(kit[role]))   # == rng.choice
+                            layers.append((pick_layer(kit[role][vi], vel),
                                            gains[role]))
+                            ksrc, onset = kit_src[role][vi]
+                            ev(max(0, pos), ksrc, onset, len(kit[role][vi][1]),
+                               1.0, role)
                         if sgains[role] > 0 and synth:
                             layers.append((pick_layer(synth[role], vel),
                                            sgains[role]))
@@ -1322,8 +1373,11 @@ def compose(seed, duration, sample_files, intro_bars=None,
                     s = rng.randrange(16)
                     n_rep = rng.choice([6, 8, 12, 16])
                     spacing = max(1, int(step_len * SR / rng.choice([2, 3, 4, 6])))
+                    gsrc = None
                     if gains["hihat"] > 0 and kit["hihat"]:
-                        hit, g_hat = rng.choice(kit["hihat"])[1], gains["hihat"]
+                        vi = rng.randrange(len(kit["hihat"]))     # == rng.choice
+                        hit, g_hat = kit["hihat"][vi][1], gains["hihat"]
+                        gsrc = kit_src["hihat"][vi]
                     else:
                         hit, g_hat = synth["hihat"][1], sgains["hihat"]
                     ramp = rng.choice([-1, 1])        # fade out or fade in
@@ -1333,8 +1387,10 @@ def compose(seed, duration, sample_files, intro_bars=None,
                         h = hit
                         if pan_drums > 0:             # glitch sweeps the field
                             h = panned(hit, np.sin(t * np.pi * 2) * 0.7)
-                        place(buf, h, bar_start + int(s * step_len * SR)
-                              + i * spacing, g)
+                        gpos = bar_start + int(s * step_len * SR) + i * spacing
+                        place(buf, h, gpos, g)
+                        if gsrc:
+                            ev(gpos, gsrc[0], gsrc[1], spacing, 1.0, "glitch")
 
         # ---- special intro content ----
         if intro_kind == "reverse-swell":
@@ -1347,6 +1403,12 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 Compressor(threshold_db=-18, ratio=3),
             ])
             clip = apply_fx(clip, board, tail=0.5)
+            L = len(bank[src])
+            j0 = len(clip) - sec_len          # first clip sample in the swell
+            if j0 >= 0:                       # reversed: index j <- source L-1-j
+                ev(sec_start, src, L - j0, min(sec_len, L - j0), -1.0, "swell")
+            else:
+                ev(sec_start - j0, src, L, L, -1.0, "swell")
             if len(clip) >= sec_len:
                 swell = clip[-sec_len:].copy()    # end lands on the drop
             else:
@@ -1362,7 +1424,9 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 used.add(src)
                 cut = int(rng.uniform(0.5, 3.0) * SR)
                 clip = random_window(rng, bank[src], cut, k.random_start == "all")
+                c_off = len(bank[src]) - len(clip)   # window = a suffix
                 clip = clip[:cut].copy()
+                c_dur = len(clip)
                 clip = clip * envelope(len(clip), attack=0.02, decay_curve=1.5)
                 board, tail = random_texture_board(rng, beat, k.fx_min, k.fx_max,
                                                k.saturation)
@@ -1371,6 +1435,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 clip = panned(clip, rng.uniform(-spread, spread))
                 pos = sec_start + rng.randint(0, max(1, sec_len - len(clip)))
                 place(buf, clip, pos, rng.uniform(0.3, 0.5))
+                ev(pos, src, c_off, c_dur, 1.0, "collage")
             print(f"  sec{si} collage intro")
 
         # ---- background texture layers (loop / reverse / stretch) ----
@@ -1387,9 +1452,11 @@ def compose(seed, duration, sample_files, intro_bars=None,
             used.add(src)
             clip = random_window(rng, bank[src], sec_len,
                                  k.random_start == "all").copy()
+            w_off, w_len = len(bank[src]) - len(clip), len(clip)
             ops = []
+            rev, rate = False, 1.0
             if rng.random() < k.reverse_chance:
-                clip = clip[::-1].copy(); ops.append("rev")
+                clip = clip[::-1].copy(); ops.append("rev"); rev = True
             if rng.random() < k.stretch_chance and len(clip) > SR:   # stretch to bars
                 n_target_bars = rng.choice([1, 2, 4])
                 target = int(n_target_bars * bar * SR)
@@ -1398,10 +1465,19 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 st = np.stack([librosa.effects.time_stretch(chunk[:, c], rate=rate)
                                for c in range(2)], axis=1)
                 clip = st.astype("float32"); ops.append(f"stretch{n_target_bars}bar")
+            mat_n = len(clip)                 # material before the fx tail
             board, tail = random_texture_board(rng, beat, k.fx_min, k.fx_max,
                                                k.saturation)
             clip = apply_fx(clip, board, tail=tail)
             loop = crossfade_loop(clip, sec_len)
+            # one event per loop pass, the way crossfade_loop tiles the clip
+            n_fade = min(int(0.05 * SR), len(clip) // 4)
+            step_n = (len(clip) - n_fade) or len(clip)
+            lp = 0
+            while lp < sec_len:
+                ev(sec_start + lp, src, w_off + w_len if rev else w_off,
+                   min(mat_n, sec_len - lp), -rate if rev else rate, "texture")
+                lp += step_n
             fade = min(int(0.5 * SR), len(loop) // 4)
             loop[:fade] *= np.linspace(0, 1, fade)[:, None]
             loop[-fade:] *= np.linspace(1, 0, fade)[:, None]
@@ -1433,14 +1509,18 @@ def compose(seed, duration, sample_files, intro_bars=None,
                     if idx is None:
                         continue
                     piece = slices[idx][:max_slice]
+                    p_off, p_rate = idx * sl, 1.0
                     if rng.random() < 0.2:
                         piece = piece[::-1]
+                        p_off, p_rate = idx * sl + len(piece), -1.0
+                    p_dur = len(piece)
                     piece = piece * envelope(len(piece), decay_curve=2.0)
                     piece = apply_fx(piece, board, tail=tail)
                     if pan_events > 0:
                         piece = panned(piece, rng.uniform(-pan_events, pan_events))
-                    place(buf, piece, bar_start + int(s * step_len * SR),
-                          k.chop_gain)
+                    cpos = bar_start + int(s * step_len * SR)
+                    place(buf, piece, cpos, k.chop_gain)
+                    ev(cpos, src, p_off, p_dur, p_rate, "chop")
             print(f"  sec{si} chops <- {src}")
 
         # ---- filtered intro: a lowpass opens bar by bar (club-door) ----
@@ -1460,10 +1540,13 @@ def compose(seed, duration, sample_files, intro_bars=None,
     print(f"Placing {len(leftovers)} unused samples as one-shot events...")
     for src in leftovers:
         clip = bank[src]
+        L, rev = len(clip), False
         if rng.random() < 0.4:
-            clip = clip[::-1].copy()
+            clip = clip[::-1].copy(); rev = True
         cut = int(min(len(clip), rng.uniform(1, 5) * SR))
-        clip = random_window(rng, clip, cut, k.random_start != "off")[:cut]
+        clip = random_window(rng, clip, cut, k.random_start != "off")
+        o_off = L - len(clip)                 # offset within the (maybe reversed) clip
+        clip = clip[:cut]
         clip = clip * envelope(len(clip), attack=0.05, decay_curve=1.5)
         board, tail = random_texture_board(rng, beat, k.fx_min, k.fx_max,
                                                k.saturation)
@@ -1473,6 +1556,8 @@ def compose(seed, duration, sample_files, intro_bars=None,
         if pan_events > 0:
             clip = panned(clip, rng.uniform(-pan_events, pan_events))
         place(buf, clip, pos, rng.uniform(0.25, 0.45))
+        ev(pos, src, L - o_off if rev else o_off, cut, -1.0 if rev else 1.0,
+           "oneshot")
 
     # ---- root note per section (from the textures), for the sub and the
     #      GUI's visuals; computed even when the sub is off -----------------
@@ -1597,7 +1682,10 @@ def compose(seed, duration, sample_files, intro_bars=None,
                     "events": pan_events},
             "knobs": asdict(k),
             "samples": names,
-            "sections": sections_meta}
+            "sections": sections_meta,
+            "events": sorted(events, key=lambda e: e[0]),
+            "video_sources": {n: str(v) for n, v in (video_sources or {}).items()
+                              if n in bank}}
     return out.astype("float32"), bpm, meta
 
 
@@ -1613,6 +1701,7 @@ def run_job(job):
         count       number of songs; seeds increment from `seed`
         duration    target seconds
         samples     list of audio file paths to build the song from
+        video_audio list of video files whose audio tracks join the samples
         knobs       dict of Knobs fields (missing ones keep their default)
         + any compose() keyword in COMPOSE_KEYS
 
@@ -1620,6 +1709,13 @@ def run_job(job):
     """
     files = [Path(f) for f in job.get("samples", [])]
     files = [f for f in files if f.is_file() and f.suffix.lower() in AUDIO_EXTS]
+    video_sources = {}
+    if job.get("video_audio"):
+        print("Extracting audio from videos...")
+        video_sources = extract_video_audio(job["video_audio"])
+        files += [VIDEO_AUDIO_DIR / n for n in video_sources]
+        for n, v in video_sources.items():
+            print(f"  {v.name} -> {n}")
     if not files:
         sys.exit("No samples selected")
     knobs = Knobs(**{k: v for k, v in (job.get("knobs") or {}).items()
@@ -1635,7 +1731,8 @@ def run_job(job):
     for i in range(count):
         seed = (base_seed + i) if base_seed is not None \
             else random.randrange(10 ** 6)
-        song, bpm, meta = compose(seed, duration, files, knobs=knobs, **kw)
+        song, bpm, meta = compose(seed, duration, files, knobs=knobs,
+                                  video_sources=video_sources, **kw)
         OUT_DIR.mkdir(exist_ok=True)
         word = random.Random(seed).choice(WORDS)
         out_path = OUT_DIR / (f"gacha_{word}_"

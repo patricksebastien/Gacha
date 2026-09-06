@@ -30,8 +30,7 @@ from PySide6.QtCore import (QEvent, QPoint, Qt, QRectF, QSettings, QThread,
 from PySide6.QtGui import (QColor, QFont, QFontDatabase, QImage, QKeySequence,
                            QPainter, QRegularExpressionValidator, QShortcut)
 from PySide6.QtCore import QRegularExpression
-from PySide6.QtMultimedia import (QAudioOutput, QMediaDevices, QMediaPlayer,
-                                  QVideoSink)
+from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFormLayout,
@@ -42,11 +41,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gacha_gl import (BLEND_MODES, FrameHistory, GLBackdrop, gl_available,
-                      shader_files)
+from gacha_gl import BLEND_MODES, GLBackdrop, gl_available, shader_files
 from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES, WORDS,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
+from gacha_video import VideoSource, video_inputs
 
 BASE = Path(__file__).parent
 GACHA = BASE / "gacha_engine.py"
@@ -302,10 +301,15 @@ VIDEO_EFFECTS = [
      "section: thin sharp lines (0.4-1% of the frame), medium bands (4-14%) "
      "or anything from 4% up to 38% slabs"),
     ("rgb", "rgb shift", 0.4, "Chromatic aberration pulsing with loudness"),
-    ("reverse", "reverse", 0.3, "Rewind: now and then a phrase runs a bar or "
-                                "two backwards, and a cymbal swell rewinds "
-                                "faster and faster into the drop. Strength = "
-                                "how often a phrase gets one"),
+    ("reverse", "reverse", 0.3, "Rewind: on a downbeat, with probability = "
+                                "strength, the video runs backwards for the "
+                                "length set next to it at a random speed "
+                                "(1x to 3x), then carries on forwards from "
+                                "there; a live video input fast-forwards "
+                                "back to live. Every clean flash jogs the "
+                                "same way. A cymbal swell also rewinds "
+                                "faster and faster into the drop. 0 = "
+                                "never, 1 = every bar"),
     ("vign", "vignette", 0.5, "Dark corners"),
     ("words", "words", 0.25, "Word cloud: now and then a 4-bar phrase fills the "
                              "screen with random words in the fonts from fonts/. "
@@ -324,6 +328,55 @@ NOTE_HUES = {n: i / 12 for i, n in enumerate(
 # glitch band height ranges as fractions of the frame, one per section mode:
 # thin sharp lines, medium bands, anything up to big slabs
 GLITCH_MODES = [(0.004, 0.01), (0.04, 0.14), (0.04, 0.38)]
+
+# what the picture follows in a song built from a video's own audio: the
+# groups of timeline events, in priority order (a hit wins over a texture)
+FOLLOW_GROUPS = {"off": (), "textures": ("textures",),
+                 "textures and chops": ("chops", "textures"),
+                 "everything": ("hits", "chops", "textures")}
+EVENT_GROUP = {"kick": "hits", "snare": "hits", "hihat": "hits", "ohat": "hits",
+               "ride": "hits", "glitch": "hits", "chop": "chops",
+               "texture": "textures", "swell": "textures",
+               "collage": "textures", "oneshot": "textures"}
+
+
+class FollowPlan:
+    """The render's sample timeline (meta["events"]) reduced to the events
+    that came from a video: for any playhead position, the event whose
+    frames should be on screen. Rows are (start ms, video, source offset s,
+    duration ms, rate), per group, sorted by start."""
+
+    def __init__(self, events, sources):
+        self.lists = {g: ([], []) for g in ("hits", "chops", "textures")}
+        ok = {}
+        for t, src, off, dur, rate, role in events:
+            video = sources.get(src)
+            group = EVENT_GROUP.get(role)
+            if video is None or group is None:
+                continue
+            if video not in ok:
+                ok[video] = Path(video).is_file()
+            if not ok[video]:
+                continue
+            ts, rows = self.lists[group]
+            ts.append(t * 1000.0)
+            rows.append((t * 1000.0, Path(video), float(off), dur * 1000.0,
+                         float(rate)))
+        self.n = sum(len(rows) for _, rows in self.lists.values())
+
+    def pick(self, pos_ms, groups):
+        """The latest event of the first group that is sounding at pos_ms."""
+        for g in groups:
+            ts, rows = self.lists[g]
+            i = bisect.bisect_right(ts, pos_ms) - 1
+            if i >= 0 and pos_ms < rows[i][0] + rows[i][3]:
+                return rows[i]
+        return None
+
+
+# rewind lengths in bars; None = a random one per bar
+REVERSE_LENGTHS = {"1/8 bar": 1 / 8, "1/4 bar": 1 / 4, "1/2 bar": 1 / 2,
+                   "1 bar": 1.0, "2 bars": 2.0, "random": None}
 
 LOOK_EXEMPT = {"color", "pump", "flash", "pixel", "kaleido", "words", "reverse",
                "clean"}
@@ -488,38 +541,43 @@ class VideoBackdrop(QWidget):
         self.videos_fn = videos_fn
         self._image = None
         self._arr = None            # keeps the processed frame's memory alive
+        self._live = None           # Frame the image was made from
         self.state_fn = None
         self.fx = VideoFX()
         self._last_fx = 0.0
         self._zoom = 0.0
         self._frozen = None         # captured frame while a beat-repeat runs
-        self._history = FrameHistory()   # for the reverse effect
-        self._start_random = False  # seek somewhere random once media loads
         self.child = child
         self.current = None         # path of the video now looping
+        self.input = None           # live capture device while video in is on
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
         lay.addWidget(child)
+        self.source = None
         if video_files():
-            self._sink = QVideoSink()
-            self._sink.videoFrameChanged.connect(self._on_frame)
-            self._vplayer = QMediaPlayer()      # no audio output = silent
-            self._vplayer.setVideoSink(self._sink)
-            self._vplayer.setLoops(QMediaPlayer.Loops.Infinite)
+            self.source = VideoSource(parent=self)   # decodes on its own thread
+            self.source.frameChanged.connect(self._on_frame)
             if DEFAULT_VIDEO.exists():
                 self.set_video(DEFAULT_VIDEO)   # always the stock clip at start
             else:
                 self.pick_random()
 
+    def set_input(self, device):
+        """Live video in: show a V4L2 capture device (`/dev/videoN`) instead
+        of the clips, and ignore clip changes until `None` switches back."""
+        if self.source is None:
+            return
+        self.input = device
+        if device:
+            self.source.open(device)
+        elif self.current is not None:
+            self.source.open(self.current, random_start=True)
+
     def set_video(self, path, random_start=False):
-        player = getattr(self, "_vplayer", None)
-        if player is None:
+        if self.source is None or self.input:
             return None
         self.current = Path(path)
-        self._start_random = random_start
-        player.stop()
-        player.setSource(QUrl.fromLocalFile(str(self.current)))
-        player.play()
+        self.source.open(self.current, random_start)
         return self.current
 
     def pick_random(self):
@@ -528,40 +586,35 @@ class VideoBackdrop(QWidget):
         possible. Rescans the folder, so new files are picked up without a
         restart."""
         files = list(self.videos_fn())
-        if not hasattr(self, "_vplayer") or not files:
+        if self.source is None or not files:
             return None
         files = [f for f in files if f != DEFAULT_VIDEO] or files
         pool = [f for f in files if f != self.current] or files
         return self.set_video(random.choice(pool), random_start=True)
 
-    def _on_frame(self, frame):
-        if not frame.isValid():
-            return
-        if self._start_random:
-            # first decoded frame of a new clip: the backend is ready to
-            # seek now, so do not always open on the first frame
-            self._start_random = False
-            self.jump()
+    def _on_frame(self):
+        fr = self.source.latest()
+        if fr is None:
             return
         st = self.state_fn() if self.state_fn else None
-        live = frame.toImage()
-        self._history.push(live, time.monotonic())
-        if not (st and st.get("reverse")):
-            self._history.stop()
+        rev = st.get("reverse") if st else None
+        if st and "speed" in st:                # the song's sample timeline
+            self.source.set_speed(float(st["speed"]))
+        else:
+            self.source.set_speed(-float(rev) if rev else 1.0)   # a real rewind
+        live = fr.img
         if st and any(k not in ("music", "clean") for k in st):
             now = time.monotonic()
             if now - self._last_fx < FX_INTERVAL:
                 return              # throttle: keep showing the last frame
             self._last_fx = now
             self._zoom = st.get("zoom", 0.0)
-            if st.get("reverse"):
-                src = self._history.rewind(now, float(st["reverse"])) or live
-            elif st.get("repeat") or st.get("freeze"):
+            if st.get("repeat") or st.get("freeze"):
                 # beat-repeat: hold the frame the roll started on, like the
                 # audio holds its slice; a pre-drop gap holds it still
                 if self._frozen is None:
-                    self._frozen = frame.toImage()
-                src = self._frozen
+                    self._frozen = fr
+                src = self._frozen.img
             else:
                 self._frozen = None
                 src = live
@@ -575,6 +628,7 @@ class VideoBackdrop(QWidget):
             self.fx.prev = None
             img = live
         self._image = img
+        self._live = fr                 # the QImage borrows fr's buffer
         self.update()
 
     def set_shader(self, path):          # generative layer: GL backdrop only
@@ -582,9 +636,8 @@ class VideoBackdrop(QWidget):
 
     def jump(self):
         """Seek the backdrop video to a random position (no-op without video)."""
-        player = getattr(self, "_vplayer", None)
-        if player is not None and player.duration() > 0:
-            player.setPosition(random.randrange(player.duration()))
+        if self.source is not None and not self.input:
+            self.source.jump()
 
     def paintEvent(self, _event):
         p = QPainter(self)
@@ -819,7 +872,14 @@ class Main(QMainWindow):
         self._look = {}             # per-section random multipliers per effect
         self._look_idx = None       # (section, 4-bar phrase) of the current look
         self._words_phrase = None   # (section, phrase) currently showing words
-        self._reverse_plan = None   # (phrase key, first bar, bars) to run backwards
+        self._reverse_bar = None    # (section, bar) last rolled for a rewind
+        self._reverse_on = False    # this bar opens with a rewind
+        self._reverse_ms = 0.0      # and for how long
+        self._reverse_speed = 1.0   # and how fast
+        self._follow = None         # FollowPlan of the playing song, if any
+        self._pos_last, self._pos_t = -1, 0.0   # playhead interpolation
+        self._follow_cur = None     # the timeline event now on screen
+        self._follow_seek_t = 0.0   # when the picture was last seeked to it
         self._words_slot = None     # half-beat slot of the cloud on screen
         self._clean_bar = None      # (section, bar) last rolled for clean video
         self._clean_on = False      # this bar shows the video with no effects
@@ -1016,6 +1076,39 @@ class Main(QMainWindow):
             "an ordinary section boundary swaps it about one time in three "
             "after 16 quiet bars.")
         form.addRow("", self.video_switch)
+        self.video_audio = QCheckBox("use the audio of the ticked videos as "
+                                     "sample material")
+        self.video_audio.setToolTip(
+            "The audio tracks of the videos ticked in the Videos tab (all of "
+            "them when none is ticked) join the ticked samples for the next "
+            "render, so drums, textures and chops are cut out of the film's "
+            "own sound. Works with no samples ticked at all. Videos without "
+            "an audio track are skipped. Ticking this sets Random start "
+            "(Layers & FX) to 'all' if it was off, so cuts land anywhere in "
+            "the film rather than at its first seconds.")
+        self.video_audio.toggled.connect(self._video_audio_toggled)
+        form.addRow("Video audio", self.video_audio)
+        self.video_follow = QComboBox()
+        self.video_follow.addItems(list(FOLLOW_GROUPS))
+        self.video_follow.setCurrentText("everything")
+        self.video_follow.setToolTip(
+            "While a song built from video audio plays, the picture shows "
+            "the frames the sound on the speakers was cut from: a hit cuts "
+            "to the moment it was carved at, a texture runs (backwards, "
+            "stretched) along with its loop, a chop jumps slice by slice. "
+            "Pick which layers the picture follows; a hit wins over a chop, "
+            "a chop over a texture. Off: the backdrop behaves as usual.")
+        form.addRow("", self._row([("picture follows", self.video_follow)]))
+        self.video_in = QComboBox()
+        self.video_in.setToolTip(
+            "Live video in: a V4L2 capture device (a webcam, or a USB "
+            "composite grabber with a VHS deck on it) replaces the clips as "
+            "the backdrop. Everything else runs on it as usual: the effects, "
+            "the shader layer, the words, and rewinds jog the live picture "
+            "through the last seconds captured. Clip changes are held off "
+            "until this is back to off.")
+        self.video_in.currentIndexChanged.connect(self._video_in_changed)
+        form.addRow("Video input", self._row([("device", self.video_in)]))
 
         self.live_on = QCheckBox("live: an audio input drives the effects "
                                  "instead of a song (L)")
@@ -1027,7 +1120,7 @@ class Main(QMainWindow):
             "Every 8 bars count as a section for the look, shader and clip "
             "changes. Turning a song on switches live off.")
         self.live_on.toggled.connect(self._toggle_live)
-        form.addRow("Live input", self.live_on)
+        form.addRow("Audio input", self.live_on)
         self.live_device = QComboBox()
         self.live_device.setToolTip("Capture device; the list follows what "
                                     "the system offers")
@@ -1113,6 +1206,10 @@ class Main(QMainWindow):
         self.vfx = {}
         for key, label, default, tip in VIDEO_EFFECTS:
             self.vfx[key] = self._prob_spin(default, tip)
+        self.reverse_len = QComboBox()
+        self.reverse_len.addItems(list(REVERSE_LENGTHS))
+        self.reverse_len.setToolTip("How long each rewind runs, from its "
+                                    "downbeat; random picks per bar")
         rows = [("Color", ("color", "tint", "pump", "flash")),
                 ("Pixels", ("pixel", "bits", "dither")),
                 ("Tone", ("mono", "solar", "edges", "lines")),
@@ -1121,8 +1218,10 @@ class Main(QMainWindow):
                 ("Frame", ("vign", "kaleido", "words", "clean"))]
         labels = {k: lbl for k, lbl, _, _ in VIDEO_EFFECTS}
         for title, keys in rows:
-            form.addRow(title, self._row([(labels[k], self.vfx[k])
-                                          for k in keys]))
+            pairs = [(labels[k], self.vfx[k]) for k in keys]
+            if "reverse" in keys:
+                pairs.append(("length", self.reverse_len))
+            form.addRow(title, self._row(pairs))
         hint = QLabel("strength 0 = off; driven by the song's sections and "
                       "loudness, or by the live input and tap tempo")
         hint.setProperty("role", "sub")
@@ -1130,7 +1229,7 @@ class Main(QMainWindow):
         return self._wrap(form, self._randomize_video)
 
     def _randomize_video(self):
-        self._shuffle(*self.vfx.values(), self.shader_blend)
+        self._shuffle(*self.vfx.values(), self.shader_blend, self.reverse_len)
         self.shader_mix.setValue(random.choice([0.3, 0.5, 0.7, 1.0]))
         self.shader.setCurrentText("random")
         self._look_idx = None                  # re-roll the look right away
@@ -1778,13 +1877,17 @@ class Main(QMainWindow):
     # ---------- generation ----------
     def generate(self):
         samples = self.checked_samples()
-        if not samples:
+        video_audio = [str(p) for p in self._song_videos()] \
+            if self.video_audio.isChecked() else []
+        if not samples and not video_audio:
             self.log.appendPlainText(
-                "✗ no samples selected — tick some in the Samples tab")
+                "✗ no samples selected — tick some in the Samples tab, or "
+                "use the audio of the videos (Video tab)")
             return
         job = {"count": self.count.value(),
                "duration": self.duration.value(),
                "samples": samples,
+               "video_audio": video_audio,
                "intro_style": self.intro_style.currentText(),
                "outro_style": self.outro_style.currentText(),
                "drum_style": self.drum_style.currentText(),
@@ -1918,6 +2021,32 @@ class Main(QMainWindow):
             if i >= 0:
                 self.live_device.setCurrentIndex(i)
         self.live_device.blockSignals(False)
+        cur = self.video_in.currentData()
+        self.video_in.blockSignals(True)
+        self.video_in.clear()
+        self.video_in.addItem("off", None)
+        for name, dev in video_inputs():
+            self.video_in.addItem(name, dev)
+        if cur:
+            i = self.video_in.findData(cur)
+            if i >= 0:
+                self.video_in.setCurrentIndex(i)
+        self.video_in.blockSignals(False)
+        if self.video_in.currentData() != cur:
+            self._video_in_changed()             # the device went away
+
+    def _video_audio_toggled(self, on):
+        """Video audio on: a soundtrack is one long take, so cuts should
+        start anywhere in it, not always at its first seconds."""
+        if on and self.random_start.currentText() == "off":
+            self.random_start.setCurrentText("all")
+            self.log.appendPlainText("video audio: random start set to 'all' "
+                                     "so cuts land anywhere in the film")
+
+    def _video_in_changed(self, *_):
+        """Video input combo -> backdrop: a capture device, or back to clips."""
+        if hasattr(self, "backdrop"):
+            self.backdrop.set_input(self.video_in.currentData())
 
     def _toggle_live(self, on):
         """Live mode on: the song stops and its analysis is dropped, the
@@ -2057,6 +2186,8 @@ class Main(QMainWindow):
         transition effect) once 4 bars have passed since the last switch,
         and now and then on an ordinary section boundary after 16 quiet
         bars. Otherwise the current clip jumps to a random spot."""
+        if self._following():
+            return                  # the sample timeline picks clip and spot
         switch = False
         if self.video_switch.isChecked() and len(self._song_videos()) > 1 \
                 and self._sections and 0 < idx <= len(self._sections):
@@ -2102,12 +2233,63 @@ class Main(QMainWindow):
             if str(f) == current_path:
                 self.mixer_renders.setCurrentItem(item)
 
+    def _playhead_ms(self):
+        """The song position for this frame. QMediaPlayer reports it only
+        about ten times a second, so between reports it is carried forward
+        on the wall clock (up to a quarter second), which keeps hits, cuts
+        and the sample timeline within a frame of the sound."""
+        pos = self.player.position()
+        now = time.monotonic()
+        if pos != self._pos_last:
+            self._pos_last, self._pos_t = pos, now
+            return pos
+        return pos + min(250.0, (now - self._pos_t) * 1000.0)
+
+    def _following(self):
+        """True while the playing song's picture is driven by its sample
+        timeline (a song built from video audio, follow mode not off)."""
+        return self._follow is not None \
+            and bool(FOLLOW_GROUPS.get(self.video_follow.currentText()))
+
+    def _follow_video(self, pos, st):
+        """Put the frames the sounding sample was cut from on screen: on a
+        new event, switch clip if needed and seek to its source offset (as
+        of now); every frame, hand its rate to the backdrop as st['speed'].
+        Nothing sounding from a video = the backdrop free-runs as usual."""
+        source = getattr(self.backdrop, "source", None)
+        if source is None or self.backdrop.input or not self._following():
+            self._follow_cur = None
+            return
+        ev = self._follow.pick(pos, FOLLOW_GROUPS[self.video_follow.currentText()])
+        source.catch_up = ev is None       # a deliberate slow-down is not a rewind
+        if ev is None:
+            self._follow_cur = None
+            return
+        t_ms, video, off, _dur_ms, rate = ev
+        want = off + (pos - t_ms) / 1000.0 * rate
+        now = time.monotonic()
+        if ev is not self._follow_cur:
+            self._follow_cur = ev
+            if self.backdrop.current != video:
+                self.backdrop.set_video(video)
+            source.seek(want)
+            self._follow_seek_t = now
+        elif now - self._follow_seek_t > 0.15 and source.duration:
+            # drift check: a seek in the song, or a stalled decode, and the
+            # picture is somewhere else; the wrap-around is a short distance
+            d = abs(source.position() - want % source.duration)
+            if min(d, source.duration - d) > 0.15:
+                source.seek(want)
+                self._follow_seek_t = now
+        st["speed"] = rate
+
     def _load_sections(self, wav):
         """Called whenever a new file starts: pick a fresh backdrop video,
         then load the section map and loudness envelope for the video
         jumps and effects. Everything degrades to nothing."""
         self._sec_idx = -1
         self._sections, self._sec_bounds, self._env = [], [], None
+        self._follow = self._follow_cur = None
         self._pick_song_video()
         self._outro = None
         parts = Path(wav).stem.split("_")
@@ -2120,6 +2302,9 @@ class Main(QMainWindow):
             self._sec_bounds = [int(s["start_sec"] * 1000)
                                 for s in self._sections]
             self._beat_ms = 60000.0 / meta["bpm"]
+            plan = FollowPlan(meta.get("events") or [],
+                              meta.get("video_sources") or {})
+            self._follow = plan if plan.n else None
             o = meta.get("outro") or {}
             if o.get("style") in (None, "none") or "tail_sec" not in o:
                 raise KeyError            # no ending effect: no fade
@@ -2149,11 +2334,6 @@ class Main(QMainWindow):
             return
         section_changed = self._look_idx is None or self._look_idx[0] != idx
         self._look_idx = key
-        # reverse: this phrase runs a bar or two backwards with probability
-        # = strength / 2, starting on a random bar of the phrase
-        self._reverse_plan = None
-        if random.random() < self.vfx["reverse"].value() * 0.5:
-            self._reverse_plan = (key, random.randrange(4), random.choice([1, 1, 2]))
         # word cloud: this phrase shows one with probability = strength
         self._words_phrase = None
         if random.random() < self.vfx["words"].value() and hasattr(self.backdrop, "set_overlay"):
@@ -2239,7 +2419,7 @@ class Main(QMainWindow):
         else:
             if self.player.playbackState() != QMediaPlayer.PlayingState:
                 return None
-            pos = self.player.position()
+            pos = self._playhead_ms()
             fade = self._outro_fade(pos)
             beat_ms = self._beat_ms
             env = 0.5
@@ -2301,6 +2481,32 @@ class Main(QMainWindow):
             self._clean_bar = bar_key
             self._clean_on = random.random() < v["clean"]
         in_bar = (pos - sec_start_ms) - bar_i * 4 * beat_ms
+        if not live:
+            self._follow_video(pos, st)
+        if v["reverse"]:
+            # rolled once per bar on its downbeat, with probability =
+            # strength; the bar then opens with a rewind of the chosen length
+            if bar_key != self._reverse_bar:
+                self._reverse_bar = bar_key
+                self._reverse_on = random.random() < v["reverse"]
+                bars = REVERSE_LENGTHS[self.reverse_len.currentText()]
+                if bars is None:
+                    bars = random.choice([b for b in REVERSE_LENGTHS.values() if b])
+                self._reverse_ms = bars * 4 * beat_ms
+                self._reverse_speed = random.choice([1.0, 1.0, 1.5, 2.0, 3.0])
+            # a clean flash jogs too: the bare video runs back, then on
+            if (self._reverse_on or self._clean_on) and in_bar < self._reverse_ms \
+                    and "speed" not in st:          # not while following a sample
+                st["reverse"] = self._reverse_speed  # backwards, at that speed
+            nxt = idx + 1
+            if nxt < len(self._sections):           # cymbal swell: rewind into
+                for t in self._sections[nxt].get("transition", []):   # the drop
+                    if t.startswith("cymbal:"):
+                        length = float(t[7:].rstrip("bar")) * 4 * beat_ms
+                        left = self._sec_bounds[nxt] - pos
+                        if 0 <= left < length:
+                            st["reverse"] = 1.0 + 2.0 * (1 - left / length)
+                            st.pop("speed", None)   # the swell wins over the timeline
         if self._clean_on and in_bar < beat_ms / 4:
             st["clean"] = True
             if fade < 1.0:
@@ -2369,19 +2575,6 @@ class Main(QMainWindow):
             st["glitch_mode"] = self._glitch_mode
         if lk("rgb"):
             st["rgbshift"] = int(14 * lk("rgb") * (0.3 + 0.7 * env))
-        if v["reverse"]:
-            plan = self._reverse_plan
-            if plan and plan[0] == self._look_idx \
-                    and plan[1] <= bar_i % 4 < plan[1] + plan[2]:
-                st["reverse"] = 1.0                 # a bar or two, real time
-            nxt = idx + 1
-            if nxt < len(self._sections):           # cymbal swell: rewind into
-                for t in self._sections[nxt].get("transition", []):   # the drop
-                    if t.startswith("cymbal:"):
-                        length = float(t[7:].rstrip("bar")) * 4 * beat_ms
-                        left = self._sec_bounds[nxt] - pos
-                        if 0 <= left < length:
-                            st["reverse"] = 1.0 + 2.0 * (1 - left / length)
         if lk("vign"):
             st["vignette"] = min(1.0, lk("vign"))
         if self._kaleido:
@@ -2562,6 +2755,8 @@ class Main(QMainWindow):
         self._show_ui()                         # never leave the cursor hidden
         self.player.stop()
         self.live.stop()
+        if getattr(self.backdrop, "source", None) is not None:
+            self.backdrop.source.stop()
         if self.worker and self.worker.isRunning():
             self.worker.wait(2000)
         event.accept()

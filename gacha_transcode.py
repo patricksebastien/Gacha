@@ -9,7 +9,9 @@ on drops, so a video must seek fast. Phone and drone clips are 4K H.264 or
 HEVC at 60 fps with an audio track: heavy to decode, and a seek stalls the
 picture for 100-300 ms right on the downbeat. The default target is
 1080p, 30 fps, MJPEG in a .mov, where every frame is a keyframe and a
-seek lands in about 15 ms. Audio is always removed.
+seek lands in about 15 ms. The audio track is kept as it is (copied,
+not re-encoded): the app can build songs out of a video's own soundtrack.
+--no-audio drops it.
 
 Every video under videos/ (its set subfolders included) is probed. A file
 already at spec is left alone. Anything else is re-encoded next to itself
@@ -22,6 +24,7 @@ videos/gacha.mp4 and anything already in originals/ are skipped.
     python3 gacha_transcode.py --height 720 --fps 24 --quality 4
     python3 gacha_transcode.py --codec h264 --quality 20 --gop 15
     python3 gacha_transcode.py --force            # redo files already at spec
+    python3 gacha_transcode.py --no-audio         # silent backdrops only
     python3 gacha_transcode.py videos/field/a.MP4 # just this one
 """
 
@@ -76,19 +79,20 @@ def probe(path):
             "audio": any(s.get("codec_type") == "audio" for s in streams)}
 
 
-def at_spec(info, codec, height, fps):
+def at_spec(info, codec, height, fps, no_audio):
     return (info["codec"] == codec and info["height"] <= height
-            and info["fps"] <= fps + 0.05 and not info["audio"])
+            and info["fps"] <= fps + 0.05 and not (no_audio and info["audio"]))
 
 
-def encode_cmd(src, dst, codec, height, fps, quality, gop, scale_up):
+def encode_cmd(src, dst, codec, height, fps, quality, gop, scale_up, no_audio):
     encoder, _, qflag, _ = CODECS[codec]
     # scale only downwards unless asked; keep aspect, even dimensions
     vf = [f"scale=-2:'min({height},ih)'" if not scale_up else f"scale=-2:{height}",
           f"fps={fps:g}"]
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y",
-           "-i", str(src), "-vf", ",".join(vf), "-an",
+           "-i", str(src), "-map", "0:v:0", "-vf", ",".join(vf),
            "-c:v", encoder, qflag, str(quality)]
+    cmd += ["-an"] if no_audio else ["-map", "0:a?", "-c:a", "copy"]
     if codec == "h264":
         cmd += ["-preset", "fast", "-pix_fmt", "yuv420p",
                 "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
@@ -128,8 +132,8 @@ def describe(info):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Re-encode backdrop videos for instant seeking; audio is "
-                    "always removed and originals move to videos/originals/.")
+        description="Re-encode backdrop videos for instant seeking; the audio "
+                    "track is kept and originals move to videos/originals/.")
     ap.add_argument("--codec", choices=CODECS, default="mjpeg",
                     help="mjpeg: every frame a keyframe, fastest seeks, big "
                          "files (default); h264: small files, seeks limited "
@@ -148,6 +152,8 @@ def main():
                     help="also upscale clips smaller than --height")
     ap.add_argument("--force", action="store_true",
                     help="re-encode files that already meet the spec")
+    ap.add_argument("--no-audio", action="store_true",
+                    help="drop the audio track (default: copy it as it is)")
     ap.add_argument("--dry-run", action="store_true",
                     help="report only, change nothing")
     ap.add_argument("files", nargs="*",
@@ -168,16 +174,17 @@ def main():
             print(f"  ? {src.relative_to(VIDEOS_DIR)}: not a readable video")
             bad += 1
             continue
-        if at_spec(info, a.codec, a.height, a.fps) and not a.force:
+        if at_spec(info, a.codec, a.height, a.fps, a.no_audio) and not a.force:
             fine += 1
             continue
-        # a file at spec except for its audio track only needs a remux
+        # a file at spec except for an unwanted audio track only needs a remux
         remux = (info["codec"] == a.codec and info["height"] <= a.height
                  and info["fps"] <= a.fps + 0.05 and not a.force)
         todo.append((src, info, remux))
 
     print(f"{fine} video(s) already at spec ({a.codec}, <= {a.height}p, "
-          f"<= {a.fps:g} fps, no audio); {len(todo)} to convert"
+          f"<= {a.fps:g} fps{', no audio' if a.no_audio else ''}); "
+          f"{len(todo)} to convert"
           + (f"; {bad} unreadable" if bad else ""))
     if not todo:
         return
@@ -195,7 +202,8 @@ def main():
             continue
         tmp = dst.with_name(dst.stem + ".transcoding" + dst.suffix)
         cmd = remux_cmd(src, tmp) if remux else encode_cmd(
-            src, tmp, a.codec, a.height, a.fps, quality, a.gop, a.scale_up)
+            src, tmp, a.codec, a.height, a.fps, quality, a.gop, a.scale_up,
+            a.no_audio)
         try:
             subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as e:
