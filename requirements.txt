@@ -8,6 +8,7 @@ PySide6
 av
 mido
 python-rtmidi
+psutil
 # ffmpeg itself is a system install (see README); this gives a fallback
 # static ffmpeg binary when none is on PATH (no ffprobe, so gacha_transcode.py
 # still wants the system one)

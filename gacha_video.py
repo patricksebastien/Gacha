@@ -164,6 +164,7 @@ class VideoSource(QObject):
         self._last_tick = None
         self._pos0, self._t0 = 0.0, time.monotonic()   # clock: pos0 at t0
         self._latest = None
+        self.frames = 0                  # frames shown so far (stats)
         self._quit = False
         # decoder state (worker thread only)
         self._ctr = None
@@ -333,6 +334,7 @@ class VideoSource(QObject):
         if fr is None:
             return
         self._latest = fr
+        self.frames += 1
         self.frameChanged.emit()
 
     def _close(self):

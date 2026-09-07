@@ -3,7 +3,8 @@
 gacha.py — Qt front-end for the gacha_engine.py render engine.
 
 Left side: all generation parameters in tabs (General / Drums / Sections /
-Layers & FX) + live render log.
+Layers & FX / Video / Perform / Controls) and the live render log in a tab
+of its own.
 Right side: the sample library (samples/, one subfolder per set, with
 checkboxes picking what a render may use), the video library (videos/,
 same tree, picking the backdrop clips), past renders
@@ -26,8 +27,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from PySide6.QtCore import (QEvent, QPoint, Qt, QRectF, QSettings, QThread,
-                            QTimer, QUrl, Signal)
+from PySide6.QtCore import (QEvent, QObject, QPoint, QSize, Qt, QRectF, QSettings,
+                            QThread, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QColor, QFont, QFontDatabase, QImage, QKeySequence,
                            QPainter, QRegularExpressionValidator, QShortcut)
 from PySide6.QtCore import QRegularExpression
@@ -56,6 +57,10 @@ import threading
 from gacha_video import VideoSource, video_inputs
 from gacha_midi import (MIDI_AVAILABLE, MidiIn, format_binding, midi_inputs,
                         parse_binding)
+try:
+    import psutil                    # cpu and memory for the stats HUD
+except ImportError:                  # pragma: no cover
+    psutil = None
 
 BASE = Path(__file__).parent
 GACHA = BASE / "gacha_engine.py"
@@ -196,6 +201,54 @@ def make_word_cloud(size, words, families, rng, hue=None, n=None, palette=()):
     p.end()
     return img
 
+CLOUD_MAX_H = 720       # the word cloud is drawn at most this tall and upscaled
+                        # by the GPU: a quarter of the pixels of 1440p, a ninth of 4K
+
+
+class WordCloudWorker(QObject):
+    """Draws word clouds on a thread of its own. Drawing 40 to 180 words in
+    random fonts at random sizes takes 50 to 80 ms with QPainter (the big
+    glyphs go through paths, the glyph cache cannot help), and one is due
+    every half beat while a cloud phrase runs: done on the GUI thread that
+    was 3 to 5 dropped frames per half beat. submit() returns at once, the
+    newest request replaces a pending one, and `ready` fires in the GUI
+    thread with the image, already in the texture's format."""
+
+    ready = Signal(QImage)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._job = None
+        self._cv = threading.Condition()
+        self.error = None
+        threading.Thread(target=self._run, name="gacha-words", daemon=True).start()
+
+    def submit(self, size, words, families, rng, hue=None, n=None, palette=()):
+        """Draw a cloud for a picture of `size`: the image is capped at
+        CLOUD_MAX_H tall (same layout, the GPU scales it up)."""
+        W, H = size.width(), size.height()
+        if W <= 0 or H <= 0:
+            return
+        sc = min(1.0, CLOUD_MAX_H / H)
+        small = QSize(max(2, int(round(W * sc))), max(2, int(round(H * sc))))
+        with self._cv:
+            self._job = (small, words, families, rng, hue, n, list(palette))
+            self._cv.notify()
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while self._job is None:
+                    self._cv.wait()
+                job, self._job = self._job, None
+            try:
+                img = make_word_cloud(*job).convertToFormat(QImage.Format_RGBA8888)
+            except Exception as e:                  # pragma: no cover
+                self.error = str(e)
+                continue
+            self.ready.emit(img)
+
+
 DEFAULT_VIDEO = VIDEOS_DIR / "gacha.mp4"     # shipped with the repo, shown at start
 VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mkv")
 
@@ -284,61 +337,6 @@ BAYER4 = np.array([[0, 8, 2, 10], [12, 4, 14, 6],
                    [3, 11, 1, 9], [15, 7, 13, 5]], dtype="float32") / 16.0
 
 # every effect the Video tab exposes: key, label, default strength, tooltip
-# every action the performer has, in one table: the Controls tab shows it,
-# the keyboard shortcuts and the MIDI bindings hang on the same ids.
-# (group, id, key, what); "" for key = MIDI only (a continuous control)
-KEYMAP = [
-    ("show", "fullscreen", "F11", "fullscreen on/off; Esc leaves it too"),
-    ("show", "video_only", "C", "video only: no effects, no shader layer, no words"),
-    ("show", "next_fx", "Space", "next video FX look, and the next shader"),
-    ("show", "shader", "S", "shader layer off/on"),
-    ("show", "shader_1", "1", "shader 1 in list order"),
-    ("show", "shader_2", "2", "shader 2 in list order"),
-    ("show", "shader_3", "3", "shader 3 in list order"),
-    ("show", "shader_4", "4", "shader 4 in list order"),
-    ("show", "shader_5", "5", "shader 5 in list order"),
-    ("show", "shader_6", "6", "shader 6 in list order"),
-    ("show", "shader_7", "7", "shader 7 in list order"),
-    ("show", "shader_8", "8", "shader 8 in list order"),
-    ("show", "shader_9", "9", "shader 9 in list order"),
-    ("show", "shader_off", "0", "shader layer off"),
-    ("tape", "through", "A", "audio through off/on (tape -> output)"),
-    ("tape", "record", "R", "take: start / stop recording the live feed into RAM"),
-    ("clock", "tap", "T", "tap tempo, first tap on the downbeat"),
-    ("clock", "downbeat", "D", "restart the bar now, tempo kept"),
-    ("clock", "live", "L", "live mode (audio drives the visuals) off/on"),
-    ("clock", "drop", "X", "mark a drop by hand"),
-    ("section", "next", "N", "next section on the bar (pre-rendered)"),
-    ("section", "stop", "Shift+N", "stop the section on the bar"),
-    ("section", "event", "E", "fire a one-shot from the material on the beat"),
-    ("section", "ab_down", "[", "A/B 10 % toward the tape"),
-    ("section", "ab_up", "]", "A/B 10 % toward the section"),
-    ("section", "ab", "", "A/B position, an expression pedal (CC 0..127)"),
-    ("section", "stem_drums", "F1", "drums stem in/out"),
-    ("section", "stem_layers", "F2", "layers stem in/out"),
-    ("section", "stem_chops", "F3", "chops stem in/out"),
-    ("section", "stem_events", "F4", "events stem in/out"),
-]
-# ids that take a value (0..1) instead of firing; only a CC can drive them
-CONTINUOUS = {"ab"}
-KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
-                 "section": "section engine"}
-
-
-def default_midi_map():
-    """The bindings before anyone learns their own: one note per button
-    action, from C1 (36) up in table order, on channel 1, which is what a
-    pad or a keyboard sends; the continuous actions on CC 11 (expression),
-    12, ... on channel 1. Any controller overwrites these by MIDI learn."""
-    out, note, cc = {}, 36, 11
-    for _g, ident, _k, _w in KEYMAP:
-        if ident in CONTINUOUS:
-            out[ident] = format_binding("cc", 1, cc)
-            cc += 1
-        else:
-            out[ident] = format_binding("note", 1, note)
-            note += 1
-    return out
 
 # source grade: colour correction of the picture itself (the VHS input above
 # all), applied before every effect and kept in "video only" mode.
@@ -407,6 +405,82 @@ VIDEO_EFFECTS = [
                             "is, with no effects, no shader layer and no "
                             "words. 0 = never, 1 = every bar"),
 ]
+# every action the performer has, in one table: the Controls tab shows it,
+# the keyboard shortcuts and the MIDI bindings hang on the same ids.
+# (group, id, key, what); "" for key = MIDI only (a continuous control)
+KEYMAP = [
+    ("show", "fullscreen", "F11", "fullscreen on/off; Esc leaves it too"),
+    ("show", "video_only", "C", "video only: no effects, no shader layer, no words"),
+    ("show", "next_fx", "Space", "next video FX look, and the next shader"),
+    ("show", "shader", "S", "shader layer off/on"),
+    ("show", "shader_1", "1", "shader 1 in list order"),
+    ("show", "shader_2", "2", "shader 2 in list order"),
+    ("show", "shader_3", "3", "shader 3 in list order"),
+    ("show", "shader_4", "4", "shader 4 in list order"),
+    ("show", "shader_5", "5", "shader 5 in list order"),
+    ("show", "shader_6", "6", "shader 6 in list order"),
+    ("show", "shader_7", "7", "shader 7 in list order"),
+    ("show", "shader_8", "8", "shader 8 in list order"),
+    ("show", "shader_9", "9", "shader 9 in list order"),
+    ("show", "shader_off", "0", "shader layer off"),
+    ("tape", "through", "A", "audio through off/on (tape -> output)"),
+    ("tape", "record", "R", "take: start / stop recording the live feed into RAM"),
+    ("clock", "tap", "T", "tap tempo, first tap on the downbeat"),
+    ("clock", "downbeat", "D", "restart the bar now, tempo kept"),
+    ("clock", "live", "L", "live mode (audio drives the visuals) off/on"),
+    ("clock", "drop", "X", "mark a drop by hand"),
+    ("section", "next", "N", "next section on the bar (pre-rendered)"),
+    ("section", "stop", "Shift+N", "stop the section on the bar"),
+    ("section", "event", "E", "fire a one-shot from the material on the beat"),
+    ("section", "ab_down", "[", "A/B 10 % toward the tape"),
+    ("section", "ab_up", "]", "A/B 10 % toward the section"),
+    ("section", "ab", "", "A/B position, an expression pedal (CC 0..127)"),
+    ("section", "stem_drums", "F1", "drums stem in/out"),
+    ("section", "stem_layers", "F2", "layers stem in/out"),
+    ("section", "stem_chops", "F3", "chops stem in/out"),
+    ("section", "stem_events", "F4", "events stem in/out"),
+    # MIDI only from here on (no key): more buttons, then the knobs
+    ("show", "randomize_fx", "", "new random effect strengths (the Randomize button)"),
+    ("show", "grade_neutral", "", "source grade back to neutral"),
+    ("show", "blend_next", "", "next shader blend mode (mix, add, screen)"),
+    ("section", "kind_next", "", "next section kind (random, groove, break, ...)"),
+    ("section", "picture_next", "", "picture while a section plays: auto, take, live"),
+    ("mix", "volume", "", "main volume: songs and the audio through"),
+    ("mix", "sync", "", "audio sync delay, 0 to 2000 ms"),
+    ("mix", "shader_mix", "", "shader layer opacity"),
+    ("mix", "shader_pick", "", "shader by knob: off at the bottom, then each shader in list order"),
+]
+# the source grade knobs and every effect strength, one row each, from the
+# tables that build their widgets
+KEYMAP += [("grade", f"grade_{k}", "", f"{lbl}: {lo:g} to {hi:g}, neutral {val:g}")
+           for k, lbl, (lo, hi, _s, val), _t in VIDEO_GRADE]
+KEYMAP += [("fx", f"fx_{k}", "", f"{lbl} strength, 0 (off) to 1")
+           for k, lbl, _d, _t in VIDEO_EFFECTS]
+# ids that take a value (0..1) instead of firing; only a CC can drive them
+CONTINUOUS = {"ab", "volume", "sync", "shader_mix", "shader_pick"} \
+    | {f"grade_{k}" for k, *_ in VIDEO_GRADE} | {f"fx_{k}" for k, *_ in VIDEO_EFFECTS}
+KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
+                 "section": "section engine", "mix": "mix and shader",
+                 "grade": "source grade", "fx": "video effects"}
+
+
+def default_midi_map():
+    """The bindings before anyone learns their own: one note per button
+    action, from C1 (36) up in table order, on channel 1, which is what a
+    pad or a keyboard sends; the knobs on CC 11 (expression) for A/B, then
+    12, 13, ... in table order, channel 1. Any controller overwrites these
+    by MIDI learn."""
+    out, note, cc = {}, 36, 11
+    for _g, ident, _k, _w in KEYMAP:
+        if ident in CONTINUOUS:
+            out[ident] = format_binding("cc", 1, cc)
+            cc += 1
+        else:
+            out[ident] = format_binding("note", 1, note)
+            note += 1
+    return out
+
+
 NOTE_HUES = {n: i / 12 for i, n in enumerate(
     ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"])}
 # these follow the music directly and are not part of the random per-section look
@@ -641,6 +715,7 @@ class VideoBackdrop(QWidget):
         self._zoom = 0.0
         self._frozen = None         # captured frame while a beat-repeat runs
         self.child = child
+        self.frames = 0             # paints so far (the stats HUD reads the rate)
         self.current = None         # path of the video now looping
         self.input = None           # live capture device while video in is on
         lay = QVBoxLayout(self)
@@ -733,6 +808,7 @@ class VideoBackdrop(QWidget):
             self.source.jump()
 
     def paintEvent(self, _event):
+        self.frames += 1
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         p.fillRect(self.rect(), QColor(16, 9, 7))
@@ -903,6 +979,43 @@ class SetTree(QTreeWidget):
             self.activated.emit(item.data(0, Qt.UserRole))
 
 
+class HoverTabs(QObject):
+    """Switch a QTabWidget's page by hovering its tabs: after `delay` ms on
+    one tab it becomes current, no click needed. Install with
+    HoverTabs(tabwidget). The dwell keeps a sweep across the bar from
+    flipping through every page."""
+
+    def __init__(self, tabs, delay=120):
+        super().__init__(tabs)
+        self.tabs, self.bar = tabs, tabs.tabBar()
+        self._idx = -1
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(delay)
+        self._timer.timeout.connect(self._fire)
+        self.bar.setMouseTracking(True)
+        self.bar.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t in (QEvent.HoverMove, QEvent.MouseMove):
+            idx = self.bar.tabAt(event.position().toPoint())
+            if idx != self._idx:
+                self._idx = idx
+                if idx >= 0 and idx != self.tabs.currentIndex():
+                    self._timer.start()
+                else:
+                    self._timer.stop()
+        elif t in (QEvent.HoverLeave, QEvent.Leave):
+            self._idx = -1
+            self._timer.stop()
+        return False
+
+    def _fire(self):
+        if 0 <= self._idx < self.tabs.count():
+            self.tabs.setCurrentIndex(self._idx)
+
+
 class RenderWorker(QThread):
     """Writes the job as JSON, runs gacha_engine.py on it in a subprocess and
     streams its log lines."""
@@ -982,6 +1095,8 @@ class Main(QMainWindow):
         self._song_word = None      # the word in the playing render's file name
         self._song_facts = []       # (key, value) pairs from the render's JSON
         self.font_families = load_fonts()
+        self._cloud = WordCloudWorker(self)          # word clouds, off the GUI thread
+        self._cloud.ready.connect(self._cloud_ready)
         self._kaleido = 0
         self._mono = (0, 0.5)
         self._pix_seed = 0.0
@@ -1018,20 +1133,17 @@ class Main(QMainWindow):
 
         # ---------- parameters panel ----------
         self.settings = QSettings("gacha", "gacha")
+        self.log = QPlainTextEdit(readOnly=True)     # its own tab, see _tab_log
+        self.log.setMaximumBlockCount(2000)
         params_box = self._build_params()
 
         self.generate_btn = QPushButton("Generate")
         self.generate_btn.setMinimumHeight(36)
         self.generate_btn.clicked.connect(self.generate)
 
-        self.log = QPlainTextEdit(readOnly=True)
-        self.log.setMaximumBlockCount(2000)
-
         left = QVBoxLayout()
-        left.addWidget(params_box)
+        left.addWidget(params_box, stretch=1)
         left.addWidget(self.generate_btn)
-        left.addWidget(QLabel("Render log"))
-        left.addWidget(self.log, stretch=1)
         left_w = QWidget()
         left_w.setLayout(left)
 
@@ -1067,7 +1179,7 @@ class Main(QMainWindow):
             tabs.addTab(w, title)
         tabs.addTab(self.outputs_list, "Outputs")
         tabs.addTab(self._scrolling(self._build_mixer()), "Mixer")
-        # the lists pane is a quarter of the interface: pages scroll rather
+        # the lists pane is 40 % of the interface: pages scroll rather
         # than force the pane wide
         for i in range(tabs.count()):
             if tabs.tabText(i) in ("Samples", "Videos"):
@@ -1112,10 +1224,10 @@ class Main(QMainWindow):
         split.addWidget(left_w)
         split.addWidget(right_w)
         left_w.setMinimumWidth(560)      # four-spinbox rows need the room
-        # parameters 75 %, the file lists 25 %; the ratio survives resizes
+        # parameters 60 %, the file lists 40 %; the ratio survives resizes
         # and follows the handle when it is dragged
         self.split = split
-        self._split_ratio = 0.75
+        self._split_ratio = 0.60
         split.splitterMoved.connect(self._split_dragged)
         self.setStyleSheet(STYLE)
         self.gl_mode = gl_available()
@@ -1127,6 +1239,21 @@ class Main(QMainWindow):
         self.backdrop.shader_mix = self.shader_mix.value()
         self.backdrop.shader_blend = self.shader_blend.currentIndex()
         self.setCentralWidget(self.backdrop)
+        # the stats HUD: a label over the picture, top right, above the interface
+        self.hud = QLabel(self.backdrop)
+        self.hud.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.hud.setStyleSheet(
+            "QLabel { background: rgba(16, 9, 7, 170); color: rgba(242, 233, 229, 230); "
+            "font-family: monospace; font-size: 12px; padding: 4px 8px; "
+            "border-radius: 6px; }")
+        self.hud.hide()
+        self._stats_timer = QTimer(self)
+        self._stats_timer.timeout.connect(self._update_stats)
+        self._stats_prev = None                  # (time, paints, video frames)
+        self._proc = psutil.Process() if psutil else None
+        if self._proc is not None:
+            self._proc.cpu_percent(None)          # prime the counters
+            psutil.cpu_percent(None)
         self._apply_shader_choice()
         if hasattr(self.backdrop, "prewarm"):
             self.backdrop.prewarm(shader_files())   # compile all shaders early
@@ -1167,6 +1294,27 @@ class Main(QMainWindow):
             self.actions[f"shader_{n}"] = lambda n=n: self.select_shader_key(n)
         for stem in STEMS:
             self.actions[f"stem_{stem}"] = self.perf_stems[stem].toggle
+        # MIDI-only buttons
+        self.actions.update({
+            "randomize_fx": self._randomize_video,
+            "grade_neutral": self._reset_grade,
+            "blend_next": lambda: self._combo_next(self.shader_blend),
+            "kind_next": lambda: self._combo_next(self.perf_kind),
+            "picture_next": lambda: self._combo_next(self.perf_picture),
+        })
+        # knobs: a CC's 0..1 spread over the widget's range
+        self.actions.update({
+            "volume": self._frac_setter(self.vol),
+            "sync": self._frac_setter(self.through_sync),
+            "shader_mix": self._frac_setter(self.shader_mix),
+            "shader_pick": self._pick_shader_frac,
+        })
+        for k, sp in self.grade.items():
+            self.actions[f"grade_{k}"] = self._frac_setter(sp)
+        for k, sp in self.vfx.items():
+            self.actions[f"fx_{k}"] = self._frac_setter(sp)
+        missing = [ident for _g, ident, _k, _w in KEYMAP if ident not in self.actions]
+        assert not missing, f"actions without a handler: {missing}"
         self.shortcuts = []
         for _g, ident, key, _w in KEYMAP:
             if not key or ident in CONTINUOUS:
@@ -1178,6 +1326,66 @@ class Main(QMainWindow):
         self._midi_setup()
 
         self.refresh_lists()
+
+    # ---------- stats HUD ----------
+    def _toggle_stats(self, on):
+        if on:
+            self._stats_prev = None
+            self._update_stats()
+            self._stats_timer.start(500)
+            self.hud.show()
+            self.hud.raise_()
+        else:
+            self._stats_timer.stop()
+            self.hud.hide()
+
+    def _update_stats(self):
+        """Half a second of the machine: paint and video rates from the frame
+        counters, GPU paint time, CPU, memory, and the audio thread's load."""
+        now = time.monotonic()
+        paints = getattr(self.backdrop, "frames", 0)
+        src = getattr(self.backdrop, "source", None)
+        vframes = src.frames if src is not None else 0
+        parts = []
+        if self._stats_prev is not None:
+            t0, p0, v0 = self._stats_prev
+            dt = max(1e-3, now - t0)
+            parts.append(f"paint {(paints - p0) / dt:5.1f} fps")
+            gpu = getattr(self.backdrop, "frame_ms", None)
+            if gpu:
+                parts[-1] += f"  {gpu:4.1f} ms"
+            parts.append(f"video {(vframes - v0) / dt:5.1f} fps")
+        else:
+            parts.append("paint  ... fps")
+        self._stats_prev = (now, paints, vframes)
+        if src is not None and getattr(src, "_size", None):
+            w, h = src._size
+            parts[-1] += f"  {w}x{h}"
+        if self._proc is not None:
+            cpu_all = psutil.cpu_percent(None)
+            cpu_app = self._proc.cpu_percent(None) / max(1, psutil.cpu_count() or 1)
+            parts.append(f"cpu   {cpu_all:5.1f} %  app {cpu_app:5.1f} %")
+            vm = psutil.virtual_memory()
+            rss = self._proc.memory_info().rss
+            parts.append(f"mem   {rss / 1e9:5.2f} GB app  {vm.available / 1e9:5.1f} GB free")
+            takes = self.takes.nbytes
+            if takes:
+                parts[-1] += f"  takes {takes / 1e9:.2f} GB"
+        else:
+            parts.append("cpu/mem: pip install psutil")
+        if self.through is not None and self.through.running:
+            st = self.through.stats()
+            parts.append(f"audio {100 * st['load']:5.1f} % dsp  {st['dropped']} drops")
+        self.hud.setText("\n".join(parts))
+        self.hud.adjustSize()
+        self.hud.move(self.backdrop.width() - self.hud.width() - 12, 12)
+
+    def _cloud_ready(self, img):
+        """A word cloud drawn by the worker: onto the backdrop (uploaded on
+        the next paint). Arrives ~50 ms after the half beat it was asked
+        for, invisible anyway once its phrase is over (opacity 0)."""
+        if hasattr(self.backdrop, "set_overlay"):
+            self.backdrop.set_overlay(img)
 
     def _drain_gl_log(self):
         """GL backdrop messages (shader compile errors) -> render log."""
@@ -1197,7 +1405,66 @@ class Main(QMainWindow):
         tabs.addTab(self._tab_video(), "Video")
         tabs.addTab(self._tab_perform(), "Perform")
         tabs.addTab(self._tab_controls(), "Controls")
+        tabs.addTab(self._tab_log(), "Log")
+        HoverTabs(tabs)                  # hover a tab to open it, no click
+        self.params_tabs = tabs
         return tabs
+
+    @staticmethod
+    def _frac_setter(widget):
+        """x in 0..1 -> widget.setValue over its min..max (spinbox or slider)."""
+        def set_frac(x):
+            lo, hi = widget.minimum(), widget.maximum()
+            v = lo + max(0.0, min(1.0, x)) * (hi - lo)
+            widget.setValue(int(round(v)) if isinstance(widget, QSlider) else v)
+        return set_frac
+
+    @staticmethod
+    def _combo_next(combo):
+        if combo.count():
+            combo.setCurrentIndex((combo.currentIndex() + 1) % combo.count())
+
+    def _pick_shader_frac(self, x):
+        """A knob over the shaders: the bottom of its travel is off, the rest
+        is split evenly between the shader files in list order."""
+        files = shader_files()
+        n = len(files) + 1
+        idx = min(n - 1, int(max(0.0, min(1.0, x)) * n))
+        if idx == 0:
+            if self.shader.currentText() != "off":
+                self.select_shader_key(0)
+        else:
+            name = files[idx - 1].stem
+            if self.shader.currentText() != name:
+                self.shader.setCurrentText(name)
+                self._shader_user_off = False
+
+    def _show_log(self):
+        """Bring the Log tab to the front."""
+        self.params_tabs.setCurrentWidget(self.log_page)
+
+    def _tab_log(self):
+        """The render log on its own page: the engine's lines, the video and
+        shader messages, the live and MIDI notes; the last 2000 lines."""
+        outer = QVBoxLayout()
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+        outer.addWidget(self.log, stretch=1)
+        clear_btn = QPushButton("clear")
+        clear_btn.setToolTip("Empty the log")
+        clear_btn.clicked.connect(self.log.clear)
+        hint = QLabel("render engine, video, shaders, live, MIDI: everything "
+                      "the app has to say lands here")
+        hint.setProperty("role", "sub")
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(hint, stretch=1)
+        row.addWidget(clear_btn)
+        outer.addLayout(row)
+        w = QWidget()
+        w.setLayout(outer)
+        self.log_page = w
+        return w
 
     def _split_dragged(self, *_):
         a, b = self.split.sizes()
@@ -1214,7 +1481,8 @@ class Main(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, "split"):
-            self._apply_split()
+            # the splitter gets its new width after this event: apply then
+            QTimer.singleShot(0, self._apply_split)
 
     def _tab_controls(self):
         """Every action, grouped, with its key and its MIDI binding. Click
@@ -1270,6 +1538,9 @@ class Main(QMainWindow):
             groups[group].addChild(item)
             self.midi_items[ident] = item
         tree.expandAll()
+        for group in ("grade", "fx"):            # long knob lists: folded at first
+            if group in groups:
+                groups[group].setExpanded(False)
         for c in range(3):
             tree.resizeColumnToContents(c)
         tree.itemClicked.connect(self._midi_tree_clicked)
@@ -1289,7 +1560,8 @@ class Main(QMainWindow):
                                 "one per button, CC 11 for A/B, channel 1")
         defaults_btn.clicked.connect(self._midi_defaults)
         hint = QLabel("none of these bring the hidden interface back; a button "
-                      "fires on note on, program change or a CC going above 63")
+                      "fires on note on, program change or a CC going above 63; "
+                      "a knob row takes a CC over the widget's whole range")
         hint.setProperty("role", "sub")
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -1537,6 +1809,16 @@ class Main(QMainWindow):
         self.video_jump = QCheckBox("jump to a random spot on every section")
         self.video_jump.setChecked(True)
         form.addRow("Playback", self.video_jump)
+        self.video_stats = QCheckBox("stats on screen: fps, cpu, memory")
+        self.video_stats.setToolTip(
+            "A small readout in the top right corner of the picture, kept "
+            "with the interface hidden: paint rate and GPU time of the "
+            "backdrop, the video's frame rate, the machine's CPU and this "
+            "app's share, memory used by the app (the takes live there) and "
+            "left on the machine, and with audio through on its DSP load and "
+            "drops.")
+        self.video_stats.toggled.connect(self._toggle_stats)
+        form.addRow("", self.video_stats)
         self.video_switch = QCheckBox("switch between the ticked videos on "
                                       "drops, now and then on sections")
         self.video_switch.setChecked(True)
@@ -2468,6 +2750,7 @@ class Main(QMainWindow):
 
     # ---------- generation ----------
     def generate(self):
+        self._show_log()                        # watch the render as it goes
         samples = self.checked_samples()
         video_audio = [str(p) for p in self._song_videos()] \
             if self.video_audio.isChecked() else []
@@ -3572,9 +3855,8 @@ class Main(QMainWindow):
                     words += [self._song_word] * 6       # the song's own name, often
                 n = int(40 + 140 * env)
                 frame = self.backdrop.last_frame() if hasattr(self.backdrop, "last_frame") else None
-                self.backdrop.set_overlay(make_word_cloud(
-                    self.backdrop.size(), words, self.font_families, rng, hue, n,
-                    frame_palette(frame, rng)))
+                self._cloud.submit(self.backdrop.size(), words, self.font_families,
+                                   rng, hue, n, frame_palette(frame, rng))
             edge = min(1.0, t_in / (0.2 * beat_ms),
                        (phrase_ms - t_in) / (0.2 * beat_ms))
             st["words"] = min(1.0, max(0.0, edge) * (0.6 + 0.6 * env)

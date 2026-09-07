@@ -313,6 +313,7 @@ class GLBackdrop(QOpenGLWidget):
         self._last_t = self._t0
         self.log = []                    # compile errors etc., for the GUI
         self.frame_ms = 0.0              # smoothed CPU time of paintGL
+        self.frames = 0                  # paints so far (the stats HUD reads the rate)
         # generative layer
         self.shader_path = None
         self.shader_mix = 0.5
@@ -562,6 +563,7 @@ class GLBackdrop(QOpenGLWidget):
         t_start = time.perf_counter()
         self._paint()
         self.frame_ms = 0.9 * self.frame_ms + 0.1 * (time.perf_counter() - t_start) * 1000
+        self.frames += 1
 
     def _paint(self):
         gl = self.gl
