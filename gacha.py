@@ -54,6 +54,8 @@ import gacha_engine as E
 from scipy.signal import resample_poly
 import threading
 from gacha_video import VideoSource, video_inputs
+from gacha_midi import (MIDI_AVAILABLE, MidiIn, format_binding, midi_inputs,
+                        parse_binding)
 
 BASE = Path(__file__).parent
 GACHA = BASE / "gacha_engine.py"
@@ -282,14 +284,23 @@ BAYER4 = np.array([[0, 8, 2, 10], [12, 4, 14, 6],
                    [3, 11, 1, 9], [15, 7, 13, 5]], dtype="float32") / 16.0
 
 # every effect the Video tab exposes: key, label, default strength, tooltip
-# every key the performer has, in one table: the Keys tab shows it, and the
-# MIDI mapping will hang its bindings on the same ids. (group, id, key, what)
+# every action the performer has, in one table: the Controls tab shows it,
+# the keyboard shortcuts and the MIDI bindings hang on the same ids.
+# (group, id, key, what); "" for key = MIDI only (a continuous control)
 KEYMAP = [
     ("show", "fullscreen", "F11", "fullscreen on/off; Esc leaves it too"),
     ("show", "video_only", "C", "video only: no effects, no shader layer, no words"),
     ("show", "next_fx", "Space", "next video FX look, and the next shader"),
     ("show", "shader", "S", "shader layer off/on"),
-    ("show", "shader_n", "1 .. 9", "pick that shader directly"),
+    ("show", "shader_1", "1", "shader 1 in list order"),
+    ("show", "shader_2", "2", "shader 2 in list order"),
+    ("show", "shader_3", "3", "shader 3 in list order"),
+    ("show", "shader_4", "4", "shader 4 in list order"),
+    ("show", "shader_5", "5", "shader 5 in list order"),
+    ("show", "shader_6", "6", "shader 6 in list order"),
+    ("show", "shader_7", "7", "shader 7 in list order"),
+    ("show", "shader_8", "8", "shader 8 in list order"),
+    ("show", "shader_9", "9", "shader 9 in list order"),
     ("show", "shader_off", "0", "shader layer off"),
     ("tape", "through", "A", "audio through off/on (tape -> output)"),
     ("tape", "record", "R", "take: start / stop recording the live feed into RAM"),
@@ -302,11 +313,32 @@ KEYMAP = [
     ("section", "event", "E", "fire a one-shot from the material on the beat"),
     ("section", "ab_down", "[", "A/B 10 % toward the tape"),
     ("section", "ab_up", "]", "A/B 10 % toward the section"),
+    ("section", "ab", "", "A/B position, an expression pedal (CC 0..127)"),
     ("section", "stem_drums", "F1", "drums stem in/out"),
     ("section", "stem_layers", "F2", "layers stem in/out"),
     ("section", "stem_chops", "F3", "chops stem in/out"),
     ("section", "stem_events", "F4", "events stem in/out"),
 ]
+# ids that take a value (0..1) instead of firing; only a CC can drive them
+CONTINUOUS = {"ab"}
+KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
+                 "section": "section engine"}
+
+
+def default_midi_map():
+    """The bindings before anyone learns their own: one note per button
+    action, from C1 (36) up in table order, on channel 1, which is what a
+    pad or a keyboard sends; the continuous actions on CC 11 (expression),
+    12, ... on channel 1. Any controller overwrites these by MIDI learn."""
+    out, note, cc = {}, 36, 11
+    for _g, ident, _k, _w in KEYMAP:
+        if ident in CONTINUOUS:
+            out[ident] = format_binding("cc", 1, cc)
+            cc += 1
+        else:
+            out[ident] = format_binding("note", 1, note)
+            note += 1
+    return out
 
 # source grade: colour correction of the picture itself (the VHS input above
 # all), applied before every effect and kept in "video only" mode.
@@ -984,6 +1016,7 @@ class Main(QMainWindow):
         self._media_devices.audioInputsChanged.connect(self._refresh_live_devices)
 
         # ---------- parameters panel ----------
+        self.settings = QSettings("gacha", "gacha")
         params_box = self._build_params()
 
         self.generate_btn = QPushButton("Generate")
@@ -1005,7 +1038,6 @@ class Main(QMainWindow):
         self.outputs_list = QListWidget()
         self.outputs_list.itemDoubleClicked.connect(self._play_item)
         # libraries: one node per set folder, tri-state checkboxes
-        self.settings = QSettings("gacha", "gacha")
         self.samples_tree = SetTree(SAMPLES_DIR, AUDIO_EXTS, self.settings,
                                     "samples", first_run_folder="default")
         self.samples_tree.activated.connect(self._play_path)
@@ -1103,62 +1135,46 @@ class Main(QMainWindow):
         self._gl_log_timer.start(500)
         self.ui = split
         QApplication.instance().installEventFilter(self)
-        # F11 as a real application shortcut: fires exactly once per press,
-        # whatever has focus, even with the interface hidden
-        self.fs_shortcut = QShortcut(QKeySequence(Qt.Key_F11), self)
-        self.fs_shortcut.setContext(Qt.ApplicationShortcut)
-        self.fs_shortcut.activated.connect(self.toggle_fullscreen)
-        # Space: next video FX (next shader + new random look); S: shader on/off
+        # the performer's actions, by id: the keys in KEYMAP and the MIDI
+        # bindings both land here. Application shortcuts fire exactly once
+        # per press, whatever has focus, even with the interface hidden.
         self._prev_shader_choice = "random"
         self._shader_user_off = False     # off by your own hand: songs leave it off
         self.shader.activated.connect(
             lambda _i: setattr(self, "_shader_user_off",
                                self.shader.currentText() == "off"))
-        self.next_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
-        self.next_shortcut.setContext(Qt.ApplicationShortcut)
-        self.next_shortcut.activated.connect(self.next_video_fx)
-        self.shader_shortcut = QShortcut(QKeySequence(Qt.Key_S), self)
-        self.shader_shortcut.setContext(Qt.ApplicationShortcut)
-        self.shader_shortcut.activated.connect(self.toggle_shader)
-        self.plain_shortcut = QShortcut(QKeySequence(Qt.Key_C), self)
-        self.plain_shortcut.setContext(Qt.ApplicationShortcut)
-        self.plain_shortcut.activated.connect(self.video_plain.toggle)
-        self.through_shortcut = QShortcut(QKeySequence(Qt.Key_A), self)
-        self.through_shortcut.setContext(Qt.ApplicationShortcut)
-        self.through_shortcut.activated.connect(self.through_on.toggle)
-        self.rec_shortcut = QShortcut(QKeySequence(Qt.Key_R), self)
-        self.rec_shortcut.setContext(Qt.ApplicationShortcut)
-        self.rec_shortcut.activated.connect(self.toggle_take)
-        self.perf_shortcuts = []
-        for keys, slot in ((Qt.Key_N, self.perform_next),
-                           ("Shift+N", self.perform_stop),
-                           (Qt.Key_E, self.perform_event),
-                           (Qt.Key_BracketLeft, lambda: self.perf_ab.setValue(self.perf_ab.value() - 10)),
-                           (Qt.Key_BracketRight, lambda: self.perf_ab.setValue(self.perf_ab.value() + 10)),
-                           (Qt.Key_F1, lambda: self.perf_stems["drums"].toggle()),
-                           (Qt.Key_F2, lambda: self.perf_stems["layers"].toggle()),
-                           (Qt.Key_F3, lambda: self.perf_stems["chops"].toggle()),
-                           (Qt.Key_F4, lambda: self.perf_stems["events"].toggle())):
-            sc = QShortcut(QKeySequence(keys), self)
-            sc.setContext(Qt.ApplicationShortcut)
-            sc.activated.connect(slot)
-            self.perf_shortcuts.append(sc)
-        # 1..9: pick that shader directly, 0: shader layer off
-        self.digit_shortcuts = []
-        for n in range(10):
-            sc = QShortcut(QKeySequence(getattr(Qt, f"Key_{n}")), self)
-            sc.setContext(Qt.ApplicationShortcut)
-            sc.activated.connect(lambda n=n: self.select_shader_key(n))
-            self.digit_shortcuts.append(sc)
-        # live mode: T taps the tempo, D restarts the bar, L toggles the mode
-        self.live_shortcuts = []
-        for key, slot in ((Qt.Key_T, self.tap_tempo), (Qt.Key_D, self.live_downbeat),
-                          (Qt.Key_L, lambda: self.live_on.toggle()),
-                          (Qt.Key_X, self.live_drop_key)):
+        self.actions = {
+            "fullscreen": self.toggle_fullscreen,
+            "video_only": self.video_plain.toggle,
+            "next_fx": self.next_video_fx,
+            "shader": self.toggle_shader,
+            "shader_off": lambda: self.select_shader_key(0),
+            "through": self.through_on.toggle,
+            "record": self.toggle_take,
+            "tap": self.tap_tempo,
+            "downbeat": self.live_downbeat,
+            "live": self.live_on.toggle,
+            "drop": self.live_drop_key,
+            "next": self.perform_next,
+            "stop": self.perform_stop,
+            "event": self.perform_event,
+            "ab_down": lambda: self.perf_ab.setValue(self.perf_ab.value() - 10),
+            "ab_up": lambda: self.perf_ab.setValue(self.perf_ab.value() + 10),
+            "ab": lambda x: self.perf_ab.setValue(round(x * 100)),
+        }
+        for n in range(1, 10):
+            self.actions[f"shader_{n}"] = lambda n=n: self.select_shader_key(n)
+        for stem in STEMS:
+            self.actions[f"stem_{stem}"] = self.perf_stems[stem].toggle
+        self.shortcuts = []
+        for _g, ident, key, _w in KEYMAP:
+            if not key or ident in CONTINUOUS:
+                continue
             sc = QShortcut(QKeySequence(key), self)
             sc.setContext(Qt.ApplicationShortcut)
-            sc.activated.connect(slot)
-            self.live_shortcuts.append(sc)
+            sc.activated.connect(self.actions[ident])
+            self.shortcuts.append(sc)
+        self._midi_setup()
 
         self.refresh_lists()
 
@@ -1179,7 +1195,7 @@ class Main(QMainWindow):
         tabs.addTab(self._tab_layers(), "Layers && FX")
         tabs.addTab(self._tab_video(), "Video")
         tabs.addTab(self._tab_perform(), "Perform")
-        tabs.addTab(self._tab_keys(), "Keys")
+        tabs.addTab(self._tab_controls(), "Controls")
         return tabs
 
     def _split_dragged(self, *_):
@@ -1199,44 +1215,252 @@ class Main(QMainWindow):
         if hasattr(self, "split"):
             self._apply_split()
 
-    def _tab_keys(self):
-        """Every key, grouped, with a MIDI column that is empty until the
-        mapping exists: the same table will take the bindings."""
+    def _tab_controls(self):
+        """Every action, grouped, with its key and its MIDI binding. Click
+        the MIDI cell of a row and the next message from a ticked controller
+        becomes that row's binding (MIDI learn); Delete clears the row."""
+        outer = QVBoxLayout()
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+        self.midi_ports = QListWidget()
+        self.midi_ports.setToolTip(
+            "MIDI inputs. Tick every controller you play from: a foot "
+            "controller and a pad at once is fine, they all feed the same "
+            "map. A port that is not plugged in shows greyed and opens by "
+            "itself when it appears.")
+        self.midi_ports.setMaximumHeight(72)
+        self.midi_ports.itemChanged.connect(self._midi_ports_changed)
+        rescan = QPushButton("rescan")
+        rescan.setToolTip("Look for controllers plugged in since launch "
+                          "(done every 2 s anyway)")
+        rescan.clicked.connect(self._midi_refresh_ports)
+        self.midi_last = QLabel("no MIDI yet" if MIDI_AVAILABLE else
+                                "MIDI off: pip install mido python-rtmidi")
+        self.midi_last.setProperty("role", "sub")
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(self.midi_ports, stretch=1)
+        side = QVBoxLayout()
+        side.addWidget(rescan)
+        side.addStretch(1)
+        top.addLayout(side)
+        outer.addWidget(QLabel("MIDI inputs"))
+        outer.addLayout(top)
+        outer.addWidget(self.midi_last)
+
         tree = QTreeWidget()
         tree.setColumnCount(4)
         tree.setHeaderLabels(["key", "action", "what it does", "MIDI"])
         tree.setRootIsDecorated(True)
         tree.setUniformRowHeights(True)
-        tree.setToolTip("The performer's keys. The MIDI column fills in once "
-                        "a controller is mapped to these actions.")
+        tree.setToolTip("The performer's actions. Click a row's MIDI cell, "
+                        "then press the switch, hit the pad or move the "
+                        "pedal that should do it. Delete clears the row.")
         groups = {}
-        names = {"show": "picture", "tape": "tape", "clock": "clock",
-                 "section": "section engine"}
+        self.midi_items = {}
         for group, ident, key, what in KEYMAP:
             if group not in groups:
-                g = QTreeWidgetItem([names.get(group, group), "", "", ""])
+                g = QTreeWidgetItem([KEYMAP_GROUPS.get(group, group), "", "", ""])
                 g.setFlags(g.flags() & ~Qt.ItemIsSelectable)
                 tree.addTopLevelItem(g)
                 groups[group] = g
             item = QTreeWidgetItem([key, ident, what, ""])
             item.setData(0, Qt.UserRole, ident)
             groups[group].addChild(item)
+            self.midi_items[ident] = item
         tree.expandAll()
         for c in range(3):
             tree.resizeColumnToContents(c)
-        self.keys_tree = tree
+        tree.itemClicked.connect(self._midi_tree_clicked)
+        for key in (Qt.Key_Delete, Qt.Key_Backspace):
+            sc = QShortcut(QKeySequence(key), tree)
+            sc.setContext(Qt.WidgetShortcut)
+            sc.activated.connect(self._midi_clear_selected)
+        self.controls_tree = tree
         tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        tree.setMinimumHeight(300)          # the tab area gives it the rest
-        hint = QLabel("none of these keys bring the hidden interface back; "
-                      "the MIDI column is the plan: one binding per action")
-        hint.setProperty("role", "sub")
-        outer = QVBoxLayout()                  # the tree takes the whole tab
-        outer.setContentsMargins(8, 8, 8, 8)
+        tree.setMinimumHeight(240)          # the tab area gives it the rest
         outer.addWidget(tree, stretch=1)
-        outer.addWidget(hint)
+        clear_btn = QPushButton("clear binding")
+        clear_btn.setToolTip("Forget the MIDI binding of the selected row")
+        clear_btn.clicked.connect(self._midi_clear_selected)
+        defaults_btn = QPushButton("defaults")
+        defaults_btn.setToolTip("Back to the stock map: notes from C1 up, "
+                                "one per button, CC 11 for A/B, channel 1")
+        defaults_btn.clicked.connect(self._midi_defaults)
+        hint = QLabel("none of these bring the hidden interface back; a button "
+                      "fires on note on, program change or a CC going above 63")
+        hint.setProperty("role", "sub")
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(hint, stretch=1)
+        row.addWidget(clear_btn)
+        row.addWidget(defaults_btn)
+        outer.addLayout(row)
         w = QWidget()
         w.setLayout(outer)
         return w
+
+    # ---------- MIDI ----------
+    def _midi_setup(self):
+        """Load the map and the ticked ports, open them, start watching for
+        controllers plugged in later. Called once the actions exist."""
+        self.midi = MidiIn(self)
+        self.midi.message.connect(self._on_midi)
+        self._midi_learn = None                 # ident being learnt, or None
+        self._midi_cc_last = {}                 # (ch, cc) -> last value, for edges
+        self.midi_map = default_midi_map()
+        saved = self.settings.value("midi/map", "")
+        if saved:
+            try:
+                for ident, text in json.loads(saved).items():
+                    if ident in self.midi_map and (text == "" or parse_binding(text)):
+                        self.midi_map[ident] = text
+            except (ValueError, AttributeError):
+                pass
+        ticked = self.settings.value("midi/ports", None)
+        self._midi_ticked = set(ticked) if ticked is not None else None   # None: first run
+        self._midi_refresh_tree()
+        self._midi_refresh_ports()
+        self._midi_timer = QTimer(self)
+        self._midi_timer.timeout.connect(self._midi_refresh_ports)
+        self._midi_timer.start(2000)
+
+    @staticmethod
+    def _midi_hw(label):
+        return "Midi Through" not in label
+
+    def _midi_refresh_ports(self):
+        """Rescan the inputs, keep the ticks, open what is ticked and there."""
+        if not MIDI_AVAILABLE:
+            return
+        ports = midi_inputs()
+        present = [lab for lab, _ in ports]
+        if self._midi_ticked is None:           # first run: every real controller
+            self._midi_ticked = {lab for lab in present if self._midi_hw(lab)}
+        labels = list(present) + sorted(self._midi_ticked - set(present))
+        shown = [self.midi_ports.item(i).text() for i in range(self.midi_ports.count())]
+        if shown != labels:
+            self.midi_ports.blockSignals(True)
+            self.midi_ports.clear()
+            for lab in labels:
+                it = QListWidgetItem(lab)
+                it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                it.setCheckState(Qt.Checked if lab in self._midi_ticked else Qt.Unchecked)
+                if lab not in present:
+                    it.setForeground(QColor(242, 233, 229, 90))
+                    it.setToolTip("not plugged in")
+                self.midi_ports.addItem(it)
+            self.midi_ports.blockSignals(False)
+        self._midi_open(ports)
+
+    def _midi_ports_changed(self, item):
+        lab = item.text()
+        if item.checkState() == Qt.Checked:
+            self._midi_ticked.add(lab)
+        else:
+            self._midi_ticked.discard(lab)
+        self.settings.setValue("midi/ports", sorted(self._midi_ticked))
+        self._midi_open()
+
+    def _midi_open(self, ports=None):
+        before = set(self.midi.open_labels)
+        errors = self.midi.open(self._midi_ticked, ports)
+        for lab, err in errors.items():
+            if lab not in getattr(self, "_midi_errored", set()):
+                self.log.appendPlainText(f"midi: cannot open {lab}: {err}")
+        self._midi_errored = set(errors)
+        after = set(self.midi.open_labels)
+        for lab in sorted(after - before):
+            self.log.appendPlainText(f"midi: listening to {lab}")
+        for lab in sorted(before - after):
+            self.log.appendPlainText(f"midi: {lab} closed")
+
+    def _midi_refresh_tree(self):
+        rev = {}
+        for ident, item in self.midi_items.items():
+            text = self.midi_map.get(ident, "")
+            if self._midi_learn == ident:
+                item.setText(3, "learning: press or move a control...")
+                item.setForeground(3, QColor(255, 120, 90))
+            else:
+                item.setText(3, text)
+                item.setForeground(3, QColor(242, 233, 229, 230 if text else 90))
+            b = parse_binding(text)
+            if b:
+                rev[b] = ident
+        self._midi_rev = rev
+        self.controls_tree.resizeColumnToContents(3)
+
+    def _midi_save(self):
+        self.settings.setValue("midi/map", json.dumps(self.midi_map))
+
+    def _midi_tree_clicked(self, item, column):
+        ident = item.data(0, Qt.UserRole)
+        if ident is None:
+            return
+        if column != 3:
+            if self._midi_learn is not None:    # any other click ends the learn
+                self._midi_learn = None
+                self._midi_refresh_tree()
+            return
+        self._midi_learn = None if self._midi_learn == ident else ident
+        if self._midi_learn:
+            what = "move a knob or a pedal" if ident in CONTINUOUS \
+                else "press the switch or hit the pad"
+            self.midi_last.setText(f"learning {ident}: {what}; click again to cancel")
+        self._midi_refresh_tree()
+
+    def _midi_clear_selected(self):
+        item = self.controls_tree.currentItem()
+        ident = item.data(0, Qt.UserRole) if item is not None else None
+        if ident is None:
+            return
+        self.midi_map[ident] = ""
+        self._midi_learn = None
+        self._midi_save()
+        self._midi_refresh_tree()
+        self.log.appendPlainText(f"midi: {ident} unbound")
+
+    def _midi_defaults(self):
+        self.midi_map = default_midi_map()
+        self._midi_learn = None
+        self._midi_save()
+        self._midi_refresh_tree()
+        self.log.appendPlainText("midi: default map")
+
+    def _on_midi(self, port, kind, ch, num, val):
+        """Every message from every ticked controller, on the GUI thread."""
+        text = format_binding(kind, ch, num)
+        self.midi_last.setText(f"last: {text} = {val} from {port}")
+        if self._midi_learn is not None:
+            ident = self._midi_learn
+            if ident in CONTINUOUS and kind != "cc":
+                return                          # a pedal, not a switch
+            other = self._midi_rev.get((kind, ch, num))
+            if other and other != ident:
+                self.midi_map[other] = ""       # one control, one action
+                self.log.appendPlainText(f"midi: {text} taken from {other}")
+            self.midi_map[ident] = text
+            self._midi_learn = None
+            self._midi_save()
+            self._midi_refresh_tree()
+            self.midi_last.setText(f"{ident} <- {text} from {port}")
+            self.log.appendPlainText(f"midi: {ident} <- {text} ({port})")
+            if kind == "cc":
+                self._midi_cc_last[(ch, num)] = val   # no trigger from the learn press
+            return
+        ident = self._midi_rev.get((kind, ch, num))
+        if ident is None:
+            return
+        if ident in CONTINUOUS:
+            self.actions[ident](val / 127.0)
+            return
+        if kind == "cc":                        # a switch on a CC: rising edge only
+            prev = self._midi_cc_last.get((ch, num), 0)
+            self._midi_cc_last[(ch, num)] = val
+            if not (val >= 64 and prev < 64):
+                return
+        self.actions[ident]()
 
     def _tab_perform(self):
         """The live section engine: what the feet will drive on stage."""
@@ -1284,7 +1508,8 @@ class Main(QMainWindow):
         self.perf_ab.setValue(0)
         self.perf_ab.setToolTip("A/B: 0 = the tape through only, 100 = the section "
                                 "only, equal power in between. Keys [ and ] step "
-                                "by 10; a MIDI expression pedal later.")
+                                "by 10; a MIDI expression pedal drives it "
+                                "through the Controls tab.")
         self.perf_ab.valueChanged.connect(self._perf_ab_changed)
         self.perf_ab_lbl = QLabel("A 100 %  ·  B 0 %")
         self.perf_ab_lbl.setProperty("role", "sub")
@@ -3498,6 +3723,8 @@ class Main(QMainWindow):
             self.takes.stop()
         if self.through is not None:
             self.through.stop()
+        if getattr(self, "midi", None) is not None:
+            self.midi.close_all()
         if getattr(self.backdrop, "source", None) is not None:
             self.backdrop.source.stop()
         if self.worker and self.worker.isRunning():

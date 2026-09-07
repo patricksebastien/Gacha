@@ -19,10 +19,10 @@ No two pulls are alike. Every sample gets used.
 Python 3.10+ and:
 
 ```bash
-pip install numpy soundfile librosa pedalboard PySide6 av
+pip install numpy soundfile librosa pedalboard PySide6 av mido python-rtmidi
 ```
 
-[pedalboard](https://github.com/spotify/pedalboard) (Spotify's audio effects library) powers all effect chains, [PyAV](https://github.com/PyAV-Org/PyAV) (ffmpeg) decodes the backdrop videos. The app is the Qt GUI; `gacha_engine.py` is the render engine it drives.
+[pedalboard](https://github.com/spotify/pedalboard) (Spotify's audio effects library) powers all effect chains, [PyAV](https://github.com/PyAV-Org/PyAV) (ffmpeg) decodes the backdrop videos, [mido](https://mido.readthedocs.io/) over python-rtmidi reads the MIDI controllers (optional: without it the app runs with the keys only). The app is the Qt GUI; `gacha_engine.py` is the render engine it drives.
 
 ## Quick start
 
@@ -50,7 +50,7 @@ Excerpt names keep the source stem and the start offset, so `2019-07-06T23.17.57
 
 ## The app
 
-`gacha.py` is the Qt window. `gacha_engine.py` is the render engine it runs in a subprocess for every Generate, `gacha_gl.py` is the OpenGL video backdrop with the shaders in `shaders/`, `gacha_live.py` is the audio input and tap-tempo clock behind the live mode, `gacha_video.py` decodes the backdrop video on its own thread (any speed, forwards or backwards, frame-exact seeks, and V4L2 capture devices), and three command-line tools prepare material: `gacha_bank.py` cuts sample sets out of long recordings, `gacha_transcode.py` re-encodes backdrop videos for instant seeking, and `gacha_syncdemo.py` renders a test clip for the follow mode (a slow melody of sustained notes; on every note the picture shows its number, its name and its colour, with a progress bar and a frame counter, so what you hear is checked against what you see).
+`gacha.py` is the Qt window. `gacha_engine.py` is the render engine it runs in a subprocess for every Generate, `gacha_gl.py` is the OpenGL video backdrop with the shaders in `shaders/`, `gacha_live.py` is the audio input and tap-tempo clock behind the live mode, `gacha_video.py` decodes the backdrop video on its own thread (any speed, forwards or backwards, frame-exact seeks, and V4L2 capture devices), `gacha_midi.py` listens to the MIDI controllers, and three command-line tools prepare material: `gacha_bank.py` cuts sample sets out of long recordings, `gacha_transcode.py` re-encodes backdrop videos for instant seeking, and `gacha_syncdemo.py` renders a test clip for the follow mode (a slow melody of sustained notes; on every note the picture shows its number, its name and its colour, with a progress bar and a frame counter, so what you hear is checked against what you see).
 
 All parameters as widgets in four tabs (General, Drums, Sections, Layers & FX), a live render log, and a built-in player:
 
@@ -132,11 +132,17 @@ Keys `1` to `9` reach the first nine in this alphabetical order; the combo and `
 
 ### Perform
 
-The Perform tab is the live section engine, what the feet will drive on stage once MIDI is mapped; for now every control has a key. It needs audio through on (`A`), because the section is mixed into that path. **Material** is what sections are built from: the takes recorded during the show, or the ticked sample sets while rehearsing (nothing ticked means every sample). **next section** (`N`) renders an 8-bar loop from the material at the live tempo, `gacha_section.py` doing in about a second what the engine does for a song, and starts it on the next bar; while it loops, the following one is rendered ahead, so the next press is instant. **next kind** picks the shape: groove, break, build, sparse or random. **stop** (`Shift+N`) silences the section on the bar; the tape stays. **event** (`E`) fires a one-shot cut from the material on the next beat. The four **stems** (`F1` to `F4`) switch drums, layers, chops and events in and out with a ramp. The **A/B** slider (`[` and `]` step by 10) mixes the tape through against the section at equal power, 0 to 100 %, later an expression pedal. **Picture** chooses what the screen shows while a section plays: the frames the sounds were cut from (takes with video), the tape as it comes in, or auto, which switches to the take frames once A/B passes 50 %. The live clock follows the section, so the visuals, the shaders and the tap tempo are on its bars.
+The Perform tab is the live section engine, what the feet drive on stage: every control has a key and a MIDI binding (Controls tab). It needs audio through on (`A`), because the section is mixed into that path. **Material** is what sections are built from: the takes recorded during the show, or the ticked sample sets while rehearsing (nothing ticked means every sample). **next section** (`N`) renders an 8-bar loop from the material at the live tempo, `gacha_section.py` doing in about a second what the engine does for a song, and starts it on the next bar; while it loops, the following one is rendered ahead, so the next press is instant. **next kind** picks the shape: groove, break, build, sparse or random. **stop** (`Shift+N`) silences the section on the bar; the tape stays. **event** (`E`) fires a one-shot cut from the material on the next beat. The four **stems** (`F1` to `F4`) switch drums, layers, chops and events in and out with a ramp. The **A/B** slider (`[` and `]` step by 10) mixes the tape through against the section at equal power, 0 to 100 %; an expression pedal drives it through the `ab` row of the Controls tab. **Picture** chooses what the screen shows while a section plays: the frames the sounds were cut from (takes with video), the tape as it comes in, or auto, which switches to the take frames once A/B passes 50 %. The live clock follows the section, so the visuals, the shaders and the tap tempo are on its bars.
 
-### Keys
+### Controls
 
-The Keys tab lists every key the performer has, grouped as picture, tape, clock and section engine, with what each does. It is built from one table in `gacha.py` that also gives each action an id; the MIDI column is empty for now and will take the controller bindings, one per action, so the same table becomes the mapping.
+The Controls tab is the performer's map: every action, grouped as picture, tape, clock and section engine, with its key, what it does and its MIDI binding. It is built from one table in `gacha.py` that gives each action an id; the keyboard shortcuts and the MIDI bindings both hang on those ids, so a foot controller, a pad and the keyboard do exactly the same things.
+
+**MIDI inputs** lists every MIDI port the system sees; tick the controllers you play from, as many as you like (a foot controller for the sections and a drum pad for the events, say), and they all feed the same map. The list is rescanned every 2 s, so a controller plugged in during the show opens by itself; one that is ticked but not plugged in stays in the list greyed out. On the first launch every port except the ALSA *Midi Through* is ticked. Below the list, the last message received is shown with the port it came from, which is how you find out what a switch sends.
+
+**MIDI learn**: click the MIDI cell of a row, then press the switch, hit the pad or move the pedal that should do it; the next message becomes the row's binding, the map is saved, and if that control was bound to another action it moves. Click the cell again to cancel, `Delete` or the *clear binding* button unbinds the selected row, *defaults* puts the stock map back. A binding is a note, a control change or a program change (which is what an FCB1010 sends out of the box) with its channel, shown as `note 60 ch1`, `cc 11 ch1` or `pc 5 ch1`; the port is not part of it, so two controllers tell themselves apart by the channel and a binding survives a change of USB socket.
+
+Button actions fire on a note on, a program change, or a CC rising above 63 (and again only after it has gone below, so a footswitch in toggle mode that sends 127 then 0 fires once per press). The `ab` row is continuous: only a CC can drive it, and its 0 to 127 becomes the A/B slider's 0 to 100 %. The **stock map** before anyone learns anything is one note per button from C1 (note 36) up in table order on channel 1, which is what a pad or a small keyboard sends, and CC 11 (expression) for `ab`; a real controller overwrites it row by row. None of these bring the hidden interface back.
 
 ## Parameters
 
