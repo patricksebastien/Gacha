@@ -60,6 +60,7 @@ class LiveInput(QObject):
         self._source = None
         self._io = None
         self._fmt = None
+        self._external = False    # fed by feed() from gacha_audio, no capture
         self.device_name = ""
         self.loud = 0.0           # normalised, smoothed: what the visuals use
         self.rms = 0.0            # raw RMS of the last block, for a meter
@@ -70,7 +71,23 @@ class LiveInput(QObject):
 
     @property
     def running(self):
-        return self._source is not None
+        return self._source is not None or self._external
+
+    @property
+    def external(self):
+        """True while the blocks come from outside (the audio-through path)."""
+        return self._external
+
+    def start_external(self, name, sr):
+        """Listen to blocks handed in through feed() instead of capturing:
+        the audio-through path already reads the device and owns it."""
+        self.stop()
+        self._external = True
+        self.device_name = name
+        self._env, self._peak, self._last_t = 0.0, PEAK_FLOOR, None
+        self.loud = self.rms = 0.0
+        self.analyzer = Analyzer(sr)
+        return None
 
     def start(self, device=None):
         """Open `device` (QAudioDevice; None = default input). Returns an
@@ -112,6 +129,7 @@ class LiveInput(QObject):
             self._source.stop()
             self._source.deleteLater()
         self._source = self._io = self._fmt = None
+        self._external = False
         self.loud = self.rms = 0.0
 
     def _read(self):
@@ -126,9 +144,15 @@ class LiveInput(QObject):
         x = (x - off) / scale
         if ch > 1:
             x = x.reshape(n, ch).mean(axis=1)
+        self.feed(x, time.monotonic())
+
+    def feed(self, x, now):
+        """A block of mono float samples that ended at monotonic time `now`:
+        loudness, auto-gain reference and the analyzer."""
+        if len(x) == 0:
+            return
         rms = float(np.sqrt(np.mean(x * x)))
         self.rms = rms
-        now = time.monotonic()
         dt = 0.02 if self._last_t is None else max(1e-3, now - self._last_t)
         self._last_t = now
         # auto-gain: the reference is the recent peak, falling slowly so a

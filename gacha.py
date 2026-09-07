@@ -15,6 +15,7 @@ Usage:  python3 gacha.py
 
 import bisect
 import json
+import math
 import random
 import subprocess
 import sys
@@ -45,6 +46,7 @@ from gacha_gl import BLEND_MODES, GLBackdrop, gl_available, shader_files
 from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES, WORDS,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
+from gacha_audio import LiveAudio, audio_devices
 from gacha_video import VideoSource, video_inputs
 
 BASE = Path(__file__).parent
@@ -274,6 +276,25 @@ BAYER4 = np.array([[0, 8, 2, 10], [12, 4, 14, 6],
                    [3, 11, 1, 9], [15, 7, 13, 5]], dtype="float32") / 16.0
 
 # every effect the Video tab exposes: key, label, default strength, tooltip
+# source grade: colour correction of the picture itself (the VHS input above
+# all), applied before every effect and kept in "video only" mode.
+# key, label, (min, max, step, neutral), tooltip
+VIDEO_GRADE = [
+    ("exposure", "exposure", (0.25, 3.0, 0.05, 1.0), "Overall light: multiplies the picture"),
+    ("black", "black", (-0.25, 0.25, 0.01, 0.0), "Black level: negative pulls VHS's grey "
+                                                  "blacks down, positive lifts them"),
+    ("gamma", "gamma", (0.4, 2.5, 0.05, 1.0), "Mid-tones: above 1 brightens the middle "
+                                              "without touching black or white"),
+    ("contrast", "contrast", (0.25, 2.5, 0.05, 1.0), "Contrast around mid grey"),
+    ("saturation", "saturation", (0.0, 2.5, 0.05, 1.0), "Colour strength; 0 is black and white"),
+    ("warmth", "warmth", (-1.0, 1.0, 0.02, 0.0), "Colour temperature: positive warmer "
+                                                 "(amber), negative cooler (blue)"),
+    ("tint", "tint", (-1.0, 1.0, 0.02, 0.0), "Green (negative) to magenta (positive)"),
+    ("react", "react", (0.0, 1.0, 0.05, 0.0), "How much the grade breathes with the music, "
+                                              "very subtly: exposure and saturation with "
+                                              "loudness, warmth toward the root note's colour"),
+]
+
 VIDEO_EFFECTS = [
     ("color", "color", 0.6, "Saturation and hue per section; intros bloom in, "
                             "breaks wash out"),
@@ -330,10 +351,16 @@ NOTE_HUES = {n: i / 12 for i, n in enumerate(
 GLITCH_MODES = [(0.004, 0.01), (0.04, 0.14), (0.04, 0.38)]
 
 # what the picture follows in a song built from a video's own audio: the
-# groups of timeline events, in priority order (a hit wins over a texture)
+# groups of timeline events, in priority order (a hit wins over a texture).
+# "varies" re-rolls that order per section and per 4-bar phrase, so the
+# picture is led by the textures for a while, then the chops, then the drums
 FOLLOW_GROUPS = {"off": (), "textures": ("textures",),
                  "textures and chops": ("chops", "textures"),
-                 "everything": ("hits", "chops", "textures")}
+                 "everything": ("hits", "chops", "textures"),
+                 "varies": ("hits", "chops", "textures")}
+# varies: how often each group gets to lead (drums are sounding almost all
+# the time, so they would win every phrase on an even roll)
+FOLLOW_LEAD_WEIGHTS = {"hits": 1.0, "chops": 1.4, "textures": 1.6}
 EVENT_GROUP = {"kick": "hits", "snare": "hits", "hihat": "hits", "ohat": "hits",
                "ride": "hits", "glitch": "hits", "chop": "chops",
                "texture": "textures", "swell": "textures",
@@ -879,6 +906,8 @@ class Main(QMainWindow):
         self._follow = None         # FollowPlan of the playing song, if any
         self._pos_last, self._pos_t = -1, 0.0   # playhead interpolation
         self._follow_cur = None     # the timeline event now on screen
+        self._follow_key = None     # (section, phrase) the lead was rolled for
+        self._follow_order = FOLLOW_GROUPS["everything"]   # varies: this phrase
         self._follow_seek_t = 0.0   # when the picture was last seeked to it
         self._words_slot = None     # half-beat slot of the cloud on screen
         self._clean_bar = None      # (section, bar) last rolled for clean video
@@ -898,6 +927,10 @@ class Main(QMainWindow):
         self.tempo = TapTempo()
         self._live_timer = QTimer(self)             # level meter refresh
         self._live_timer.timeout.connect(self._update_live_meter)
+        self.through = None                         # LiveAudio while audio through is on
+        self._through_timer = QTimer(self)          # feeds the analyzer, status line
+        self._through_timer.timeout.connect(self._poll_through)
+        self._through_ticks = 0
         self._media_devices = QMediaDevices(self)
         self._media_devices.audioInputsChanged.connect(self._refresh_live_devices)
 
@@ -963,10 +996,12 @@ class Main(QMainWindow):
         self.pos_slider = SeekSlider(Qt.Horizontal)
         self.pos_slider.sliderMoved.connect(self.player.setPosition)
         self.time_lbl = QLabel("0:00 / 0:00")
-        vol = QSlider(Qt.Horizontal, maximumWidth=100)
-        vol.setRange(0, 100)
-        vol.setValue(90)
-        vol.valueChanged.connect(lambda v: self.audio_out.setVolume(v / 100))
+        self.vol = QSlider(Qt.Horizontal, maximumWidth=100)
+        self.vol.setRange(0, 100)
+        self.vol.setValue(90)
+        self.vol.setToolTip("Volume of songs, and of the audio through")
+        self.vol.valueChanged.connect(self._set_volume)
+        vol = self.vol
 
         bar = QHBoxLayout()
         bar.addWidget(self.play_btn)
@@ -1025,6 +1060,12 @@ class Main(QMainWindow):
         self.shader_shortcut = QShortcut(QKeySequence(Qt.Key_S), self)
         self.shader_shortcut.setContext(Qt.ApplicationShortcut)
         self.shader_shortcut.activated.connect(self.toggle_shader)
+        self.plain_shortcut = QShortcut(QKeySequence(Qt.Key_C), self)
+        self.plain_shortcut.setContext(Qt.ApplicationShortcut)
+        self.plain_shortcut.activated.connect(self.video_plain.toggle)
+        self.through_shortcut = QShortcut(QKeySequence(Qt.Key_A), self)
+        self.through_shortcut.setContext(Qt.ApplicationShortcut)
+        self.through_shortcut.activated.connect(self.through_on.toggle)
         # 1..9: pick that shader directly, 0: shader layer off
         self.digit_shortcuts = []
         for n in range(10):
@@ -1090,14 +1131,17 @@ class Main(QMainWindow):
         form.addRow("Video audio", self.video_audio)
         self.video_follow = QComboBox()
         self.video_follow.addItems(list(FOLLOW_GROUPS))
-        self.video_follow.setCurrentText("everything")
+        self.video_follow.setCurrentText("varies")
         self.video_follow.setToolTip(
             "While a song built from video audio plays, the picture shows "
             "the frames the sound on the speakers was cut from: a hit cuts "
             "to the moment it was carved at, a texture runs (backwards, "
             "stretched) along with its loop, a chop jumps slice by slice. "
-            "Pick which layers the picture follows; a hit wins over a chop, "
-            "a chop over a texture. Off: the backdrop behaves as usual.")
+            "Pick which layers the picture follows. everything: a hit wins "
+            "over a chop, a chop over a texture (drums nearly always). "
+            "varies: which layer leads is re-rolled at every section and "
+            "every 4 bars, textures and chops a little more often than the "
+            "drums. Off: the backdrop behaves as usual.")
         form.addRow("", self._row([("picture follows", self.video_follow)]))
         self.video_in = QComboBox()
         self.video_in.setToolTip(
@@ -1131,6 +1175,44 @@ class Main(QMainWindow):
         self.live_level.setToolTip("Normalised loudness, what the effects see")
         form.addRow("", self._row([("device", self.live_device),
                                    ("level", self.live_level)]))
+        self.through_on = QCheckBox("through: the input plays out of an output "
+                                    "device, via the live FX rack (A)")
+        self.through_on.setToolTip(
+            "The live path of the show: the chosen input (the VHS grabber) "
+            "goes to the chosen output in realtime, through a rack of effects "
+            "that is empty for now, so what comes out is the deck's own sound. "
+            "Two 256-frame buffers make about 11 ms plus the devices' own "
+            "latency. Only ALSA hardware devices are listed; one that PipeWire "
+            "or another app is playing through cannot be opened. With live "
+            "mode on, the analysis listens to this stream. The main volume "
+            "slider sets its level. Key A toggles it.")
+        self.through_on.toggled.connect(self._toggle_through)
+        form.addRow("Audio through", self.through_on)
+        self.through_in = QComboBox()
+        self.through_in.setToolTip("Hardware input: the grabber's audio")
+        self.through_out = QComboBox()
+        self.through_out.setToolTip("Hardware output: the PA / the desk")
+        self.through_block = QComboBox()
+        self.through_block.addItems(["256", "512", "1024"])
+        self.through_block.setToolTip("Frames per buffer: 256 = 5.3 ms each "
+                                      "way; raise it if drops appear")
+        self.through_sync = QSpinBox(minimum=0, maximum=2000, singleStep=5,
+                                     suffix=" ms")
+        self.through_sync.setValue(0)
+        self.through_sync.setToolTip(
+            "Lip sync: hold the sound back by this much so it meets the "
+            "picture, which arrives late through the grabber, the decoder "
+            "and the display. Adjust while watching a tape: mouths, cuts, "
+            "hits. Changes live without a click. Typical: 60 to 150 ms.")
+        self.through_sync.valueChanged.connect(self._through_sync_changed)
+        form.addRow("", self._row([("in", self.through_in),
+                                   ("out", self.through_out),
+                                   ("block", self.through_block),
+                                   ("sync", self.through_sync)]))
+        self.through_status = QLabel("")
+        self.through_status.setProperty("role", "sub")
+        form.addRow("", self.through_status)
+        self._refresh_through_devices()
         self.live_bpm = QDoubleSpinBox(minimum=40.0, maximum=240.0,
                                        singleStep=1.0, decimals=1, suffix=" bpm")
         self.live_bpm.setValue(self.tempo.bpm)
@@ -1181,6 +1263,25 @@ class Main(QMainWindow):
         fs_btn.clicked.connect(self.toggle_fullscreen)
         form.addRow("", fs_btn)
 
+        self.grade = {}
+        for key, label, (lo, hi, step, val), tip in VIDEO_GRADE:
+            sp = QDoubleSpinBox(minimum=lo, maximum=hi, singleStep=step, decimals=2)
+            sp.setValue(val)
+            sp.setToolTip(tip)
+            sp.valueChanged.connect(self._apply_grade)
+            self.grade[key] = sp
+        keys = [k for k, *_ in VIDEO_GRADE]
+        labels = {k: lbl for k, lbl, _, _ in VIDEO_GRADE}
+        form.addRow("Source grade", self._row([(labels[k], self.grade[k]) for k in keys[:4]]))
+        form.addRow("", self._row([(labels[k], self.grade[k]) for k in keys[4:]]))
+        grade_hint = QLabel("colour correction of the picture itself, before every "
+                            "effect and kept in video-only mode; neutral as set")
+        grade_hint.setProperty("role", "sub")
+        reset_btn = QPushButton("neutral")
+        reset_btn.setToolTip("Back to no correction")
+        reset_btn.clicked.connect(self._reset_grade)
+        form.addRow("", self._row([("", grade_hint), ("", reset_btn)]))
+
         self.shader = QComboBox()
         self.shader.addItems(["off", "random"] + [p.stem for p in shader_files()])
         self.shader.setCurrentText("off")          # on once a song is generated
@@ -1202,6 +1303,14 @@ class Main(QMainWindow):
             lambda i: setattr(self.backdrop, "shader_blend", i))
         form.addRow("Shader layer", self._row([("opacity", self.shader_mix),
                                                ("blend", self.shader_blend)]))
+        self.video_plain = QCheckBox("video only: no effects, no shader layer, "
+                                     "no words (C)")
+        self.video_plain.setToolTip(
+            "Show the video as it is, for as long as this is ticked: every "
+            "effect below, the shader layer and the words are bypassed. The "
+            "picture still follows the song (sample timeline, section jumps, "
+            "clip switches, rewinds, the outro fade). Key C toggles it.")
+        form.addRow("", self.video_plain)
 
         self.vfx = {}
         for key, label, default, tip in VIDEO_EFFECTS:
@@ -1233,6 +1342,15 @@ class Main(QMainWindow):
         self.shader_mix.setValue(random.choice([0.3, 0.5, 0.7, 1.0]))
         self.shader.setCurrentText("random")
         self._look_idx = None                  # re-roll the look right away
+
+    def _apply_grade(self, *_):
+        """Grade spinboxes -> backdrop, as one dict."""
+        if hasattr(self, "backdrop"):
+            self.backdrop.grade = {k: sp.value() for k, sp in self.grade.items()}
+
+    def _reset_grade(self):
+        for (key, _, (_, _, _, val), _) in VIDEO_GRADE:
+            self.grade[key].setValue(val)
 
     def _apply_shader_choice(self):
         """Combo -> backdrop. 'random' picks per section in _roll_look."""
@@ -2032,6 +2150,8 @@ class Main(QMainWindow):
             if i >= 0:
                 self.video_in.setCurrentIndex(i)
         self.video_in.blockSignals(False)
+        if hasattr(self, "through_in"):
+            self._refresh_through_devices()
         if self.video_in.currentData() != cur:
             self._video_in_changed()             # the device went away
 
@@ -2057,7 +2177,11 @@ class Main(QMainWindow):
             self.player.stop()
             self._sections, self._sec_bounds, self._env = [], [], None
             self._outro, self._song_word = None, None
-            err = self.live.start(self.live_device.currentData())
+            if self.through is not None:        # the through path owns the input
+                err = self.live.start_external(self.through_in.currentText(),
+                                               self.through.sr)
+            else:
+                err = self.live.start(self.live_device.currentData())
             if err:
                 self.log.appendPlainText(f"live: {err}")
                 self.live_on.setChecked(False)
@@ -2084,6 +2208,92 @@ class Main(QMainWindow):
                 self.log.appendPlainText("live: off")
             self.live_level.setValue(0)
             self._arm_hide()
+
+    # ---------- audio through ----------
+    def _set_volume(self, v):
+        self.audio_out.setVolume(v / 100)
+        if self.through is not None:
+            self.through.gain = v / 100
+
+    def _through_sync_changed(self, ms):
+        if self.through is not None:
+            self.through.delay_ms = ms
+
+    def _refresh_through_devices(self):
+        """Hardware devices pedalboard can open, the grabber preselected."""
+        ins, outs = audio_devices()
+        for combo, items, prefer in ((self.through_in, ins, ("MS210x", "USB Video", "Grabber")),
+                                     (self.through_out, outs, ())):
+            cur = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            for short, full in items:
+                combo.addItem(short, full)
+            i = combo.findData(cur) if cur else -1
+            if i < 0:
+                for k, (short, _) in enumerate(items):
+                    if any(p in short for p in prefer):
+                        i = k
+                        break
+            combo.setCurrentIndex(max(0, i))
+            combo.blockSignals(False)
+
+    def _toggle_through(self, on):
+        if on:
+            in_name, out_name = self.through_in.currentData(), self.through_out.currentData()
+            if not in_name or not out_name:
+                self.log.appendPlainText("audio through: pick an input and an output")
+                self.through_on.setChecked(False)
+                return
+            self.through = LiveAudio(in_name, out_name, int(self.through_block.currentText()))
+            self.through.gain = self.vol.value() / 100
+            self.through.delay_ms = self.through_sync.value()
+            self.through.start()
+            self.through_status.setText("opening...")
+            self._through_ticks = 0
+            self._through_timer.start(20)
+            self.log.appendPlainText(
+                f"audio through: {self.through_in.currentText()} -> "
+                f"{self.through_out.currentText()}, {self.through.block} frames")
+            if self.live_on.isChecked():          # analysis moves to this stream
+                self.live.start_external(self.through_in.currentText(), self.through.sr)
+        else:
+            self._through_timer.stop()
+            if self.through is not None:
+                self.through.stop()
+                self.through = None
+                self.log.appendPlainText("audio through: off")
+            self.through_status.setText("")
+            if self.live_on.isChecked() and self.live.external:   # back to capture
+                err = self.live.start(self.live_device.currentData())
+                if err:
+                    self.log.appendPlainText(f"live: {err}")
+
+    def _poll_through(self):
+        la = self.through
+        if la is None:
+            return
+        if not la.running:
+            if la.error:
+                self.log.appendPlainText(f"audio through: {la.error}")
+                self.through_on.setChecked(False)
+            return
+        if self._live_active() and self.live.external:
+            for block, t in la.drain():
+                self.live.feed(block, t)
+        self._through_ticks += 1
+        if self._through_ticks % 10 == 0:
+            s = la.stats()
+            db = lambda p: f"{20 * math.log10(max(p, 1e-5)):.0f} dB"
+            text = (f"in {db(s['in_peak'])}  out {db(s['out_peak'])}  ·  dsp {s['load']:.0%}  ·  "
+                    f"buffers {s['buffer_ms']:.1f} ms  ·  sync {s['delay_ms']:.0f} ms  ·  "
+                    f"drops {s['dropped']}  late {s['late']}")
+            src = getattr(self.backdrop, "source", None)
+            lat = getattr(src, "capture_latency_ms", None) if self.backdrop.input else None
+            if lat is not None:
+                # what the picture is already late by before paint and display
+                text += f"  ·  picture {lat:.0f} ms + paint + display"
+            self.through_status.setText(text)
 
     def _update_live_meter(self):
         self.live_level.setValue(int(100 * self.live.loud))
@@ -2251,7 +2461,30 @@ class Main(QMainWindow):
         return self._follow is not None \
             and bool(FOLLOW_GROUPS.get(self.video_follow.currentText()))
 
-    def _follow_video(self, pos, st):
+    def _follow_groups(self, phrase_key):
+        """The priority order of event groups for this frame. Fixed for the
+        plain modes; in "varies" a lead group is rolled once per (section,
+        4-bar phrase), among the groups the song actually has events in,
+        weighted towards the layers, the other groups behind it as fallback
+        so something is always on screen."""
+        mode = self.video_follow.currentText()
+        if mode != "varies":
+            return FOLLOW_GROUPS[mode]
+        if phrase_key != self._follow_key:
+            # a new section (or song) always re-rolls; a new phrase half the time
+            new_sec = self._follow_key is None or phrase_key[0] != self._follow_key[0]
+            self._follow_key = phrase_key
+            if new_sec or random.random() < 0.5:
+                have = [g for g in FOLLOW_GROUPS["everything"]
+                        if self._follow.lists[g][1]]
+                if have:
+                    lead = random.choices(
+                        have, [FOLLOW_LEAD_WEIGHTS[g] for g in have])[0]
+                    rest = [g for g in FOLLOW_GROUPS["everything"] if g != lead]
+                    self._follow_order = (lead, *rest)
+        return self._follow_order
+
+    def _follow_video(self, pos, st, phrase_key=(0, 0)):
         """Put the frames the sounding sample was cut from on screen: on a
         new event, switch clip if needed and seek to its source offset (as
         of now); every frame, hand its rate to the backdrop as st['speed'].
@@ -2260,7 +2493,7 @@ class Main(QMainWindow):
         if source is None or self.backdrop.input or not self._following():
             self._follow_cur = None
             return
-        ev = self._follow.pick(pos, FOLLOW_GROUPS[self.video_follow.currentText()])
+        ev = self._follow.pick(pos, self._follow_groups(phrase_key))
         source.catch_up = ev is None       # a deliberate slow-down is not a rewind
         if ev is None:
             self._follow_cur = None
@@ -2289,7 +2522,7 @@ class Main(QMainWindow):
         jumps and effects. Everything degrades to nothing."""
         self._sec_idx = -1
         self._sections, self._sec_bounds, self._env = [], [], None
-        self._follow = self._follow_cur = None
+        self._follow = self._follow_cur = self._follow_key = None
         self._pick_song_video()
         self._outro = None
         parts = Path(wav).stem.split("_")
@@ -2482,7 +2715,7 @@ class Main(QMainWindow):
             self._clean_on = random.random() < v["clean"]
         in_bar = (pos - sec_start_ms) - bar_i * 4 * beat_ms
         if not live:
-            self._follow_video(pos, st)
+            self._follow_video(pos, st, (idx, bar_i // 4))
         if v["reverse"]:
             # rolled once per bar on its downbeat, with probability =
             # strength; the bar then opens with a rewind of the chosen length
@@ -2507,7 +2740,7 @@ class Main(QMainWindow):
                         if 0 <= left < length:
                             st["reverse"] = 1.0 + 2.0 * (1 - left / length)
                             st.pop("speed", None)   # the swell wins over the timeline
-        if self._clean_on and in_bar < beat_ms / 4:
+        if self.video_plain.isChecked() or (self._clean_on and in_bar < beat_ms / 4):
             st["clean"] = True
             if fade < 1.0:
                 st["brightness"] = fade
@@ -2755,6 +2988,8 @@ class Main(QMainWindow):
         self._show_ui()                         # never leave the cursor hidden
         self.player.stop()
         self.live.stop()
+        if self.through is not None:
+            self.through.stop()
         if getattr(self.backdrop, "source", None) is not None:
             self.backdrop.source.stop()
         if self.worker and self.worker.isRunning():

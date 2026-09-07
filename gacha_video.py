@@ -136,6 +136,7 @@ class VideoSource(QObject):
         self._gops = []                  # reverse cache, oldest first
         self._graphs = {}                # (in w, h, fmt, out w, h) -> filter graph
         self._ring_t = deque()           # live: capture wall times, oldest first
+        self.capture_latency_ms = None   # live: kernel capture -> decoded, smoothed
         self._ring = deque()             # live: the Frames for those times
         self._live_pos = None            # live: wall time shown when behind live
         self._live_tick = None           # live: wall time of the last tick
@@ -503,7 +504,16 @@ class VideoSource(QObject):
         if f is None:
             raise EOFError("capture device stopped")
         fr = self._to_frame(f)
-        return Frame(fr.img, fr.arr, time.monotonic())
+        now = time.monotonic()
+        if f.pts is not None:
+            # v4l2 stamps frames with the kernel's monotonic clock, so this is
+            # how far behind the world the decoded picture already is (one
+            # frame period on the MS210x grabber); paint and display add more
+            lat = (now - f.pts * self._tb) * 1000.0
+            if 0.0 <= lat < 2000.0:
+                self.capture_latency_ms = lat if self.capture_latency_ms is None \
+                    else 0.9 * self.capture_latency_ms + 0.1 * lat
+        return Frame(fr.img, fr.arr, now)
 
     def _live_step(self):
         """Capture one frame into the ring, then pick the frame to show: the

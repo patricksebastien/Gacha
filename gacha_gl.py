@@ -15,6 +15,7 @@ gacha.py falls back to its numpy VideoBackdrop when no usable OpenGL 3.3
 context exists.
 """
 
+import math
 import random
 import re
 import time
@@ -105,6 +106,21 @@ uniform float uBrightness, uSaturation, uHue, uTintHue, uTintAmt, uInvert;
 uniform float uBits, uDither, uMonoTones, uMonoThr, uSolar, uEdges, uScan;
 uniform float uGrain, uVign, uPixel, uRgbShift, uGlitch, uGlitchMode, uTrails, uZoom;
 uniform float uKaleido, uRepeat, uRepeatK, uRepeatFrac, uSwell;
+// source grade (colour correction of the picture itself, before any effect)
+uniform float uGExposure, uGBlack, uGGamma, uGContrast, uGSat, uGWarm, uGTint;
+
+vec3 grade(vec3 c) {
+    c = max(c * uGExposure + uGBlack, 0.0);
+    c = pow(c, vec3(1.0 / max(uGGamma, 0.05)));
+    c = (c - 0.5) * uGContrast + 0.5;
+    // warmth tilts red against blue, tint green against magenta; both keep
+    // the luma of a grey roughly where it was
+    c *= vec3(1.0 + 0.12 * uGWarm, 1.0 - 0.05 * abs(uGWarm), 1.0 - 0.12 * uGWarm);
+    c *= vec3(1.0 + 0.06 * uGTint, 1.0 - 0.10 * uGTint, 1.0 + 0.06 * uGTint);
+    float l = dot(c, vec3(0.299, 0.587, 0.114));
+    c = mix(vec3(l), c, uGSat);
+    return clamp(c, 0.0, 1.0);
+}
 
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
@@ -127,7 +143,7 @@ vec2 coverUV(vec2 uv, float zoom) {
     uv = (uv - 0.5) * s * (1.0 - zoom) + 0.5;
     return vec2(uv.x, 1.0 - uv.y);                  // QImage rows are top-down
 }
-vec3 video(vec2 uv, float zoom) { return texture(uVideo, coverUV(uv, zoom)).rgb; }
+vec3 video(vec2 uv, float zoom) { return grade(texture(uVideo, coverUV(uv, zoom)).rgb); }
 
 void main() {
     vec2 uv = vUV;
@@ -301,6 +317,7 @@ class GLBackdrop(QOpenGLWidget):
         self.shader_path = None
         self.shader_mix = 0.5
         self.shader_blend = 0             # index into BLEND_MODES
+        self.grade = {}                   # source grade: exposure, black, gamma, ...
         self._gen_prog = None
         self._gen_pending = None          # path to compile on next paint
         self._gen_cache = {}              # path -> (mtime, program): compile once
@@ -652,7 +669,35 @@ class GLBackdrop(QOpenGLWidget):
         self._has_prev = True
         self._ping = prev
 
+    def _set_grade_uniforms(self, p, st):
+        """The source grade, plus its very slight breathing with the music
+        when `react` is up: exposure and saturation a few percent with the
+        loudness, warmth a touch toward the root note's colour (warm notes
+        on the red side of the hue circle, cool ones on the cyan side)."""
+        gr = self.grade
+        f = p.setUniformValue1f
+        react = float(gr.get("react", 0.0))
+        expo = float(gr.get("exposure", 1.0))
+        sat = float(gr.get("saturation", 1.0))
+        warm = float(gr.get("warmth", 0.0))
+        m = st.get("music") if react > 0 else None
+        if m:
+            loud = float(m.get("loud", 0.5)) - 0.5             # -0.5 .. 0.5
+            expo *= 1.0 + 0.08 * react * loud                   # +-4 % at most
+            sat *= 1.0 + 0.12 * react * loud                    # +-6 % at most
+            root = int(m.get("root", -1))
+            if root >= 0:
+                warm += 0.15 * react * math.cos(2 * math.pi * root / 12.0)
+        f("uGExposure", expo)
+        f("uGBlack", float(gr.get("black", 0.0)))
+        f("uGGamma", float(gr.get("gamma", 1.0)))
+        f("uGContrast", float(gr.get("contrast", 1.0)))
+        f("uGSat", sat)
+        f("uGWarm", warm)
+        f("uGTint", float(gr.get("tint", 0.0)))
+
     def _set_fx_uniforms(self, p, st):
+        self._set_grade_uniforms(p, st)
         g = st.get
         f = p.setUniformValue1f
         f("uBrightness", float(g("brightness", 1.0)))
