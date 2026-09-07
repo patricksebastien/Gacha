@@ -131,6 +131,8 @@ def describe(info):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):      # Windows consoles: no crash on ✔
+        sys.stdout.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(
         description="Re-encode backdrop videos for instant seeking; the audio "
                     "track is kept and originals move to videos/originals/.")

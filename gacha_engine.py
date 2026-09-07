@@ -18,7 +18,9 @@ streaming the printed log. See run_job() for the job format.
 
 import hashlib
 import json
+import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -34,6 +36,23 @@ from pedalboard import (
     Limiter, Gain, HighpassFilter, LowpassFilter, PitchShift, Bitcrush,
     LadderFilter, GSMFullRateCompressor, MP3Compressor,
 )
+
+# subprocesses: ffmpeg from PATH, else the static build imageio-ffmpeg
+# installs with pip (handy on Windows); no console window flashes when the
+# app runs under pythonw.exe
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
+def ffmpeg_exe():
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"                 # let the call fail with a clear error
+
 
 SR = 44100
 SAMPLES_DIR = Path(__file__).parent / "samples"
@@ -182,9 +201,14 @@ def extract_video_audio(videos):
         wav = VIDEO_AUDIO_DIR / f"{v.stem}_{key}.wav"
         if not wav.is_file():
             VIDEO_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-            r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(v), "-vn",
-                                "-ac", "2", "-ar", str(SR), "-c:a", "pcm_s16le",
-                                str(wav)], capture_output=True, text=True)
+            try:
+                r = subprocess.run([ffmpeg_exe(), "-v", "error", "-y", "-i", str(v), "-vn",
+                                    "-ac", "2", "-ar", str(SR), "-c:a", "pcm_s16le",
+                                    str(wav)], capture_output=True, text=True,
+                                   errors="replace", **NO_WINDOW)
+            except OSError as e:                            # no ffmpeg at all
+                print(f"  ! ffmpeg not found ({e}): install ffmpeg or pip install imageio-ffmpeg")
+                break
             if r.returncode or not wav.is_file() or wav.stat().st_size < 1024:
                 wav.unlink(missing_ok=True)
                 print(f"  ! no audio from {v.name}: "
@@ -1744,6 +1768,8 @@ def run_job(job):
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):      # Windows consoles: no crash on ✔
+        sys.stdout.reconfigure(errors="replace")
     if len(sys.argv) != 2:
         sys.exit("usage: gacha_engine.py job.json  (normally launched by gacha.py)")
     run_job(json.loads(Path(sys.argv[1]).read_text()))

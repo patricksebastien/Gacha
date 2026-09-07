@@ -19,10 +19,24 @@ No two pulls are alike. Every sample gets used.
 Python 3.10+ and:
 
 ```bash
-pip install numpy soundfile librosa pedalboard PySide6 av mido python-rtmidi
+python3 -m pip install -r requirements.txt
+# or by hand:
+pip install numpy scipy soundfile librosa pedalboard PySide6 av mido python-rtmidi
 ```
 
 [pedalboard](https://github.com/spotify/pedalboard) (Spotify's audio effects library) powers all effect chains, [PyAV](https://github.com/PyAV-Org/PyAV) (ffmpeg) decodes the backdrop videos, [mido](https://mido.readthedocs.io/) over python-rtmidi reads the MIDI controllers (optional: without it the app runs with the keys only). The app is the Qt GUI; `gacha_engine.py` is the render engine it drives.
+
+The `ffmpeg` command line tool is needed for three things: the soundtrack of videos used as sample material, saving takes as movies, and `gacha_transcode.py` (which also wants `ffprobe`). On Linux it comes from the distribution (`apt install ffmpeg`), on macOS from Homebrew (`brew install ffmpeg`), on Windows from `winget install Gyan.FFmpeg` (then open a new terminal so it is on `PATH`). If no `ffmpeg` is on `PATH`, the app falls back to the static binary the `imageio-ffmpeg` package installs with pip; that build has no `ffprobe`, so the transcoder still needs the system one.
+
+### Windows
+
+The code has no Linux-only imports left and the same `pip install` line works in a Windows Python from python.org (the wheels of pedalboard, PyAV, PySide6 and python-rtmidi are all published for Windows). Then `python gacha.py`. What differs, and what has been checked only on Linux so far:
+
+* **Video input**: DirectShow instead of V4L2. The combo lists the cameras Windows reports and PyAV opens them by name (`dshow`); a cheap USB composite grabber should appear like a webcam. Capture latency is not measured on DirectShow, so the sync value has no starting hint.
+* **Audio through**: the WASAPI / DirectSound devices pedalboard lists, all of them, no ALSA filtering. Exclusive-mode quirks of WASAPI have not been tried; if a device refuses to open at 48 kHz, set it to 48 kHz in the Windows sound settings.
+* **MIDI**: python-rtmidi uses the WinMM backend; port names have no ALSA client numbers and everything in the Controls tab works the same. Windows lets one program open a MIDI port at a time, so close the controller's editor first.
+* **Rendering**: the render engine runs as a subprocess with UTF-8 forced, so the log survives the console code page. Renders, takes and settings land in the same places (`output/`, `takes/`, the user's registry-backed QSettings).
+* **OpenGL**: the backdrop needs OpenGL 3.3, which every desktop GPU driver provides; a virtual machine without GPU acceleration gets the numpy fallback.
 
 ## Quick start
 

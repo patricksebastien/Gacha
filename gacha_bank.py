@@ -219,6 +219,8 @@ def build(name, source, count, min_len, max_len, seed, overwrite,
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):      # Windows consoles: no crash on ✔
+        sys.stdout.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(
         description="Cut a gacha sample set out of a folder of recordings.")
     ap.add_argument("name", help="set name, becomes samples/<name>/")

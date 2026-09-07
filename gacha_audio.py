@@ -58,14 +58,19 @@ MAX_DELAY_MS = 2000              # the sync delay's ring
 
 def audio_devices():
     """([(short name, device name)], [(short name, device name)]) of the
-    hardware inputs and outputs pedalboard can open, short names for
-    combos ("MS210x, USB Audio"), full names for AudioStream."""
+    inputs and outputs pedalboard can open, short names for combos
+    ("MS210x, USB Audio"), full names for AudioStream. On Linux only the
+    ALSA hardware devices (PipeWire's plugin devices report no channels);
+    elsewhere (WASAPI / DirectSound on Windows, CoreAudio on macOS) every
+    device the library lists."""
     def hw(names):
+        if not sys.platform.startswith("linux"):
+            return [(n, n) for n in names]
         return [(n[: -len(HW_SUFFIX)] if n.endswith(HW_SUFFIX) else n, n)
                 for n in names if HW_SUFFIX in n]
     try:
         return hw(AudioStream.input_device_names), hw(AudioStream.output_device_names)
-    except Exception:                                    # no ALSA at all
+    except Exception:                                    # no audio system at all
         return [], []
 
 

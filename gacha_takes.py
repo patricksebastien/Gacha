@@ -29,6 +29,8 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 from scipy.signal import resample_poly
 
+from gacha_engine import NO_WINDOW, ffmpeg_exe
+
 ENGINE_SR = 44100
 
 
@@ -202,14 +204,18 @@ class TakeStore(QObject):
                 dts = np.diff([f.t for f in t.frames])
                 fps = 1.0 / max(1e-3, float(np.median(dts)))
                 p = folder / f"{t.name}.mov"
-                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                cmd = [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
                        "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}",
                        "-r", f"{fps:.3f}", "-i", "-"]
                 if len(t.audio):
                     cmd += ["-itsoffset", f"{t.video_lag:.3f}", "-i", str(folder / f"{t.name}.wav"),
                             "-c:a", "pcm_s16le", "-shortest"]
                 cmd += ["-c:v", "mjpeg", "-q:v", "4", "-pix_fmt", "yuvj420p", str(p)]
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                try:
+                    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, **NO_WINDOW)
+                except OSError as e:                     # no ffmpeg: the wav is saved
+                    print(f"takes: ffmpeg not found ({e}): frames of {t.name} not saved")
+                    continue
                 for f in t.frames:
                     proc.stdin.write(f.arr.tobytes())
                 proc.stdin.close()

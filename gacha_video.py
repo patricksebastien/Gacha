@@ -30,12 +30,16 @@ Frames are delivered as RGBA QImages wrapping a numpy buffer, scaled down to
 """
 
 import bisect
-import fcntl
 import os
 import random
 import struct
+import sys
 import threading
 import time
+try:
+    import fcntl                        # V4L2 device queries; Linux only
+except ImportError:                     # pragma: no cover - Windows, macOS
+    fcntl = None
 from collections import deque, namedtuple
 from pathlib import Path
 
@@ -47,6 +51,23 @@ try:
     import av
 except ImportError as e:                       # pragma: no cover
     raise ImportError("gacha needs PyAV for video: pip install av") from e
+
+# a capture device is a string: "/dev/videoN" on Linux (V4L2),
+# "dshow:video=Name" on Windows (DirectShow), "avfoundation:N" on macOS
+DEVICE_PREFIXES = ("/dev/", "dshow:", "avfoundation:")
+
+
+def is_device(path):
+    return str(path).startswith(DEVICE_PREFIXES)
+
+
+def _device_open(path):
+    """av.open() for a device string; (container, input format name)."""
+    if path.startswith("dshow:"):
+        return av.open(path[len("dshow:"):], format="dshow"), "dshow"
+    if path.startswith("avfoundation:"):
+        return av.open(path[len("avfoundation:"):], format="avfoundation"), "avfoundation"
+    return av.open(path, format="v4l2"), "v4l2"
 
 # a decoded frame ready to show: the QImage wraps `arr`, which must stay
 # alive as long as the image is used; `t` is media time in seconds
@@ -66,9 +87,29 @@ _Gop = namedtuple("_Gop", "t0 t1 times frames")
 
 
 def video_inputs():
-    """[(name, "/dev/videoN")] of the V4L2 devices that capture video: a
-    webcam, or a USB composite/VHS grabber. Metadata nodes (a webcam's
-    second /dev/video) and devices we cannot open are left out."""
+    """[(name, device string)] of the video capture devices: a webcam, or a
+    USB composite/VHS grabber. Linux asks V4L2 directly (metadata nodes,
+    a webcam's second /dev/video, and devices we cannot open are left out);
+    Windows and macOS take the cameras Qt sees and hand them to ffmpeg's
+    DirectShow / AVFoundation inputs by name / index."""
+    if sys.platform.startswith("linux") and fcntl is not None:
+        return _v4l2_inputs()
+    try:
+        from PySide6.QtMultimedia import QMediaDevices
+        cams = QMediaDevices.videoInputs()
+    except Exception:
+        return []
+    out = []
+    for i, cam in enumerate(cams):
+        name = cam.description() or f"camera {i}"
+        if sys.platform == "win32":
+            out.append((name, f"dshow:video={name}"))
+        elif sys.platform == "darwin":
+            out.append((name, f"avfoundation:{i}:none"))
+    return out
+
+
+def _v4l2_inputs():
     VIDIOC_QUERYCAP, CAPTURE, META = 0x80685600, 0x1, 0x00800000
     out = []
     root = "/sys/class/video4linux"
@@ -110,6 +151,7 @@ class VideoSource(QObject):
         self.current = None              # Path (or device) now open
         self.duration = None             # seconds; None until opened / live
         self.is_live = False
+        self._live_fmt = None            # "v4l2", "dshow", "avfoundation" while live
         self.error = None                # last open failure, for the log
         self._lock = threading.Lock()
         self._wake = threading.Event()
@@ -148,9 +190,9 @@ class VideoSource(QObject):
 
     # ---- control (any thread) ----
     def open(self, path, random_start=False):
-        """Start looping `path` (a file, or a V4L2 device like /dev/video0),
-        from the beginning or from a random position."""
-        self.current = Path(path) if not str(path).startswith("/dev/") else str(path)
+        """Start looping `path` (a file, or a capture device string, see
+        video_inputs()), from the beginning or from a random position."""
+        self.current = str(path) if is_device(path) else Path(path)
         with self._lock:
             self._cmds.append(("open", str(path), bool(random_start)))
         self._wake.set()
@@ -312,9 +354,10 @@ class VideoSource(QObject):
     def _open(self, path, random_start):
         self._close()
         self.error = None
-        live = path.startswith("/dev/")
+        live = is_device(path)
+        self._live_fmt = None
         if live:
-            ctr = av.open(path, format="v4l2")
+            ctr, self._live_fmt = _device_open(path)
         else:
             ctr = av.open(path)
         s = ctr.streams.video[0]
@@ -518,7 +561,7 @@ class VideoSource(QObject):
             raise EOFError("capture device stopped")
         fr = self._to_frame(f)
         now = time.monotonic()
-        if f.pts is not None:
+        if f.pts is not None and self._live_fmt == "v4l2":
             # v4l2 stamps frames with the kernel's monotonic clock, so this is
             # how far behind the world the decoded picture already is (one
             # frame period on the MS210x grabber); paint and display add more

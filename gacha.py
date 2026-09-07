@@ -922,8 +922,9 @@ class RenderWorker(QThread):
                 json.dump(self.job, fh)
                 job_file = fh.name
             proc = subprocess.Popen(
-                [sys.executable, "-u", str(GACHA), job_file],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                [sys.executable, "-u", "-X", "utf8", str(GACHA), job_file],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                encoding="utf-8", errors="replace", **E.NO_WINDOW)
             for ln in proc.stdout:
                 self.line.emit(ln.rstrip())
             self.finished_ok.emit(proc.wait() == 0)
@@ -1573,8 +1574,9 @@ class Main(QMainWindow):
         form.addRow("", self._row([("picture follows", self.video_follow)]))
         self.video_in = QComboBox()
         self.video_in.setToolTip(
-            "Live video in: a V4L2 capture device (a webcam, or a USB "
-            "composite grabber with a VHS deck on it) replaces the clips as "
+            "Live video in: a capture device (a webcam, or a USB composite "
+            "grabber with a VHS deck on it; V4L2 on Linux, DirectShow on "
+            "Windows) replaces the clips as "
             "the backdrop. Everything else runs on it as usual: the effects, "
             "the shader layer, the words, and rewinds jog the live picture "
             "through the last seconds captured. Clip changes are held off "
@@ -1610,8 +1612,9 @@ class Main(QMainWindow):
             "goes to the chosen output in realtime, through a rack of effects "
             "that is empty for now, so what comes out is the deck's own sound. "
             "Two 256-frame buffers make about 11 ms plus the devices' own "
-            "latency. Only ALSA hardware devices are listed; one that PipeWire "
-            "or another app is playing through cannot be opened. With live "
+            "latency. On Linux only ALSA hardware devices are listed, and one "
+            "that PipeWire or another app is playing through cannot be opened; "
+            "Windows lists the WASAPI / DirectSound devices. With live "
             "mode on, the analysis listens to this stream. The main volume "
             "slider sets its level. Key A toggles it.")
         self.through_on.toggled.connect(self._toggle_through)

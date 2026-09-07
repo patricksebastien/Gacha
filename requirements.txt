@@ -1,0 +1,14 @@
+# python3 -m pip install -r requirements.txt
+numpy
+scipy
+soundfile
+librosa
+pedalboard
+PySide6
+av
+mido
+python-rtmidi
+# ffmpeg itself is a system install (see README); this gives a fallback
+# static ffmpeg binary when none is on PATH (no ffprobe, so gacha_transcode.py
+# still wants the system one)
+imageio-ffmpeg
