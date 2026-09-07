@@ -7,7 +7,9 @@ path can carry effects and, later still, the generated material.
 
 Built on pedalboard's AudioStream (JUCE/ALSA) with Python in the loop:
 
-    input device  --read-->  [analysis tap]  -> rack -> sync delay -> gain -->write-->  output
+    input device  --read-->  [analysis tap]  -> rack -> sync delay --+
+                                                                     A/B mix -> gain -->write-->  output
+    section player (looping stems) + one-shots ----------------------+
 
 The sync delay holds the sound back by a settable number of milliseconds so
 it lines up with the picture, which arrives late through the capture
@@ -33,6 +35,9 @@ Songs keep playing through Qt as before; this path is for the live input.
     la.gain, la.mute                       # ramped, click-free
     la.delay_ms = 80                       # audio held back to meet the picture
     la.drain()                             # mono blocks for the analyzer
+    la.record_start(10.0); la.record_stop()   # a take: dry input, with pre-roll
+    la.player                              # SectionPlayer: stems, next, one-shots
+    la.ab = 0.0 .. 1.0                     # A tape through <-> B the section
     la.stats()                             # peaks, load, drops, latency
 """
 import sys
@@ -64,6 +69,100 @@ def audio_devices():
         return [], []
 
 
+class SectionPlayer:
+    """Looping stems at the stream's rate, swapped on a bar, plus one-shots.
+    Everything here is set from the GUI thread and read in the audio
+    thread; swaps go through `pending` and happen on a bar boundary."""
+
+    def __init__(self, sr):
+        self.sr = sr
+        self.stems = None                    # {name: (2, n) float32 at sr}
+        self.events = []                     # the section's timeline (seconds)
+        self.bpm = 120.0
+        self.bars = 8
+        self.n = 0                           # loop length in frames
+        self.pos = 0                         # play position in frames
+        self.pending = None                  # (stems, events, bpm, bars) for the next bar
+        self.on = {"drums": True, "layers": True, "chops": True, "events": True}
+        self._gain_now = {}                  # stem -> gain reached (ramps)
+        self.shots = []                      # [(clip (2, n), frames played)]
+        self.shot_queue = []                 # clips waiting for the next beat
+        self.loop_t0 = None                  # monotonic time the loop last wrapped
+        self.swapped = False                 # a pending section just went live
+        self.beat_frames = 0
+
+    @property
+    def playing(self):
+        return self.stems is not None
+
+    def queue(self, stems, events, bpm, bars):
+        self.pending = (stems, events, bpm, bars)
+
+    def clear(self):
+        self.pending = ("clear",)
+
+    def fire(self, clip):
+        """A one-shot (2, n) float32 at sr, on the next beat (or now if no
+        section plays)."""
+        self.shot_queue.append(clip)
+
+    def pos_s(self):
+        return self.pos / self.sr
+
+    def _swap(self):
+        p, self.pending = self.pending, None
+        if p[0] == "clear":
+            self.stems, self.events, self.n, self.pos = None, [], 0, 0
+            return
+        stems, events, bpm, bars = p
+        self.stems, self.events, self.bpm, self.bars = stems, events, bpm, bars
+        self.n = next(iter(stems.values())).shape[1]
+        self.pos = 0
+        self.beat_frames = int(round(60.0 / bpm * self.sr))
+        self.loop_t0 = time.monotonic()
+        self.swapped = True
+
+    def block(self, bs, now, ramp):
+        """The next bs frames of section + one-shots, (2, bs) float32."""
+        out = np.zeros((2, bs), np.float32)
+        bar_f = 4 * self.beat_frames
+        if self.pending is not None and (self.stems is None or self.pos == 0):
+            self._swap()
+        if self.stems is not None:
+            i0 = self.pos
+            idx = (np.arange(bs) + i0) % self.n
+            for name, data in self.stems.items():
+                target = 1.0 if self.on.get(name, True) else 0.0
+                cur = self._gain_now.get(name, target)
+                if cur != target:
+                    out += data[:, idx] * np.linspace(cur, target, bs, dtype=np.float32)
+                    self._gain_now[name] = target
+                elif target:
+                    out += data[:, idx]
+            self.pos = (i0 + bs) % self.n
+            if i0 + bs >= self.n:                     # wrapped inside this block
+                self.loop_t0 = now + (self.n - i0) / self.sr
+            # a bar boundary inside this block: a pending section comes in
+            # at the next block (5 ms off at most), its position on the bar
+            if self.pending is not None and bar_f and (i0 // bar_f) != ((i0 + bs) // bar_f):
+                self.pos = 0                          # so the swap lands on the bar
+            on_beat = (i0 // self.beat_frames) != ((i0 + bs) // self.beat_frames) \
+                if self.beat_frames else True
+        else:
+            on_beat = True
+        if self.shot_queue and on_beat:
+            self.shots.extend((c, 0) for c in self.shot_queue)
+            self.shot_queue = []
+        keep = []
+        for clip, k in self.shots:
+            n = min(bs, clip.shape[1] - k)
+            out[:, :n] += clip[:, k:k + n]
+            if k + n < clip.shape[1]:
+                keep.append((clip, k + n))
+        self.shots = keep
+        return out
+
+
 class LiveAudio:
     """The through path, on its own thread. Attributes read from any thread:
     running, error, and the stats. Set from any thread: board, gain, mute."""
@@ -75,6 +174,8 @@ class LiveAudio:
         self.gain = 1.0
         self.mute = False
         self.delay_ms = 0.0                  # sync: hold the sound back this much
+        self.ab = 0.0                        # 0 = tape through only, 1 = section only
+        self.player = SectionPlayer(self.sr)
         self.running = False
         self.error = None
         self.ready = threading.Event()       # set once open (or failed)
@@ -82,6 +183,10 @@ class LiveAudio:
         self._thread = None
         self._blocks = deque(maxlen=64)      # (mono float32 block, end time)
         self._lock = threading.Lock()
+        self.pre_roll = 12.0                 # s of dry input always kept for takes
+        self._pre = deque(maxlen=int(self.pre_roll * self.sr / self.block) + 1)
+        self._rec = None                     # [(stereo block, end time)] while recording
+        self._rec_req = None                 # pre-roll seconds asked for, once
         # stats
         self.in_peak = self.out_peak = 0.0   # last block's peaks, 0..1
         self.load = 0.0                      # DSP time / block time, smoothed
@@ -108,6 +213,19 @@ class LiveAudio:
             items = list(self._blocks)
             self._blocks.clear()
         return items
+
+    def record_start(self, pre_roll_s):
+        """Start collecting the dry input, beginning `pre_roll_s` seconds
+        ago (as far as kept). The audio thread picks it up on its next block."""
+        self._rec_req = min(float(pre_roll_s), self.pre_roll)
+
+    def record_stop(self):
+        """Stop and return [(stereo (2, bs) float32 block, monotonic end
+        time)] oldest first; [] if nothing was recording."""
+        with self._lock:
+            blocks, self._rec = self._rec, None
+            self._rec_req = None
+        return blocks or []
 
     def stats(self):
         return {"in_peak": self.in_peak, "out_peak": self.out_peak,
@@ -200,6 +318,7 @@ class LiveAudio:
         self._delay_now = self._delay_frames()
         self._ramp = np.linspace(0.0, 1.0, bs, dtype=np.float32)
         self._ar = np.arange(bs)
+        self._ab_now = float(self.ab)
 
     def _ring_read(self, delay):
         idx = (self._ar + self._wpos - self.block - delay) % self._ring_n
@@ -212,8 +331,16 @@ class LiveAudio:
         bs, sr, ramp = self.block, self.sr, self._ramp
         self.in_peak = float(np.abs(x).max()) if x.size else 0.0
         mono = x.mean(axis=0).astype(np.float32, copy=False)
+        dry = x.copy()
         with self._lock:
             self._blocks.append((mono, now))
+            self._pre.append((dry, now))
+            if self._rec_req is not None:         # take starts: pre-roll first
+                since = now - self._rec_req
+                self._rec = [b for b in self._pre if b[1] >= since]
+                self._rec_req = None
+            elif self._rec is not None:
+                self._rec.append((dry, now))
         new = self.board
         if new is not self._board_now:
             a = self._board_now.process(x, sr, reset=False)
@@ -231,6 +358,15 @@ class LiveAudio:
             self._delay_now = delay
         elif delay:
             y = self._ring_read(delay)
+        # A/B: the tape through against the section, equal power, ramped
+        sec = self.player.block(bs, now, ramp)
+        ab = min(1.0, max(0.0, float(self.ab)))
+        if ab != self._ab_now:
+            a = np.linspace(self._ab_now, ab, bs, dtype=np.float32)
+            self._ab_now = ab
+        else:
+            a = ab
+        y = y * np.sqrt(1.0 - a) + sec * np.sqrt(a)
         target = 0.0 if self.mute else float(self.gain)
         if target != self._gain_now:
             y = y * np.linspace(self._gain_now, target, bs, dtype=np.float32)

@@ -318,6 +318,7 @@ class GLBackdrop(QOpenGLWidget):
         self.shader_mix = 0.5
         self.shader_blend = 0             # index into BLEND_MODES
         self.grade = {}                   # source grade: exposure, black, gamma, ...
+        self.override = None              # a Frame from RAM shown instead of the source
         self._gen_prog = None
         self._gen_pending = None          # path to compile on next paint
         self._gen_cache = {}              # path -> (mtime, program): compile once
@@ -575,8 +576,9 @@ class GLBackdrop(QOpenGLWidget):
                 self.source.set_speed(float(st["speed"]))
             else:
                 self.source.set_speed(-float(rev) if rev else 1.0)
-            fr = self.source.latest()
-            if fr is not None and fr is not self._shown and not self._frozen:
+            fr = self.override if self.override is not None else self.source.latest()
+            if fr is not None and fr.img is not None and fr is not self._shown \
+                    and not self._frozen:
                 self._upload_frame(fr.img)
                 self._shown = fr                 # keeps fr.arr alive with it
         if self._overlay_img is not None:

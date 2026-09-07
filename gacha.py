@@ -38,7 +38,8 @@ from PySide6.QtWidgets import (
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox,
     QStyle,
-    QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QScrollArea, QSizePolicy, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -47,6 +48,11 @@ from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES, WORDS,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
 from gacha_audio import LiveAudio, audio_devices
+from gacha_takes import TakeStore
+from gacha_section import Material, render_section, render_oneshot, KINDS, STEMS
+import gacha_engine as E
+from scipy.signal import resample_poly
+import threading
 from gacha_video import VideoSource, video_inputs
 
 BASE = Path(__file__).parent
@@ -276,6 +282,32 @@ BAYER4 = np.array([[0, 8, 2, 10], [12, 4, 14, 6],
                    [3, 11, 1, 9], [15, 7, 13, 5]], dtype="float32") / 16.0
 
 # every effect the Video tab exposes: key, label, default strength, tooltip
+# every key the performer has, in one table: the Keys tab shows it, and the
+# MIDI mapping will hang its bindings on the same ids. (group, id, key, what)
+KEYMAP = [
+    ("show", "fullscreen", "F11", "fullscreen on/off; Esc leaves it too"),
+    ("show", "video_only", "C", "video only: no effects, no shader layer, no words"),
+    ("show", "next_fx", "Space", "next video FX look, and the next shader"),
+    ("show", "shader", "S", "shader layer off/on"),
+    ("show", "shader_n", "1 .. 9", "pick that shader directly"),
+    ("show", "shader_off", "0", "shader layer off"),
+    ("tape", "through", "A", "audio through off/on (tape -> output)"),
+    ("tape", "record", "R", "take: start / stop recording the live feed into RAM"),
+    ("clock", "tap", "T", "tap tempo, first tap on the downbeat"),
+    ("clock", "downbeat", "D", "restart the bar now, tempo kept"),
+    ("clock", "live", "L", "live mode (audio drives the visuals) off/on"),
+    ("clock", "drop", "X", "mark a drop by hand"),
+    ("section", "next", "N", "next section on the bar (pre-rendered)"),
+    ("section", "stop", "Shift+N", "stop the section on the bar"),
+    ("section", "event", "E", "fire a one-shot from the material on the beat"),
+    ("section", "ab_down", "[", "A/B 10 % toward the tape"),
+    ("section", "ab_up", "]", "A/B 10 % toward the section"),
+    ("section", "stem_drums", "F1", "drums stem in/out"),
+    ("section", "stem_layers", "F2", "layers stem in/out"),
+    ("section", "stem_chops", "F3", "chops stem in/out"),
+    ("section", "stem_events", "F4", "events stem in/out"),
+]
+
 # source grade: colour correction of the picture itself (the VHS input above
 # all), applied before every effect and kept in "video only" mode.
 # key, label, (min, max, step, neutral), tooltip
@@ -571,6 +603,8 @@ class VideoBackdrop(QWidget):
         self._live = None           # Frame the image was made from
         self.state_fn = None
         self.fx = VideoFX()
+        self.override = None       # RAM frame from the section engine (GL only shows it)
+        self.grade = {}            # source grade (GL only applies it)
         self._last_fx = 0.0
         self._zoom = 0.0
         self._frozen = None         # captured frame while a beat-repeat runs
@@ -928,6 +962,21 @@ class Main(QMainWindow):
         self._live_timer = QTimer(self)             # level meter refresh
         self._live_timer.timeout.connect(self._update_live_meter)
         self.through = None                         # LiveAudio while audio through is on
+        self.takes = TakeStore(parent=self)         # moments of the show, in RAM
+        # the live section engine: material carved from the takes, sections
+        # rendered on a thread, played by the audio thread's SectionPlayer
+        self._perf_material = None                  # (key, Material)
+        self._perf_ready = None                     # (key, Section, stems48) pre-rendered
+        self._perf_busy = None                      # ("section"|"shot", key) rendering now
+        self._perf_result = None                    # set by the render thread
+        self._perf_want = False                     # play the next result as soon as it lands
+        self._perf_playing = None                   # Section on the player
+        self._perf_timer = QTimer(self)
+        self._perf_timer.timeout.connect(self._poll_perform)
+        self._perf_timer.start(20)
+        self.takes.changed.connect(self._takes_changed)
+        self._take_timer = QTimer(self)             # limit check + status while recording
+        self._take_timer.timeout.connect(self._poll_take)
         self._through_timer = QTimer(self)          # feeds the analyzer, status line
         self._through_timer.timeout.connect(self._poll_through)
         self._through_ticks = 0
@@ -984,7 +1033,13 @@ class Main(QMainWindow):
             w.setLayout(box)
             tabs.addTab(w, title)
         tabs.addTab(self.outputs_list, "Outputs")
-        tabs.addTab(self._build_mixer(), "Mixer")
+        tabs.addTab(self._scrolling(self._build_mixer()), "Mixer")
+        # the lists pane is a quarter of the interface: pages scroll rather
+        # than force the pane wide
+        for i in range(tabs.count()):
+            if tabs.tabText(i) in ("Samples", "Videos"):
+                tabs.widget(i).setMinimumWidth(1)
+        right_min = 300
 
         # ---------- player bar ----------
         self.now_playing = QLabel("—")
@@ -1018,12 +1073,17 @@ class Main(QMainWindow):
         right.addLayout(bar)
         right_w = QWidget()
         right_w.setLayout(right)
+        right_w.setMinimumWidth(right_min)
 
         split = QSplitter()
         split.addWidget(left_w)
         split.addWidget(right_w)
         left_w.setMinimumWidth(560)      # four-spinbox rows need the room
-        split.setSizes([560, 490])
+        # parameters 75 %, the file lists 25 %; the ratio survives resizes
+        # and follows the handle when it is dragged
+        self.split = split
+        self._split_ratio = 0.75
+        split.splitterMoved.connect(self._split_dragged)
         self.setStyleSheet(STYLE)
         self.gl_mode = gl_available()
         if self.gl_mode:
@@ -1066,6 +1126,23 @@ class Main(QMainWindow):
         self.through_shortcut = QShortcut(QKeySequence(Qt.Key_A), self)
         self.through_shortcut.setContext(Qt.ApplicationShortcut)
         self.through_shortcut.activated.connect(self.through_on.toggle)
+        self.rec_shortcut = QShortcut(QKeySequence(Qt.Key_R), self)
+        self.rec_shortcut.setContext(Qt.ApplicationShortcut)
+        self.rec_shortcut.activated.connect(self.toggle_take)
+        self.perf_shortcuts = []
+        for keys, slot in ((Qt.Key_N, self.perform_next),
+                           ("Shift+N", self.perform_stop),
+                           (Qt.Key_E, self.perform_event),
+                           (Qt.Key_BracketLeft, lambda: self.perf_ab.setValue(self.perf_ab.value() - 10)),
+                           (Qt.Key_BracketRight, lambda: self.perf_ab.setValue(self.perf_ab.value() + 10)),
+                           (Qt.Key_F1, lambda: self.perf_stems["drums"].toggle()),
+                           (Qt.Key_F2, lambda: self.perf_stems["layers"].toggle()),
+                           (Qt.Key_F3, lambda: self.perf_stems["chops"].toggle()),
+                           (Qt.Key_F4, lambda: self.perf_stems["events"].toggle())):
+            sc = QShortcut(QKeySequence(keys), self)
+            sc.setContext(Qt.ApplicationShortcut)
+            sc.activated.connect(slot)
+            self.perf_shortcuts.append(sc)
         # 1..9: pick that shader directly, 0: shader layer off
         self.digit_shortcuts = []
         for n in range(10):
@@ -1101,7 +1178,133 @@ class Main(QMainWindow):
         tabs.addTab(self._tab_sections(), "Sections")
         tabs.addTab(self._tab_layers(), "Layers && FX")
         tabs.addTab(self._tab_video(), "Video")
+        tabs.addTab(self._tab_perform(), "Perform")
+        tabs.addTab(self._tab_keys(), "Keys")
         return tabs
+
+    def _split_dragged(self, *_):
+        a, b = self.split.sizes()
+        if a + b > 0:
+            self._split_ratio = a / (a + b)
+
+    def _apply_split(self):
+        w = self.split.width()
+        if w > 0:
+            self.split.blockSignals(True)
+            self.split.setSizes([int(w * self._split_ratio), int(w * (1 - self._split_ratio))])
+            self.split.blockSignals(False)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "split"):
+            self._apply_split()
+
+    def _tab_keys(self):
+        """Every key, grouped, with a MIDI column that is empty until the
+        mapping exists: the same table will take the bindings."""
+        tree = QTreeWidget()
+        tree.setColumnCount(4)
+        tree.setHeaderLabels(["key", "action", "what it does", "MIDI"])
+        tree.setRootIsDecorated(True)
+        tree.setUniformRowHeights(True)
+        tree.setToolTip("The performer's keys. The MIDI column fills in once "
+                        "a controller is mapped to these actions.")
+        groups = {}
+        names = {"show": "picture", "tape": "tape", "clock": "clock",
+                 "section": "section engine"}
+        for group, ident, key, what in KEYMAP:
+            if group not in groups:
+                g = QTreeWidgetItem([names.get(group, group), "", "", ""])
+                g.setFlags(g.flags() & ~Qt.ItemIsSelectable)
+                tree.addTopLevelItem(g)
+                groups[group] = g
+            item = QTreeWidgetItem([key, ident, what, ""])
+            item.setData(0, Qt.UserRole, ident)
+            groups[group].addChild(item)
+        tree.expandAll()
+        for c in range(3):
+            tree.resizeColumnToContents(c)
+        self.keys_tree = tree
+        tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        tree.setMinimumHeight(300)          # the tab area gives it the rest
+        hint = QLabel("none of these keys bring the hidden interface back; "
+                      "the MIDI column is the plan: one binding per action")
+        hint.setProperty("role", "sub")
+        outer = QVBoxLayout()                  # the tree takes the whole tab
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.addWidget(tree, stretch=1)
+        outer.addWidget(hint)
+        w = QWidget()
+        w.setLayout(outer)
+        return w
+
+    def _tab_perform(self):
+        """The live section engine: what the feet will drive on stage."""
+        form = QFormLayout()
+        self.perf_material = QComboBox()
+        self.perf_material.addItems(["takes, else ticked samples", "takes only",
+                                     "ticked samples"])
+        self.perf_material.setToolTip(
+            "What the sections are built from. The takes recorded during the "
+            "show are the point; the ticked sample sets stand in for rehearsal "
+            "when there are none (nothing ticked = every sample).")
+        self.perf_kind = QComboBox()
+        self.perf_kind.addItems(["random"] + list(KINDS))
+        self.perf_kind.setToolTip(
+            "Shape of the next section. groove: full kit, one to three layers, "
+            "maybe chops. break: one or two drum voices under more layers. "
+            "build: the voices stack up bar by bar. sparse: one voice, one layer.")
+        form.addRow("Material", self._row([("", self.perf_material), ("next kind", self.perf_kind)]))
+        next_btn = QPushButton("next section (N)")
+        next_btn.setMinimumHeight(30)
+        next_btn.setToolTip(
+            "A new 8-bar section from the material at the live tempo, on the "
+            "next bar. One is rendered ahead while the current one loops, so "
+            "this is instant; the very first waits about a second.")
+        next_btn.clicked.connect(self.perform_next)
+        stop_btn = QPushButton("stop (Shift+N)")
+        stop_btn.setToolTip("Silence the section on the next bar; the tape stays")
+        stop_btn.clicked.connect(self.perform_stop)
+        event_btn = QPushButton("event (E)")
+        event_btn.setToolTip("Fire a one-shot cut from the material on the next beat")
+        event_btn.clicked.connect(self.perform_event)
+        form.addRow("Section", self._row([("", next_btn), ("", stop_btn), ("", event_btn)]))
+        self.perf_stems = {}
+        keys = {"drums": "F1", "layers": "F2", "chops": "F3", "events": "F4"}
+        pairs = []
+        for stem in STEMS:
+            cb = QCheckBox(f"{stem} ({keys[stem]})")
+            cb.setChecked(True)
+            cb.toggled.connect(lambda on, st=stem: self._perf_stem(st, on))
+            self.perf_stems[stem] = cb
+            pairs.append(("", cb))
+        form.addRow("Stems", self._row(pairs))
+        self.perf_ab = QSlider(Qt.Horizontal)
+        self.perf_ab.setRange(0, 100)
+        self.perf_ab.setValue(0)
+        self.perf_ab.setToolTip("A/B: 0 = the tape through only, 100 = the section "
+                                "only, equal power in between. Keys [ and ] step "
+                                "by 10; a MIDI expression pedal later.")
+        self.perf_ab.valueChanged.connect(self._perf_ab_changed)
+        self.perf_ab_lbl = QLabel("A 100 %  ·  B 0 %")
+        self.perf_ab_lbl.setProperty("role", "sub")
+        form.addRow("A/B", self._row([("", self.perf_ab), ("", self.perf_ab_lbl)]))
+        self.perf_picture = QComboBox()
+        self.perf_picture.addItems(["auto", "take", "live"])
+        self.perf_picture.setToolTip(
+            "What the screen shows while a section plays: take = the frames "
+            "the sounds were cut from (needs takes with video), live = the "
+            "tape as it comes in, auto = the take frames once A/B passes 50 %.")
+        form.addRow("Picture", self._row([("", self.perf_picture)]))
+        self.perf_status = QLabel("no section")
+        self.perf_status.setProperty("role", "sub")
+        self.perf_status.setWordWrap(True)
+        form.addRow("", self.perf_status)
+        hint = QLabel("needs audio through on (A): the section is mixed into that "
+                      "path. Tempo = the live clock (tap T, or the bpm box).")
+        hint.setProperty("role", "sub")
+        form.addRow("", hint)
+        return self._wrap(form)
 
     def _tab_video(self):
         form = QFormLayout()
@@ -1212,6 +1415,40 @@ class Main(QMainWindow):
         self.through_status = QLabel("")
         self.through_status.setProperty("role", "sub")
         form.addRow("", self.through_status)
+
+        self.rec_btn = QPushButton("● record (R)")
+        self.rec_btn.setCheckable(True)
+        self.rec_btn.setMinimumHeight(30)
+        self.rec_btn.setToolTip(
+            "A take: the live sound and picture from a few seconds before "
+            "this press until the next one, kept in RAM. The takes together "
+            "are the sample bank the engine builds sections from at the end "
+            "of the piece; short ones are fine. Stops by itself at the limit; "
+            "the next press then starts a new take. Needs audio through and/or "
+            "the video input on. Key R.")
+        self.rec_btn.clicked.connect(self.toggle_take)
+        self.take_pre = QDoubleSpinBox(minimum=0.0, maximum=12.0, singleStep=1.0,
+                                       decimals=0, suffix=" s")
+        self.take_pre.setValue(10.0)
+        self.take_pre.setToolTip("Pre-roll: how many seconds before the press "
+                                 "each take starts with")
+        self.take_limit = QDoubleSpinBox(minimum=5.0, maximum=300.0, singleStep=5.0,
+                                         decimals=0, suffix=" s")
+        self.take_limit.setValue(60.0)
+        self.take_limit.setToolTip("A take stops by itself after this long")
+        save_btn = QPushButton("save takes")
+        save_btn.setToolTip("Write every take as wav + mov into takes/<date>/ "
+                            "for rehearsal and offline work")
+        save_btn.clicked.connect(self._save_takes)
+        clear_btn = QPushButton("clear")
+        clear_btn.setToolTip("Forget every take")
+        clear_btn.clicked.connect(self.takes.clear)
+        form.addRow("Takes", self._row([("", self.rec_btn), ("pre-roll", self.take_pre),
+                                        ("limit", self.take_limit), ("", save_btn),
+                                        ("", clear_btn)]))
+        self.take_status = QLabel("no takes")
+        self.take_status.setProperty("role", "sub")
+        form.addRow("", self.take_status)
         self._refresh_through_devices()
         self.live_bpm = QDoubleSpinBox(minimum=40.0, maximum=240.0,
                                        singleStep=1.0, decimals=1, suffix=" bpm")
@@ -1751,6 +1988,15 @@ class Main(QMainWindow):
         self._order(self.fx_min, self.fx_max)
 
     # ---------- mixer tab ----------
+    @staticmethod
+    def _scrolling(widget):
+        """A page that scrolls when the pane is narrower than its content."""
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.NoFrame)
+        area.setWidget(widget)
+        return area
+
     def _build_mixer(self):
         self.mixer_renders = QListWidget()
         self.mixer_renders.currentItemChanged.connect(self._mixer_load_sections)
@@ -2208,6 +2454,266 @@ class Main(QMainWindow):
                 self.log.appendPlainText("live: off")
             self.live_level.setValue(0)
             self._arm_hide()
+
+    # ---------- perform: live sections ----------
+    def _perf_material_key(self):
+        mode = self.perf_material.currentIndex()
+        take_ids = tuple(t.idx for t in self.takes.takes if len(t.audio))
+        if take_ids and mode != 2:
+            return ("takes", take_ids)
+        if mode == 1:
+            return None
+        files = tuple(str(p) for p in self.samples_tree.checked()) or \
+            tuple(sorted(str(p) for p in SAMPLES_DIR.rglob("*") if p.suffix.lower() in AUDIO_EXTS))
+        return ("samples", files) if files else None
+
+    def _perf_bank(self, key):
+        """Material for `key`, built if needed (call on the render thread)."""
+        if self._perf_material and self._perf_material[0] == key:
+            return self._perf_material[1]
+        if key[0] == "takes":
+            bank = self.takes.bank()
+        else:
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                bank = E.load_samples(list(key[1]))
+        mat = Material(bank, seed=random.randrange(1 << 30))
+        self._perf_material = (key, mat)
+        return mat
+
+    def _perf_key(self):
+        kind = self.perf_kind.currentText()
+        return (self._perf_material_key(), kind, round(self.tempo.bpm, 1))
+
+    def _perf_render(self, key, kind_choice):
+        """Render thread: a section for `key`, stems resampled to the audio
+        thread's rate; result lands in _perf_result."""
+        try:
+            mat = self._perf_bank(key[0])
+            if not mat.ok:
+                self._perf_result = ("error", "no material with sound (record a take, "
+                                              "or tick some samples)")
+                return
+            kind = random.choice(KINDS) if kind_choice == "random" else kind_choice
+            sec = render_section(mat, seed=random.randrange(1 << 30), bpm=key[2],
+                                 bars=8, kind=kind)
+            sr = self.through.sr if self.through is not None else 48000
+            stems = {}
+            for name, data in sec.stems.items():
+                d = data if sr == E.SR else resample_poly(data, sr // 300, E.SR // 300, axis=0)
+                stems[name] = np.ascontiguousarray(d.T.astype(np.float32))
+            self._perf_result = ("section", key, sec, stems)
+        except Exception as e:                        # noqa: BLE001
+            self._perf_result = ("error", f"render failed: {e}")
+
+    def _perf_render_shot(self, key):
+        try:
+            mat = self._perf_bank(key[0])
+            if not mat.ok:
+                self._perf_result = ("error", "no material with sound")
+                return
+            shot = render_oneshot(mat, random.randrange(1 << 30), 60.0 / key[2])
+            sr = self.through.sr if self.through is not None else 48000
+            clip = shot["clip"] * shot["gain"]
+            if sr != E.SR:
+                clip = resample_poly(clip, sr // 300, E.SR // 300, axis=0)
+            self._perf_result = ("shot", np.ascontiguousarray(clip.T.astype(np.float32)), shot)
+        except Exception as e:                        # noqa: BLE001
+            self._perf_result = ("error", f"one-shot failed: {e}")
+
+    def _perf_start(self, what, key):
+        if self._perf_busy is not None:
+            return False
+        self._perf_busy = (what, key)
+        target = self._perf_render if what == "section" else self._perf_render_shot
+        args = (key, self.perf_kind.currentText()) if what == "section" else (key,)
+        threading.Thread(target=target, args=args, daemon=True, name="gacha-render").start()
+        return True
+
+    def perform_next(self):
+        """N: the next section, on the bar. Uses the pre-rendered one when it
+        matches the material, kind and tempo; else renders and plays when done."""
+        if self.through is None or not self.through.running:
+            self.log.appendPlainText("perform: switch audio through on first (A)")
+            return
+        key = self._perf_key()
+        if key[0] is None:
+            self.log.appendPlainText("perform: no material (record a take or tick samples)")
+            return
+        if self._perf_ready is not None and self._perf_ready[0] == key:
+            self._perf_play(*self._perf_ready[1:])
+            self._perf_ready = None
+            self._perf_start("section", key)          # the one after, ahead of time
+        else:
+            self._perf_want = True
+            self._perf_ready = None
+            if not self._perf_start("section", key):
+                self.perf_status.setText("rendering, the next lands when ready...")
+
+    def _perf_play(self, sec, stems):
+        self.through.player.queue(stems, sec.events, sec.bpm, sec.bars)
+        self._perf_playing = sec
+        self.log.appendPlainText(f"section: {sec.kind} {sec.bpm:.0f} bpm, "
+                                 f"{'; '.join(sec.notes)}")
+
+    def perform_stop(self):
+        if self.through is not None:
+            self.through.player.clear()
+        self._perf_playing = None
+        self.backdrop.override = None
+        self.perf_status.setText("no section")
+
+    def perform_event(self):
+        """E: a one-shot from the material, on the next beat."""
+        if self.through is None or not self.through.running:
+            self.log.appendPlainText("perform: switch audio through on first (A)")
+            return
+        key = self._perf_key()
+        if key[0] is None:
+            return
+        self._perf_start("shot", key)
+
+    def _perf_stem(self, stem, on):
+        if self.through is not None:
+            self.through.player.on[stem] = on
+
+    def _perf_ab_changed(self, v):
+        self.perf_ab_lbl.setText(f"A {100 - v} %  ·  B {v} %")
+        if self.through is not None:
+            self.through.ab = v / 100.0
+
+    def _poll_perform(self):
+        """20 ms: collect render results, keep the live clock on the section,
+        and put the take's frames on screen for the sound that plays."""
+        r, self._perf_result = self._perf_result, None
+        if r is not None:
+            what = r[0]
+            self._perf_busy = None
+            if what == "error":
+                self.log.appendPlainText(f"perform: {r[1]}")
+                self._perf_want = False
+            elif what == "shot":
+                if self.through is not None:
+                    self.through.player.fire(r[1])
+                    self.log.appendPlainText(f"event <- {r[2]['src']}")
+            elif what == "section":
+                _, key, sec, stems = r
+                if self._perf_want and self.through is not None and key == self._perf_key():
+                    self._perf_want = False
+                    self._perf_play(sec, stems)
+                    self._perf_start("section", key)  # pre-render the one after
+                else:
+                    self._perf_ready = (key, sec, stems)
+        la = self.through
+        pl = la.player if la is not None and la.running else None
+        if pl is None or not pl.playing:
+            if self.backdrop.override is not None:
+                self.backdrop.override = None
+            if self._perf_playing is not None and pl is None:
+                self._perf_playing = None
+            if self._perf_busy:
+                self.perf_status.setText("rendering...")
+            return
+        if pl.swapped:                                 # the live clock follows the loop
+            pl.swapped = False
+            self.tempo.set_bpm(pl.bpm)
+            self.tempo.anchor = pl.loop_t0 if pl.loop_t0 else time.monotonic()
+            self.live_bpm.blockSignals(True)
+            self.live_bpm.setValue(self.tempo.bpm)
+            self.live_bpm.blockSignals(False)
+        sec = self._perf_playing
+        pos = pl.pos_s()
+        bar = int(pos * pl.bpm / 60.0 / 4) + 1
+        ready = "next ready" if self._perf_ready else ("rendering next..." if self._perf_busy else "")
+        if sec is None:                                # stop asked: it lands on the bar
+            self.perf_status.setText("stopping on the bar...")
+        else:
+            self.perf_status.setText(
+                f"playing {sec.kind} {pl.bpm:.0f} bpm  ·  bar {bar}/{pl.bars}  ·  {ready}")
+        # picture: the frame the sounding sample was cut from
+        mode = self.perf_picture.currentText()
+        show = mode == "take" or (mode == "auto" and la.ab >= 0.5)
+        fr = self._perf_frame(pos) if (show and sec is not None) else None
+        self.backdrop.override = fr
+
+    def _perf_frame(self, pos):
+        """Frame of the take the loudest-priority event sounding at `pos`
+        (seconds into the loop) was cut from, or None (no video in it)."""
+        sec = self._perf_playing
+        takes = {t.name: t for t in self.takes.takes}
+        order = {"kick": 0, "snare": 0, "hihat": 0, "ohat": 0, "ride": 0, "glitch": 0,
+                 "chop": 1, "oneshot": 1, "texture": 2}
+        best = None
+        for t, src, off, dur, rate, role in sec.events:
+            if t <= pos < t + dur and src in takes and takes[src].frames:
+                pri = order.get(role, 3)
+                if best is None or pri < best[0]:
+                    best = (pri, t, src, off, rate)
+        if best is None:
+            return None
+        _, t, src, off, rate = best
+        return takes[src].frame_at(off + (pos - t) * rate)
+
+    # ---------- takes ----------
+    def toggle_take(self):
+        """R / the button / a footswitch later: start or stop a take."""
+        audio = self.through if self.through is not None and self.through.running else None
+        src = getattr(self.backdrop, "source", None)
+        video = src if (self.backdrop.input and src is not None and src.is_live) else None
+        if not self.takes.recording and audio is None and video is None:
+            self.log.appendPlainText("take: nothing to record, switch audio through "
+                                     "and/or the video input on")
+            self.rec_btn.setChecked(False)
+            return
+        self.takes.pre_roll = self.take_pre.value()
+        self.takes.limit = self.take_limit.value()
+        take = self.takes.toggle(audio, video)
+        if take is not None:
+            self._log_take(take)
+        elif self.takes.recording:
+            what = " + ".join(w for w, on in (("audio", audio is not None),
+                                              ("video", video is not None)) if on)
+            self.log.appendPlainText(f"take {len(self.takes.takes) + 1}: recording {what} "
+                                     f"(pre-roll {self.takes.pre_roll:.0f} s, "
+                                     f"limit {self.takes.limit:.0f} s)")
+
+    def _log_take(self, take):
+        self.log.appendPlainText(
+            f"{take.name}: {take.seconds:.1f} s, {len(take.frames)} frames, "
+            f"{take.nbytes / 1e9:.2f} GB  ·  {len(self.takes.takes)} takes, "
+            f"{self.takes.nbytes / 1e9:.1f} GB in RAM"
+            + ("  (limit reached)" if self.takes.limit_hit else ""))
+
+    def _takes_changed(self):
+        rec = self.takes.recording
+        self.rec_btn.setChecked(rec)
+        self.rec_btn.setText("■ stop (R)" if rec else "● record (R)")
+        if rec:
+            self._take_timer.start(100)
+        else:
+            self._take_timer.stop()
+            n = len(self.takes.takes)
+            self.take_status.setText(
+                "no takes" if not n else
+                f"{n} take{'s' if n > 1 else ''}, {sum(t.seconds for t in self.takes.takes):.0f} s, "
+                f"{self.takes.nbytes / 1e9:.1f} GB in RAM")
+
+    def _poll_take(self):
+        was = self.takes.recording
+        self.takes.tick()
+        if was and not self.takes.recording:           # the limit stopped it
+            self._log_take(self.takes.takes[-1])
+            return
+        self.take_status.setText(f"● recording {self.takes.elapsed:.1f} s / "
+                                 f"{self.takes.limit:.0f} s")
+
+    def _save_takes(self):
+        if not self.takes.takes:
+            self.log.appendPlainText("takes: nothing to save")
+            return
+        folder = Path("takes") / time.strftime("%Y%m%d_%H%M%S")
+        paths = self.takes.save(folder)
+        self.log.appendPlainText(f"takes: wrote {len(paths)} files to {folder}/")
 
     # ---------- audio through ----------
     def _set_volume(self, v):
@@ -2988,6 +3494,8 @@ class Main(QMainWindow):
         self._show_ui()                         # never leave the cursor hidden
         self.player.stop()
         self.live.stop()
+        if self.takes.recording:
+            self.takes.stop()
         if self.through is not None:
             self.through.stop()
         if getattr(self.backdrop, "source", None) is not None:

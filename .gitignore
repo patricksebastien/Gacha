@@ -19,3 +19,4 @@ venv/
 
 # fonts: binaries not distributed (license + readme still tracked)
 fonts/*.ttf
+takes/

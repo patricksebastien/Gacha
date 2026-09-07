@@ -137,6 +137,8 @@ class VideoSource(QObject):
         self._graphs = {}                # (in w, h, fmt, out w, h) -> filter graph
         self._ring_t = deque()           # live: capture wall times, oldest first
         self.capture_latency_ms = None   # live: kernel capture -> decoded, smoothed
+        self._rec_sink = None            # live: callable taking each captured Frame
+        self._rec_pre = None             # s of ring to hand over first, once
         self._ring = deque()             # live: the Frames for those times
         self._live_pos = None            # live: wall time shown when behind live
         self._live_tick = None           # live: wall time of the last tick
@@ -186,6 +188,17 @@ class VideoSource(QObject):
         """Media time now, in seconds (0 for live sources)."""
         with self._lock:
             return self._clock(time.monotonic())
+
+    def record_start(self, pre_roll_s, sink):
+        """Hand every captured frame to `sink(frame)` from now on, starting
+        with the last `pre_roll_s` seconds already in the ring. Live sources
+        only; the decoder thread does the handing over."""
+        self._rec_pre = float(pre_roll_s)
+        self._rec_sink = sink
+
+    def record_stop(self):
+        self._rec_sink = None
+        self._rec_pre = None
 
     def latest(self):
         """The Frame to show now, or None before the first decode."""
@@ -521,6 +534,15 @@ class VideoSource(QObject):
         fr = self._next_live()
         self._ring_t.append(fr.t)
         self._ring.append(fr)
+        sink = self._rec_sink
+        if sink is not None:
+            if self._rec_pre is not None:            # first frame: the pre-roll
+                since = fr.t - self._rec_pre
+                i = bisect.bisect_left(self._ring_t, since)
+                for old in list(self._ring)[i:-1]:
+                    sink(old)
+                self._rec_pre = None
+            sink(fr)
         w, h = self._size
         keep = max(2, LIVE_BUFFER_BYTES // max(1, w * h * 4))
         while len(self._ring) > keep:
