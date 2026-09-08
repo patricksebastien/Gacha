@@ -91,29 +91,56 @@ SWITCH_INTERVAL = 0.001          # s; Python's default 5 ms lets the GUI hold
 MAX_DELAY_MS = 2000              # the sync delay's ring
 
 
+def _api_has_devices(idx, devs):
+    return any(d["hostapi"] == idx and (d["max_input_channels"] > 0 or
+                                        d["max_output_channels"] > 0) for d in devs)
+
+
 def audio_apis():
-    """Names of the host APIs present, best first (ASIO, WASAPI, ...)."""
+    """Names of the host APIs present that have at least one device, best
+    first (ASIO, WASAPI, ...). The ASIO build lists an ASIO host API even
+    with no ASIO driver installed; empty, it is left out."""
     if sd is None:
         return []
     try:
-        names = [a["name"] for a in sd.query_hostapis()]
+        apis = sd.query_hostapis()
+        devs = sd.query_devices()
     except Exception:
         return []
+    names = [a["name"] for i, a in enumerate(apis) if _api_has_devices(i, devs)]
     return [n for n in PREFERRED_APIS if n in names] + \
         [n for n in names if n not in PREFERRED_APIS]
 
 
 def _hostapi(api=None):
-    """Index of the host API to use: `api` by name, else the best present."""
+    """Index of the host API to use: `api` by name, else the best present
+    that has devices."""
     apis = sd.query_hostapis()
     for i, a in enumerate(apis):
         if api and a["name"] == api:
             return i
+    devs = sd.query_devices()
     for want in PREFERRED_APIS:
         for i, a in enumerate(apis):
-            if a["name"] == want:
+            if a["name"] == want and _api_has_devices(i, devs):
                 return i
+    for i, a in enumerate(apis):
+        if _api_has_devices(i, devs):
+            return i
     return sd.default.hostapi if sd.default.hostapi >= 0 else 0
+
+
+def audio_status():
+    """Why there may be no devices: '' when all is well, else a sentence."""
+    if sd is None:
+        return ("sounddevice/PortAudio not available: pip install sounddevice "
+                f"(Linux: also apt install libportaudio2). [{SD_ERROR}]")
+    try:
+        if not audio_apis():
+            return "PortAudio lists no audio devices on this machine"
+    except Exception as e:
+        return f"PortAudio: {e}"
+    return ""
 
 
 def audio_devices(api=None):
@@ -400,9 +427,59 @@ class LiveAudio:
 
     # ------------------------------------------------------------ control
     def start(self):
+        """Open in a thread. On ASIO the streams are opened here, on the
+        calling thread: ASIO drivers are COM objects and refuse (error -9999)
+        when opened from another thread than the one PortAudio started on."""
+        self._preopened = None
+        if sd is not None and self._api_name() == "ASIO":
+            try:
+                self._preopened = self._open()
+            except Exception as e:
+                self.error = self._explain(e)
+                self.ready.set()
+                return
         self._thread = threading.Thread(target=self._run, name="gacha-audio",
                                         daemon=True)
         self._thread.start()
+
+    def _api_name(self):
+        try:
+            return sd.query_hostapis(_hostapi(self.api))["name"]
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _explain(e):
+        msg = str(e)
+        low = msg.lower()
+        if "unavailable" in low or "busy" in low:
+            msg += (" (in use by PipeWire or another app? the 'pipewire' or "
+                    "'default' device is shared)")
+        if "-9999" in msg or "unanticipated" in low:
+            msg += (" (the ASIO driver refused: is it open in another app or in its "
+                    "control panel? set the interface to 48 kHz there, or pick the "
+                    "WASAPI driver)")
+        return msg
+
+    def _set_sr(self, sr):
+        """Run at another rate than asked (an ASIO interface locked to 44.1
+        kHz): the racks, the players and the limiter are rebuilt for it, the
+        knob values kept. Sections and songs are resampled to `self.sr`."""
+        sr = int(sr)
+        if sr == self.sr:
+            return
+        old_racks = self.racks
+        self.sr = sr
+        self.racks = {ch: Rack(sr) for ch in CHANNELS}
+        for ch, r in self.racks.items():
+            r.amounts.update(old_racks[ch].amounts)
+            r.vol = old_racks[ch].vol
+        self.player = SectionPlayer(sr)
+        self.player.on = self.on
+        self.song = SongPlayer(sr, self.on)
+        self._limiter = Limiter(threshold_db=-1.0, release_ms=100.0)
+        self.buffer_ms = 2000.0 * self.block / sr
+        self.out_latency_ms = 1000.0 * self.block / sr
 
     def stop(self):
         self._stop.set()
@@ -462,34 +539,49 @@ class LiveAudio:
         else:
             modes = [(api_name, None)]
         errors = []
-        for label, extra in modes:
-            try:
-                src, snk = self._open_streams(extra, duplex=(api_name == "ASIO"))
-                self.mode = label
-                if errors:
-                    self.mode += f" ({errors[-1]})"
-                return src, snk
-            except Exception as e:
-                errors.append(f"{label}: {str(e).strip()[:90]}")
+        rates = [self.sr]
+        try:                                  # the device's own rate as a fallback
+            _j, d = _device_index(self.out_name, "output", self.api)
+            native = int(d["default_samplerate"])
+            if native and native != self.sr:
+                rates.append(native)
+        except Exception:
+            pass
+        for sr in rates:
+            for label, extra in modes:
+                try:
+                    if sr != self.sr:
+                        self._set_sr(sr)
+                    src, snk = self._open_streams(extra, duplex=(api_name == "ASIO"))
+                    self.mode = label if sr == SR else f"{label} @ {sr} Hz"
+                    if errors:
+                        self.mode += f" ({errors[-1]})"
+                    return src, snk
+                except Exception as e:
+                    errors.append(f"{label} {sr} Hz: {str(e).strip()[:90]}")
         raise RuntimeError("; ".join(errors))
 
     def _open_streams(self, extra, duplex=False):
         lat = 2 * self.block / self.sr                 # two blocks of device buffer
+        # ASIO: the driver's control panel owns the buffer size; asking for
+        # another one is what some drivers refuse. 0 = whatever it has, and
+        # the blocking read/write still deal in our blocks.
+        bs = 0 if duplex else self.block
         j, _d = _device_index(self.out_name, "output", self.api)
         if duplex and self.in_name:                    # ASIO: one stream, in and out
             i, d = _device_index(self.in_name, "input", self.api)
-            st = sd.Stream(device=(i, j), samplerate=self.sr, blocksize=self.block,
+            st = sd.Stream(device=(i, j), samplerate=self.sr, blocksize=bs,
                            channels=(min(2, int(d["max_input_channels"])), 2),
                            dtype="float32", latency=lat, extra_settings=extra)
             return st, st
         src = None
         if self.in_name:
             i, d = _device_index(self.in_name, "input", self.api)
-            src = sd.InputStream(device=i, samplerate=self.sr, blocksize=self.block,
+            src = sd.InputStream(device=i, samplerate=self.sr, blocksize=bs,
                                  channels=min(2, int(d["max_input_channels"])),
                                  dtype="float32", latency=lat, extra_settings=extra)
         try:
-            snk = sd.OutputStream(device=j, samplerate=self.sr, blocksize=self.block,
+            snk = sd.OutputStream(device=j, samplerate=self.sr, blocksize=bs,
                                   channels=2, dtype="float32", latency=lat,
                                   extra_settings=extra)
         except Exception:
@@ -519,13 +611,10 @@ class LiveAudio:
     def _run(self):
         old_switch = sys.getswitchinterval()
         try:
-            src, snk = self._open()
+            src, snk = self._preopened if self._preopened is not None else self._open()
+            self._preopened = None
         except Exception as e:
-            msg = str(e)
-            if "unavailable" in msg.lower() or "busy" in msg.lower():
-                msg += (" (in use by PipeWire or another app? the 'pipewire' or "
-                        "'default' device is shared)")
-            self.error = msg
+            self.error = self._explain(e)
             self.ready.set()
             return
         sys.setswitchinterval(SWITCH_INTERVAL)

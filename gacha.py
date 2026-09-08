@@ -48,7 +48,7 @@ from gacha_gl import BLEND_MODES, GLBackdrop, gl_available, shader_files
 from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
-from gacha_audio import LiveAudio, audio_apis, audio_devices
+from gacha_audio import LiveAudio, audio_apis, audio_devices, audio_status
 from gacha_takes import TakeStore
 from gacha_section import Material, render_section, render_oneshot, KINDS, STEMS
 import gacha_engine as E
@@ -2301,10 +2301,14 @@ class Main(QMainWindow):
             "lists the WASAPI devices. When it cannot be opened, songs fall "
             "back to Qt's player, without racks.")
         self.through_block = QComboBox()
-        self.through_block.addItems(["256", "480", "512", "1024"])
-        self.through_block.setToolTip("Frames per buffer: 256 = 5.3 ms each way, "
-                                      "480 = 10 ms (WASAPI's period, the drop-free "
-                                      "choice on Windows); raise it if xruns appear")
+        self.through_block.addItems(["64", "128", "256", "480", "512", "1024", "2048"])
+        self.through_block.setToolTip(
+            "Frames per block, the usual driver sizes: at 48 kHz 64 = 1.3 ms, 128 = "
+            "2.7 ms, 256 = 5.3 ms, 512 = 10.7 ms, 1024 = 21 ms, 2048 = 43 ms each "
+            "way. 480 is WASAPI shared mode's 10 ms period. Python processes one "
+            "block per round, so 64 and 128 want ASIO or an exclusive device and "
+            "a quiet machine; raise the size if xruns appear. On ASIO match the "
+            "driver panel's buffer.")
         self.through_excl = QCheckBox("exclusive")
         self.through_excl.setChecked(True)
         self.through_excl.setToolTip(
@@ -3577,7 +3581,11 @@ class Main(QMainWindow):
             self.through.stop()
             self.through = None
         if not out_name:
-            self.through_status.setText("no output device: songs play through Qt, no racks")
+            why = audio_status() or "no output device chosen"
+            self.through_status.setText(f"not open: {why}. Songs play through Qt, no racks")
+            if why != getattr(self, "_audio_why_logged", None):
+                self._audio_why_logged = why
+                self.log.appendPlainText(f"audio: {why}")
             self._update_afx_status()
             return
         self.through = LiveAudio(in_name or None, out_name, int(self.through_block.currentText()),
