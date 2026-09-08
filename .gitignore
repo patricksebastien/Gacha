@@ -17,6 +17,6 @@ __pycache__/
 .venv/
 venv/
 
-# fonts: binaries not distributed (license + readme still tracked)
-fonts/*.ttf
 takes/
+
+README_perfo.md

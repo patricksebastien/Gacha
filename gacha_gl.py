@@ -107,7 +107,7 @@ uniform float uBits, uDither, uMonoTones, uMonoThr, uSolar, uEdges, uScan;
 uniform float uGrain, uVign, uPixel, uRgbShift, uGlitch, uGlitchMode, uTrails, uZoom;
 uniform float uKaleido, uRepeat, uRepeatK, uRepeatFrac, uSwell;
 // source grade (colour correction of the picture itself, before any effect)
-uniform float uGExposure, uGBlack, uGGamma, uGContrast, uGSat, uGWarm, uGTint;
+uniform float uGExposure, uGBlack, uGGamma, uGContrast, uGSat, uGWarm, uGTint, uGSharpen;
 
 vec3 grade(vec3 c) {
     c = max(c * uGExposure + uGBlack, 0.0);
@@ -143,7 +143,31 @@ vec2 coverUV(vec2 uv, float zoom) {
     uv = (uv - 0.5) * s * (1.0 - zoom) + 0.5;
     return vec2(uv.x, 1.0 - uv.y);                  // QImage rows are top-down
 }
-vec3 video(vec2 uv, float zoom) { return grade(texture(uVideo, coverUV(uv, zoom)).rgb); }
+// the source pixel, sharpened (unsharp mask against its 4 neighbours) or
+// blurred (3x3 box), in the video's own texels so a 720x576 tape is treated
+// at tape resolution, then graded
+vec3 video(vec2 uv, float zoom) {
+    vec2 p = coverUV(uv, zoom);
+    vec3 c = texture(uVideo, p).rgb;
+    if (uGSharpen > 0.0) {
+        vec2 d = 1.0 / uVidRes;
+        vec3 b = (texture(uVideo, p + vec2(d.x, 0.0)).rgb + texture(uVideo, p - vec2(d.x, 0.0)).rgb
+                + texture(uVideo, p + vec2(0.0, d.y)).rgb + texture(uVideo, p - vec2(0.0, d.y)).rgb) * 0.25;
+        c = max(c + (c - b) * uGSharpen, 0.0);
+    } else if (uGSharpen < 0.0) {
+        // blur: a 3x3 box whose radius grows with the knob (1 to 10 source
+        // texels); below 1 the box is blended in instead
+        float a = -uGSharpen;
+        vec2 d = max(a, 1.0) / uVidRes;
+        vec3 b = c;
+        for (int i = -1; i <= 1; i++)
+            for (int j = -1; j <= 1; j++)
+                if (i != 0 || j != 0)
+                    b += texture(uVideo, p + vec2(float(i), float(j)) * d).rgb;
+        c = mix(c, b / 9.0, min(a, 1.0));
+    }
+    return grade(c);
+}
 
 void main() {
     vec2 uv = vUV;
@@ -235,8 +259,8 @@ void main() {
 COMPOSITE_FS = """#version 330 core
 in vec2 vUV;
 out vec4 fragColor;
-uniform sampler2D uFx, uGen, uOverlay;
-uniform float uGenOn, uOpacity, uBlend, uScrim, uOverlayA;
+uniform sampler2D uFx, uGen;
+uniform float uGenOn, uOpacity, uBlend, uScrim;
 void main() {
     vec3 base = texture(uFx, vUV).rgb;
     vec3 col = base;
@@ -246,10 +270,6 @@ void main() {
         if (uBlend < 0.5)      col = mix(base, g.rgb, a);                 // mix
         else if (uBlend < 1.5) col = base + g.rgb * a;                    // add
         else                   col = 1.0 - (1.0 - base) * (1.0 - g.rgb * a); // screen
-    }
-    if (uOverlayA > 0.0) {                       // word cloud, drawn by Qt (rows top-down)
-        vec4 o = texture(uOverlay, vec2(vUV.x, 1.0 - vUV.y));
-        col = mix(col, o.rgb, o.a * uOverlayA);
     }
     col = mix(col, vec3(0.047, 0.027, 0.02), uScrim * 0.215);
     fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
@@ -325,9 +345,6 @@ class GLBackdrop(QOpenGLWidget):
         self._gen_cache = {}              # path -> (mtime, program): compile once
         self._gen_min_opacity = {}        # path -> opacity a shader insists on
         self._prewarm = []                # shaders still to compile in idle time
-        self._overlay_img = None          # word cloud QImage waiting for upload
-        self._overlay_tex = None
-        self._overlay_keep = None
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
         lay.addWidget(child)
@@ -343,14 +360,16 @@ class GLBackdrop(QOpenGLWidget):
         self._timer.start(16)
 
     # ---- video source (same behaviour as the numpy backdrop) ----
-    def set_input(self, device):
-        """Live video in: show a V4L2 capture device (`/dev/videoN`) instead
-        of the clips, and ignore clip changes until `None` switches back."""
+    def set_input(self, device, options=None):
+        """Live video in: show a capture device (see video_inputs()) instead
+        of the clips, at the capture mode `options` (a video_input_modes()
+        entry, None = the device's default), and ignore clip changes until
+        `None` switches back."""
         if self.source is None:
             return
         self.input = device
         if device:
-            self.source.open(device)
+            self.source.open(device, options=options)
         elif self.current is not None:
             self.source.open(self.current, random_start=True)
 
@@ -377,36 +396,6 @@ class GLBackdrop(QOpenGLWidget):
     def last_frame(self):
         """The most recently uploaded video frame (QImage) or None."""
         return getattr(self, "_frame_img", None)
-
-    def set_overlay(self, img):
-        """A transparent RGBA QImage drawn over everything (the word cloud).
-        Uploaded on the next paint; its opacity comes from state['words']."""
-        self._overlay_img = img.convertToFormat(QImage.Format_RGBA8888) \
-            if img is not None else None
-
-    def _upload_overlay(self):
-        img = self._overlay_img
-        self._overlay_img = None
-        if img is None:
-            return
-        w, h = img.width(), img.height()
-        if img.bytesPerLine() != w * 4:
-            img = img.copy()
-        if self._overlay_tex is None or (self._overlay_tex.width(),
-                                         self._overlay_tex.height()) != (w, h):
-            if self._overlay_tex is not None:
-                self._overlay_tex.destroy()
-            tex = QOpenGLTexture(QOpenGLTexture.Target2D)
-            tex.setFormat(QOpenGLTexture.RGBA8_UNorm)
-            tex.setSize(w, h)
-            tex.allocateStorage()
-            tex.setMinMagFilters(QOpenGLTexture.Linear, QOpenGLTexture.Linear)
-            tex.setWrapMode(QOpenGLTexture.ClampToEdge)
-            self._overlay_tex = tex
-        self._overlay_tex.bind()
-        self.gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA,
-                                GL_UNSIGNED_BYTE, img.constBits())
-        self._overlay_keep = img
 
     def set_shader(self, path):
         """Select a ./shaders file (or None). Compiled on the next paint."""
@@ -441,12 +430,10 @@ class GLBackdrop(QOpenGLWidget):
     def _cleanup_gl(self):
         """Free GL objects while the context is still current (on exit)."""
         self.makeCurrent()
-        for tex in (getattr(self, "_video_tex", None),
-                    getattr(self, "_overlay_tex", None)):
-            if tex is not None:
-                tex.destroy()
+        tex = getattr(self, "_video_tex", None)
+        if tex is not None:
+            tex.destroy()
         self._video_tex = None
-        self._overlay_tex = None
         self._fbo_fx = [None, None]
         self._fbo_gen = [None, None]
         self._gen_prog = None
@@ -583,8 +570,6 @@ class GLBackdrop(QOpenGLWidget):
                     and not self._frozen:
                 self._upload_frame(fr.img)
                 self._shown = fr                 # keeps fr.arr alive with it
-        if self._overlay_img is not None:
-            self._upload_overlay()
         if self._video_tex is None:
             gl.glClearColor(16 / 255, 9 / 255, 7 / 255, 1.0)
             gl.glClear(GL_COLOR_BUFFER_BIT)
@@ -664,11 +649,6 @@ class GLBackdrop(QOpenGLWidget):
         c.setUniformValue1f("uOpacity", opacity)
         c.setUniformValue1f("uBlend", float(self.shader_blend))
         c.setUniformValue1f("uScrim", 1.0 if self.child.isVisible() else 0.0)
-        words = float(st.get("words", 0.0)) if self._overlay_tex is not None else 0.0
-        if words > 0.0:
-            self._bind_tex(2, self._overlay_tex.textureId())
-        c.setUniformValue1i("uOverlay", 2)
-        c.setUniformValue1f("uOverlayA", words)
         self._draw()
         self._has_prev = True
         self._ping = prev
@@ -699,6 +679,7 @@ class GLBackdrop(QOpenGLWidget):
         f("uGSat", sat)
         f("uGWarm", warm)
         f("uGTint", float(gr.get("tint", 0.0)))
+        f("uGSharpen", float(gr.get("sharpen", 0.0)))
 
     def _set_fx_uniforms(self, p, st):
         self._set_grade_uniforms(p, st)

@@ -32,7 +32,10 @@ Frames are delivered as RGBA QImages wrapping a numpy buffer, scaled down to
 import bisect
 import os
 import random
+import re
+import shutil
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -61,13 +64,75 @@ def is_device(path):
     return str(path).startswith(DEVICE_PREFIXES)
 
 
-def _device_open(path):
-    """av.open() for a device string; (container, input format name)."""
+def _device_open(path, options=None):
+    """av.open() for a device string; (container, input format name).
+    `options` are the capture mode (video_size, input_format / pixel_format
+    / vcodec, framerate), from video_input_modes()."""
+    opts = {k: str(v) for k, v in (options or {}).items()}
     if path.startswith("dshow:"):
-        return av.open(path[len("dshow:"):], format="dshow"), "dshow"
+        return av.open(path[len("dshow:"):], format="dshow", options=opts), "dshow"
     if path.startswith("avfoundation:"):
-        return av.open(path[len("avfoundation:"):], format="avfoundation"), "avfoundation"
-    return av.open(path, format="v4l2"), "v4l2"
+        return av.open(path[len("avfoundation:"):], format="avfoundation", options=opts), "avfoundation"
+    return av.open(path, format="v4l2", options=opts), "v4l2"
+
+
+def _ffmpeg_exe():
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def video_input_modes(device):
+    """[(label, options)] the capture device offers: pixel format or codec
+    and frame size, as ffmpeg lists them (`-list_formats all` on V4L2,
+    `-list_options true` on DirectShow), largest first. Empty when nothing
+    could be listed; the device then runs at its default."""
+    exe = _ffmpeg_exe()
+    if exe is None or not device:
+        return []
+    if device.startswith("dshow:"):
+        cmd = [exe, "-hide_banner", "-f", "dshow", "-list_options", "true",
+               "-i", device[len("dshow:"):]]
+    elif device.startswith("avfoundation:"):
+        return []
+    else:
+        cmd = [exe, "-hide_banner", "-f", "v4l2", "-list_formats", "all", "-i", device]
+    try:
+        kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           timeout=8, **kw)
+        text = r.stderr + r.stdout
+    except Exception:
+        return []
+    modes = {}
+    if device.startswith("dshow:"):
+        # "  pixel_format=yuyv422  min s=640x480 fps=5 max s=640x480 fps=30"
+        # "  vcodec=mjpeg  min s=1920x1080 fps=5 max s=1920x1080 fps=30"
+        for m in re.finditer(r"(pixel_format|vcodec)=(\w+)\s+min s=(\d+x\d+) fps=([\d.]+)"
+                             r"\s+max s=(\d+x\d+) fps=([\d.]+)", text):
+            key, fmt, _s0, _f0, size, fps = m.groups()
+            fps = int(float(fps))
+            modes[(fmt, size)] = (f"{size} {fmt} {fps} fps",
+                                  {"video_size": size, key: fmt, "framerate": fps})
+    else:
+        # "[video4linux2,v4l2 @ 0x..] Raw       :     yuyv422 :           YUYV 4:2:2 : 720x576 720x480"
+        # "[video4linux2,v4l2 @ 0x..] Compressed:       mjpeg :          Motion-JPEG : 1920x1080 ..."
+        for line in text.splitlines():
+            m = re.search(r"\]\s*(Raw|Compressed)\s*:\s*(\S+)\s*:\s*.*?:\s*([\dx {}\-]+)$", line)
+            if not m:
+                continue
+            fmt = m.group(2)
+            for size in re.findall(r"\d+x\d+", m.group(3)):
+                modes[(fmt, size)] = (f"{size} {fmt}", {"video_size": size, "input_format": fmt})
+    def area(item):
+        w, h = item[1]["video_size"].split("x")
+        return int(w) * int(h)
+    return sorted(modes.values(), key=area, reverse=True)
 
 # a decoded frame ready to show: the QImage wraps `arr`, which must stay
 # alive as long as the image is used; `t` is media time in seconds
@@ -131,6 +196,28 @@ def _v4l2_inputs():
     return out
 
 
+_HAS_AUDIO = {}          # (path, size, mtime) -> bool
+
+
+def video_has_audio(path):
+    """True if the file carries an audio stream: the container is opened and
+    its stream list read, no decoding (a few milliseconds). Cached per file
+    version; a file that cannot be opened counts as silent."""
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return False
+    key = (str(p), st.st_size, st.st_mtime_ns)
+    if key not in _HAS_AUDIO:
+        try:
+            with av.open(str(p)) as ctr:
+                _HAS_AUDIO[key] = len(ctr.streams.audio) > 0
+        except Exception:
+            _HAS_AUDIO[key] = False
+    return _HAS_AUDIO[key]
+
+
 def _display_size(w, h, max_height):
     if max_height and h > max_height:
         s = max_height / h
@@ -190,12 +277,13 @@ class VideoSource(QObject):
         self._thread.start()
 
     # ---- control (any thread) ----
-    def open(self, path, random_start=False):
+    def open(self, path, random_start=False, options=None):
         """Start looping `path` (a file, or a capture device string, see
-        video_inputs()), from the beginning or from a random position."""
+        video_inputs()), from the beginning or from a random position.
+        `options`: a capture mode for a device, from video_input_modes()."""
         self.current = str(path) if is_device(path) else Path(path)
         with self._lock:
-            self._cmds.append(("open", str(path), bool(random_start)))
+            self._cmds.append(("open", str(path), bool(random_start), options))
         self._wake.set()
 
     def seek(self, t):
@@ -302,7 +390,7 @@ class VideoSource(QObject):
             cmds, self._cmds = self._cmds, []
         for cmd in cmds:
             if cmd[0] == "open":
-                self._open(cmd[1], cmd[2])
+                self._open(cmd[1], cmd[2], cmd[3] if len(cmd) > 3 else None)
             elif cmd[0] == "seek" and self._ctr is not None and not self.is_live:
                 t = cmd[1]
                 if t is None:
@@ -353,13 +441,13 @@ class VideoSource(QObject):
                 pass
         self._ctr = self._stream = None
 
-    def _open(self, path, random_start):
+    def _open(self, path, random_start, options=None):
         self._close()
         self.error = None
         live = is_device(path)
         self._live_fmt = None
         if live:
-            ctr, self._live_fmt = _device_open(path)
+            ctr, self._live_fmt = _device_open(path, options)
         else:
             ctr = av.open(path)
         s = ctr.streams.video[0]

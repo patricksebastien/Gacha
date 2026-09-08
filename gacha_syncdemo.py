@@ -33,7 +33,38 @@ SR = 44100
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 # D dorian pentatonic over two octaves: MIDI numbers
 SCALE = [50, 52, 55, 57, 60, 62, 64, 67, 69, 72]
-FONT = Path(__file__).parent / "fonts" / "JetBrainsMono.ttf"
+# a monospace face from the system (the app ships no fonts); Pillow's own
+# bitmap font is the last resort
+FONT_CANDIDATES = [
+    "DejaVuSansMono.ttf", "LiberationMono-Regular.ttf", "UbuntuMono-R.ttf",
+    "NotoSansMono-Regular.ttf", "FreeMono.ttf",                    # Linux
+    "consola.ttf", "cour.ttf",                                     # Windows
+    "Menlo.ttc", "Monaco.ttf", "Courier New.ttf",                  # macOS
+]
+FONT_DIRS = ["/usr/share/fonts", "/usr/local/share/fonts", str(Path.home() / ".fonts"),
+             str(Path.home() / ".local/share/fonts"), "C:/Windows/Fonts",
+             "/System/Library/Fonts", "/Library/Fonts"]
+
+
+def font(size):
+    """A monospace font at `size` pixels: the first candidate found in the
+    usual font folders, else Pillow's default face."""
+    for name in FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(name, size)          # on the font path
+        except OSError:
+            pass
+        for d in FONT_DIRS:
+            hits = list(Path(d).rglob(name)) if Path(d).is_dir() else []
+            if hits:
+                try:
+                    return ImageFont.truetype(str(hits[0]), size)
+                except OSError:
+                    pass
+    try:
+        return ImageFont.load_default(size=size)           # Pillow >= 10.1
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def compose(rng, n):
@@ -124,9 +155,9 @@ def main():
     audio = np.concatenate([tone(m, d) for m, d in melody])
     write_wav(wav, audio)
 
-    big = ImageFont.truetype(str(FONT), int(H * 0.55))
-    mid = ImageFont.truetype(str(FONT), int(H * 0.11))
-    small = ImageFont.truetype(str(FONT), int(H * 0.045))
+    big = font(int(H * 0.55))
+    mid = font(int(H * 0.11))
+    small = font(int(H * 0.045))
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(fps),

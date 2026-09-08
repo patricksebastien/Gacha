@@ -18,6 +18,7 @@ streaming the printed log. See run_job() for the job format.
 
 import hashlib
 import json
+import math
 import os
 import random
 import shutil
@@ -55,6 +56,9 @@ def ffmpeg_exe():
 
 
 SR = 44100
+STEMS = ("drums", "layers", "chops", "events")   # the stems a song is also written as
+STEMS_SR = 48000          # the stems file's rate: the live audio stream's
+
 SAMPLES_DIR = Path(__file__).parent / "samples"
 OUT_DIR = Path(__file__).parent / "output"
 VIDEO_AUDIO_DIR = Path(__file__).parent / "videos" / ".audio"   # extracted tracks
@@ -1229,6 +1233,14 @@ def compose(seed, duration, sample_files, intro_bars=None,
     total = int(n_bars * bar * SR) + int(4 * SR)      # room for tails
     buf = np.zeros((total, 2), dtype="float32")
     tonal = np.zeros((total, 2), dtype="float32")   # textures only, for pitch
+    # the same music as four stems (drums incl. the sub, layers = textures,
+    # chops, events = swells, fills, one-shots), for the live player's
+    # per-layer racks and F1-F4; every placement lands in buf and its stem
+    stems = {name: np.zeros((total, 2), dtype="float32") for name in STEMS}
+
+    def put(stem, clip, start, gain=1.0):
+        place(buf, clip, start, gain)
+        place(stems[stem], clip, start, gain)
     kick_hits = []                                  # (pos, section, bar, step)
     swing_frac = k.swing if k.swing is not None else rng.uniform(0.0, 0.06)
     swing = swing_frac * step_len * SR                # 16th-note swing
@@ -1391,7 +1403,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                                 hit = choke(hit, int((nxt - s) * step_len * SR))
                             if pan:
                                 hit = panned(hit, pan)
-                            place(buf, hit, max(0, pos), vel * gain)
+                            put("drums", hit, max(0, pos), vel * gain)
                 # hihat glitch: a burst of very fast retriggers (1/32-1/96)
                 if "hihat" in active and rng.random() < k.glitch_chance:
                     s = rng.randrange(16)
@@ -1412,7 +1424,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                         if pan_drums > 0:             # glitch sweeps the field
                             h = panned(hit, np.sin(t * np.pi * 2) * 0.7)
                         gpos = bar_start + int(s * step_len * SR) + i * spacing
-                        place(buf, h, gpos, g)
+                        put("drums", h, gpos, g)
                         if gsrc:
                             ev(gpos, gsrc[0], gsrc[1], spacing, 1.0, "glitch")
 
@@ -1439,7 +1451,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 swell = np.vstack([np.zeros((sec_len - len(clip), 2),
                                             dtype="float32"), clip])
             ramp = (np.linspace(0.15, 1.0, len(swell)) ** 2)[:, None]
-            place(buf, swell * ramp, sec_start, 0.55)
+            put("events", swell * ramp, sec_start, 0.55)
             print(f"  sec{si} swell <- {src}")
         elif intro_kind == "collage":
             # scattered one-shots: a field-recording scene, no beat
@@ -1458,7 +1470,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 spread = max(pan_events, 0.6)
                 clip = panned(clip, rng.uniform(-spread, spread))
                 pos = sec_start + rng.randint(0, max(1, sec_len - len(clip)))
-                place(buf, clip, pos, rng.uniform(0.3, 0.5))
+                put("events", clip, pos, rng.uniform(0.3, 0.5))
                 ev(pos, src, c_off, c_dur, 1.0, "collage")
             print(f"  sec{si} collage intro")
 
@@ -1509,7 +1521,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 * (1.4 if (is_intro or is_break) else 1.0)
             if pan_layers > 0:
                 loop = panned(loop, rng.uniform(-pan_layers, pan_layers))
-            place(buf, loop, sec_start, lvl)
+            put("layers", loop, sec_start, lvl)
             place(tonal, loop, sec_start, lvl)
             print(f"  sec{si} bg <- {src} [{','.join(ops) or 'loop'}]")
 
@@ -1543,7 +1555,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                     if pan_events > 0:
                         piece = panned(piece, rng.uniform(-pan_events, pan_events))
                     cpos = bar_start + int(s * step_len * SR)
-                    place(buf, piece, cpos, k.chop_gain)
+                    put("chops", piece, cpos, k.chop_gain)
                     ev(cpos, src, p_off, p_dur, p_rate, "chop")
             print(f"  sec{si} chops <- {src}")
 
@@ -1554,10 +1566,11 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 a = sec_start + int(bi * bar * SR)
                 b = min(len(buf), a + int(bar * SR))
                 pre = max(0, a - 2048)        # context so the filter settles
-                lp = Pedalboard(
-                    [LowpassFilter(cutoff_frequency_hz=float(cutoffs[bi]))])
-                seg = lp(buf[pre:b].T, SR).T
-                buf[a:b] = seg[a - pre:]
+                for target in (buf, *stems.values()):
+                    lp = Pedalboard(
+                        [LowpassFilter(cutoff_frequency_hz=float(cutoffs[bi]))])
+                    seg = lp(target[pre:b].T, SR).T
+                    target[a:b] = seg[a - pre:]
 
     # ---- guarantee every sample appears at least once ------------------
     leftovers = [n for n in names if n not in used]
@@ -1579,7 +1592,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
         pos = int(round(pos / (beat * SR)) * beat * SR)   # snap to the beat
         if pan_events > 0:
             clip = panned(clip, rng.uniform(-pan_events, pan_events))
-        place(buf, clip, pos, rng.uniform(0.25, 0.45))
+        put("events", clip, pos, rng.uniform(0.25, 0.45))
         ev(pos, src, L - o_off if rev else o_off, cut, -1.0 if rev else 1.0,
            "oneshot")
 
@@ -1628,6 +1641,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
         if active.any():
             sub *= k.sub_level * rms(buf) / rms(sub[active])
             buf += sub
+            stems["drums"] += sub
         print(f"  sub: {len(hits)} notes over {len(first_kick)} bars")
 
     # ---- transitions into drops: repeater, gap, reverse cymbal ---------
@@ -1643,21 +1657,27 @@ def compose(seed, duration, sample_files, intro_bars=None,
         boundary = int(m["start_bar"] * bar * SR)
         fx = []
         if rng.random() < k.repeat_chance * scale:
+            state = rng.getstate()                  # the stems get the same roll
+            for target in stems.values():
+                rng.setstate(state)
+                beat_repeat(rng, target, boundary - bar_n, bar_n, beat_n)
+            rng.setstate(state)
             flavour = beat_repeat(rng, buf, boundary - bar_n, bar_n, beat_n)
             if flavour:
                 fx.append(f"repeat:{flavour}")
         if rng.random() < k.gap_chance * scale:
             gap = int(rng.choice([0.5, 1, 1, 2]) * beat_n)
             fade = min(int(0.005 * SR), boundary - gap)
-            buf[boundary - gap - fade:boundary - gap] *= \
-                np.linspace(1, 0, fade)[:, None]
-            buf[boundary - gap:boundary] = 0.0
+            for target in (buf, *stems.values()):
+                target[boundary - gap - fade:boundary - gap] *= \
+                    np.linspace(1, 0, fade)[:, None]
+                target[boundary - gap:boundary] = 0.0
             fx.append(f"gap:{gap / beat_n:g}beat")
         ride_pool = kit["ride"] or ([synth["ride"]] if synth else [])
         if ride_pool and rng.random() < k.cymbal_chance * scale:
             length = min(rng.choice([1, 2]) * bar_n, boundary)
             swell = cymbal_swell(rng, rng.choice(ride_pool)[1], length)
-            place(buf, swell, boundary - length, rng.uniform(0.35, 0.5))
+            put("events", swell, boundary - length, rng.uniform(0.35, 0.5))
             fx.append(f"cymbal:{length // bar_n}bar")
         if fx:
             m["transition"] = fx
@@ -1665,6 +1685,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
 
     # ---- outro: ending effect ringing out past the last bar --------------
     song = buf[: int(n_bars * bar * SR)]      # cut at the last bar
+    stems = {n: st[: len(song)] for n, st in stems.items()}
     if outro_style == "random":
         outro_style = rng.choice(OUTRO_STYLES)
     outro_meta = {"style": outro_style}
@@ -1673,6 +1694,9 @@ def compose(seed, duration, sample_files, intro_bars=None,
         onset_n = int(k.outro_bars * bar * SR)
         song = apply_outro(song, outro_style, beat, tail_sec=tail,
                            onset_n=onset_n, wet=k.outro_wet, amount=k.outro_amount)
+        stems = {n: apply_outro(st, outro_style, beat, tail_sec=tail, onset_n=onset_n,
+                                wet=k.outro_wet, amount=k.outro_amount)
+                 for n, st in stems.items()}
         outro_meta.update({"tail_sec": tail, "onset_bars": k.outro_bars,
                            "wet": k.outro_wet, "amount": k.outro_amount})
         sections_meta[-1]["end_sec"] = round(len(song) / SR, 3)
@@ -1698,6 +1722,18 @@ def compose(seed, duration, sample_files, intro_bars=None,
         out[:f_in] *= np.linspace(0, 1, f_in)[:, None]
     if f_out > 0:
         out[-f_out:] *= np.linspace(1, 0, f_out)[:, None]
+    # the stems: same length as the mix, one common scale so their sum sits
+    # at -0.5 dBFS peak (the live output has its own limiter; the master
+    # bus above is not linear, so the stems are the pre-master music)
+    n_out = len(out)
+    stems = {n: (st[:n_out] if len(st) >= n_out
+                 else np.vstack([st, np.zeros((n_out - len(st), 2), "float32")]))
+             for n, st in stems.items()}
+    ssum = sum(stems.values())
+    speak = float(np.abs(ssum).max()) if len(ssum) else 0.0
+    if speak > 0:
+        for st in stems.values():
+            st *= 0.95 / speak
     meta = {"seed": seed, "bpm": bpm, "style": drum_style,
             "duration_sec": round(len(out) / SR, 3),
             "intro_style": intro_style, "outro": outro_meta,
@@ -1710,7 +1746,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
             "events": sorted(events, key=lambda e: e[0]),
             "video_sources": {n: str(v) for n, v in (video_sources or {}).items()
                               if n in bank}}
-    return out.astype("float32"), bpm, meta
+    return out.astype("float32"), bpm, meta, stems
 
 
 COMPOSE_KEYS = ("intro_bars", "intro_style", "bpm", "pan_drums",
@@ -1755,14 +1791,25 @@ def run_job(job):
     for i in range(count):
         seed = (base_seed + i) if base_seed is not None \
             else random.randrange(10 ** 6)
-        song, bpm, meta = compose(seed, duration, files, knobs=knobs,
-                                  video_sources=video_sources, **kw)
+        song, bpm, meta, stems = compose(seed, duration, files, knobs=knobs,
+                                         video_sources=video_sources, **kw)
         OUT_DIR.mkdir(exist_ok=True)
         word = random.Random(seed).choice(WORDS)
         out_path = OUT_DIR / (f"gacha_{word}_"
                               f"{time.strftime('%Y%m%d_%H%M%S')}"
                               f"_seed{seed}_bpm{bpm}.wav")
         sf.write(out_path, song, SR, subtype="PCM_16")
+        # the four stems as one 8-channel FLAC next to the mix (drums L R,
+        # layers L R, chops L R, events L R): what the live player plays
+        # ... at the live stream's 48 kHz, so playing needs no resampling
+        stems_path = out_path.with_name(out_path.stem + "_stems.flac")
+        stems8 = np.hstack([stems[n] for n in STEMS])
+        if STEMS_SR != SR:
+            g = math.gcd(STEMS_SR, SR)
+            stems8 = resample_poly(stems8, STEMS_SR // g, SR // g, axis=0).astype("float32")
+            np.clip(stems8, -1.0, 1.0, out=stems8)
+        sf.write(stems_path, stems8, STEMS_SR, subtype="PCM_16")
+        meta["stems"] = {"file": stems_path.name, "order": list(STEMS), "sr": STEMS_SR}
         out_path.with_suffix(".json").write_text(json.dumps(meta, indent=1))
         print(f"\n✔ wrote {out_path}  ({len(song)/SR:.1f}s, {bpm} BPM, seed {seed})")
 
