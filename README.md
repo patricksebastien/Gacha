@@ -125,7 +125,7 @@ The Randomize button rolls new strengths for all of them.
 
 **Rendering.** On a machine with OpenGL 3.3 the backdrop is drawn on the GPU (`gacha_gl.py`): every effect above runs as a fragment shader at full resolution and 60 fps. Without OpenGL the GUI falls back to a numpy renderer that shrinks frames to 480 pixels wide.
 
-**Shader layer.** On top of the video, a second layer runs a generative fragment shader from `shaders/`, composited with its own opacity and blend mode (mix, add, screen). The layer starts off when the app launches and switches to "random" as soon as a song has been generated; "random" picks a new shader every section. The shaders are Shadertoy-style: write a `mainImage(out vec4 fragColor, in vec2 fragCoord)` and you get `iTime`, `iResolution`, `iChannel0` (the processed video) and `iChannel1` (the shader's own previous frame), plus the music: `iLoud` (0-1), `iBeat` and `iBar` (phase 0-1), `iBPM`, `iSection` (0 intro, 1 groove, 2 break, 3 outro), `iRoot` (0-11, -1 unknown), `iDrop` (1 on a drop, decaying), `iSwell` and `iSongPos`. The alpha you output is the layer's coverage. A shader that only works by replacing the picture can put `// gacha: opacity=1.0` in its source to override a lower layer opacity. Eighteen originals ship:
+**Shader layer.** On top of the video, a second layer runs a generative fragment shader from `shaders/`, composited with its own opacity and blend mode (mix, add, screen). The layer starts off when the app launches and switches to "random" as soon as a song has been generated; "random" picks a new shader every section. The shaders are Shadertoy-style: write a `mainImage(out vec4 fragColor, in vec2 fragCoord)` and you get `iTime`, `iResolution`, `iChannel0` (the processed video) and `iChannel1` (the shader's own previous frame), plus the music: `iLoud` (0-1), `iBeat` and `iBar` (phase 0-1), `iBPM`, `iSection` (0 intro, 1 groove, 2 break, 3 outro), `iRoot` (0-11, -1 unknown), `iDrop` (1 on a drop, decaying), `iSwell` and `iSongPos`. The alpha you output is the layer's coverage. A shader that only works by replacing the picture can put `// gacha: opacity=1.0` in its source to override a lower layer opacity. Nineteen originals ship:
 
 | Shader | Look |
 | --- | --- |
@@ -144,6 +144,7 @@ The Randomize button rolls new strengths for all of them.
 | `skyline` | Column equaliser made of the picture. |
 | `slitscan` | A slit sweeps per bar and freezes time slices behind it. |
 | `sparks` | Particles born on bright pixels, drifting up. |
+| `super8` | Super 8 home movie: the picture changes 18 times a second, faded Kodachrome colour with red halation, grain, dust, hairs and dark scratches, flicker that grows with loudness, splices and orange flash frames on downbeats, a swell browns the lamp, a drop is the reel running out and burning. |
 | `thermal` | Heat palette with animated iso-lines, cold in breaks. |
 | `vhs` | A tracking band rolling up the full height every 2 bars, frame roll and wobble top to bottom, chroma bleed, dropouts on the beat, wearing out toward the end. |
 | `warp` | The video melted by noise, torn by drops. |
@@ -343,6 +344,5 @@ The JSON section map is what powers the Mixer tab. Finals stitched in the Mixer 
 - we need raw to opacity engine control
 - osc
 - link (when jamming live)
-- super8mm style
 
 

@@ -56,6 +56,7 @@ give `iDrop` a moment.
 | `skyline.frag` | skyline equaliser, each column rising to its own brightness |
 | `slitscan.frag` | slit-scan sweeping once per bar, freezing motion into streaks |
 | `sparks.frag` | tiny particles born on bright spots, drifting up and fading |
+| `super8.frag` | Super 8 home movie: 18 fps frame hold, faded Kodachrome grade with halation, grain, dust, hairs and dark scratches, exposure flicker, splices and flash frames on downbeats, the reel burning out on a drop |
 | `thermal.frag` | thermal camera palette with animated iso-lines |
 | `vhs.frag` | worn VHS over the whole frame: a tracking band rolling the full height every 2 bars, frame roll, wobble, chroma bleed, dropouts on the beat |
 | `warp.frag` | the picture melted by noise, ripped apart on a drop |

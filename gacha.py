@@ -2379,9 +2379,6 @@ class Main(QMainWindow):
         self.live_level.setTextVisible(False)
         self.live_level.setFixedHeight(10)
         self.live_level.setToolTip("Normalised loudness, what the effects see")
-        sep = QLabel("Live I/O")
-        sep.setProperty("role", "sub")
-        form.addRow("", sep)
         form.addRow("Audio output", self._row([("driver", self.through_api),
                                               ("device", self.through_out),
                                               ("block", self.through_block),
@@ -2397,10 +2394,13 @@ class Main(QMainWindow):
             "a guitar through the app experiences. The live input is muted "
             "during the test so the cable cannot feed back.")
         self.rt_btn.clicked.connect(self._ping_start)
+        # a small button: hugs its text instead of stretching across the row
+        self.rt_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.rt_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
         self.rt_lbl = QLabel("")
         self.rt_lbl.setProperty("role", "sub")
-        form.addRow("", self._row([("", self.rt_btn), ("", self.rt_lbl)]))
-        form.addRow("Live input", self.through_on)
+        form.addRow("Audio input", self._row([("", self.through_on), ("", self.rt_btn),
+                                              ("", self.rt_lbl)]))
         form.addRow("", self._row([("device", self.through_in),
                                    ("sync", self.through_sync)]))
         form.addRow("Video input", self._row([("device", self.video_in),
@@ -2449,6 +2449,9 @@ class Main(QMainWindow):
         self.all_samples.toggled.connect(
             lambda on: self.num_samples.setEnabled(not on))
         form.addRow("Samples", self._pair(self.num_samples, self.all_samples))
+        gap = QWidget()
+        gap.setFixedHeight(10)                  # a breath before the live I/O rows
+        form.addRow("", gap)
         self._live_io_rows(form)
         return self._wrap(form)
 
@@ -2905,14 +2908,15 @@ class Main(QMainWindow):
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(4)
         for i, (name, widget) in enumerate(pairs):
-            lbl = QLabel(name)
-            lbl.setProperty("role", "sub")
             if i:
                 box.addSpacing(6)
             if len(pairs) >= 3 and isinstance(widget, QAbstractSpinBox):
                 # crowded rows: drop the arrows, keep typing / wheel / keys
                 widget.setButtonSymbols(QAbstractSpinBox.NoButtons)
-            box.addWidget(lbl)
+            if name:                     # no empty label, it would pad the widget
+                lbl = QLabel(name)
+                lbl.setProperty("role", "sub")
+                box.addWidget(lbl)
             box.addWidget(widget, stretch=1)
         w = QWidget()
         w.setLayout(box)
