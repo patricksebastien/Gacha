@@ -9,8 +9,8 @@ Built on PortAudio (the sounddevice package) with Python in the loop:
 
     input device --read--> [analysis tap] -> live rack -> sync delay ----+
     section player (looping stems, one-shots) x sqrt(A/B) --+            |
-    song player (a render's stems) -------------------------+-> 4 stem   +-> gain -> limiter -->write--> output
-                                                               racks, F1-F4
+    song player (a render's stems) -------------------------+-> 4 stem   +-> VST3 inserts -> gain -> limiter -->write--> output
+                                                               racks, F1-F4    (gacha_vst)
 
 The sync delay holds the sound back by a settable number of milliseconds so
 it lines up with the picture, which arrives late through the capture
@@ -404,6 +404,7 @@ class LiveAudio:
         self.on = self.player.on             # stems in/out, for section and song alike
         self.song = SongPlayer(self.sr, self.on)
         self._limiter = Limiter(threshold_db=-1.0, release_ms=100.0)
+        self.inserts = None                  # gacha_vst.InsertChain on the master, or None
         self.running = False
         self.error = None
         self.ready = threading.Event()       # set once open (or failed)
@@ -862,6 +863,12 @@ class LiveAudio:
             elif not on:
                 continue
             y = y + blk
+        # master inserts (VST3 plugins): after the racks, before the gain and
+        # the limiter, kept out of the round-trip test so its burst stays clean;
+        # nothing at all is done here while no plugin is loaded
+        ins = self.inserts
+        if ins is not None and ins.items and pg is None:
+            y = ins.process(y, sr)
         target = 0.0 if self.mute else float(self.gain)
         if target != self._gain_now:
             y = y * np.linspace(self._gain_now, target, bs, dtype=np.float32)

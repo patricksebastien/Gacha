@@ -34,6 +34,7 @@ from PySide6.QtGui import (QColor, QImage, QKeySequence, QPainter,
 from PySide6.QtCore import QRegularExpression
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PySide6.QtWidgets import (
+    QFileDialog,
     QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFormLayout, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -58,6 +59,7 @@ from gacha_video import VideoSource, video_has_audio, video_input_modes, video_i
 from gacha_midi import (MIDI_AVAILABLE, MidiIn, format_binding, midi_inputs,
                         parse_binding)
 from gacha_fx import AUDIO_FX, BIPOLAR, CHANNELS
+from gacha_vst import KNOBS as VST_KNOBS, InsertChain, scan_plugins
 try:
     import psutil                    # cpu and memory for the stats HUD
 except ImportError:                  # pragma: no cover
@@ -289,16 +291,23 @@ KEYMAP += [("audio_focus", f"focus_{_ch}", "", f"focus the {_ch} channel for the
 KEYMAP += [("audio_focus", f"afx_{k}", "", f"{lbl} of the focused channel")
            for k, lbl, _d, _t in AUDIO_FX]
 KEYMAP += [("audio_focus", "avol", "", "volume of the focused channel")]
+# the master inserts (VST3 plugins after the racks): a bypass switch and
+# eight knobs, each pointed at a plugin parameter in the Audio FX tab
+KEYMAP += [("vst", "inserts", "", "master inserts (VST3 plugins) off/on")]
+KEYMAP += [("vst", f"vst_{n}", "", f"insert knob {n}: the plugin parameter it is "
+                                  "pointed at in the Audio FX tab")
+           for n in range(1, VST_KNOBS + 1)]
 # ids that take a value (0..1) instead of firing; only a CC can drive them
 CONTINUOUS = {"ab", "volume", "sync", "shader_mix", "shader_pick", "avol"} \
     | {f"grade_{k}" for k, *_ in VIDEO_GRADE} | {f"fx_{k}" for k, *_ in VIDEO_EFFECTS} \
     | {f"afx_{k}" for k, *_ in AUDIO_FX} \
     | {f"afx_{_ch}_{k}" for _ch in CHANNELS for k, *_ in AUDIO_FX} \
-    | {f"avol_{_ch}" for _ch in CHANNELS}
+    | {f"avol_{_ch}" for _ch in CHANNELS} | {f"vst_{n}" for n in range(1, VST_KNOBS + 1)}
 KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
                  "section": "section engine", "mix": "mix and shader",
                  "grade": "source grade", "fx": "video effects",
                  "audio_focus": "audio racks: focused channel",
+                 "vst": "master inserts (VST3)",
                  **{f"audio_{_ch}": f"audio rack: {_ch}" for _ch in CHANNELS}}
 
 
@@ -1352,6 +1361,9 @@ class Main(QMainWindow):
         self.actions["avol"] = self._afx_focused("vol")
         for ch in CHANNELS:
             self.actions[f"focus_{ch}"] = lambda ch=ch: self.afx_focus.setCurrentText(ch)
+        self.actions["inserts"] = self.vst_bypass.toggle
+        for n in range(1, VST_KNOBS + 1):
+            self.actions[f"vst_{n}"] = lambda x, n=n: self.inserts.knob(n - 1, x)
         missing = [ident for _g, ident, _k, _w in KEYMAP if ident not in self.actions]
         assert not missing, f"actions without a handler: {missing}"
         self.shortcuts = []
@@ -1380,6 +1392,7 @@ class Main(QMainWindow):
             self.through_block.setCurrentText(str(blk))
             self.through_block.blockSignals(False)
         self._io_ready = True
+        QTimer.singleShot(600, self._vst_restore)      # slow plugin loads, after the window shows
         QTimer.singleShot(0, self._reopen_stream)
 
     # ---------- stats HUD ----------
@@ -1861,10 +1874,246 @@ class Main(QMainWindow):
         outer.addWidget(self.afx_status)
         hint.setContentsMargins(8, 0, 8, 8)
         outer.addWidget(hint)
+        outer.addWidget(self._vst_section())
         outer.addStretch(1)
         w = QWidget()
         w.setLayout(outer)
         return self._scrolling(w) if hasattr(self, "_scrolling") else w
+
+    # ---------- master inserts (VST3) ----------
+    def _vst_section(self):
+        """VST3 effect plugins on the master, after the racks: pick one from
+        ./vst or the system folders (or browse), open its editor, order them,
+        point the eight MIDI knobs at their parameters. Everything is
+        remembered, plugin state included."""
+        self.inserts = InsertChain()
+        box = QVBoxLayout()
+        box.setContentsMargins(8, 8, 8, 8)
+        box.setSpacing(4)
+        title = QLabel("master inserts (VST3)")
+        box.addWidget(title)
+        self.vst_pick = QComboBox()
+        self.vst_pick.setToolTip("Plugins found in ./vst and the system's VST3 folders; "
+                                 "browse... for one elsewhere")
+        add_btn = QPushButton("add")
+        add_btn.setToolTip("Load the chosen plugin at the end of the chain (a second "
+                           "or two for a JUCE plugin, the interface waits)")
+        add_btn.clicked.connect(self._vst_add)
+        rescan = QPushButton("rescan")
+        rescan.clicked.connect(self._vst_rescan)
+        self.vst_bypass = QCheckBox("bypass all")
+        self.vst_bypass.setToolTip("The whole chain out of the path, faded over one block")
+        self.vst_bypass.toggled.connect(self._vst_bypass_changed)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(self.vst_pick, stretch=1)
+        top.addWidget(add_btn)
+        top.addWidget(rescan)
+        top.addSpacing(12)
+        top.addWidget(self.vst_bypass)
+        box.addLayout(top)
+        self.vst_rows = QVBoxLayout()
+        self.vst_rows.setContentsMargins(0, 0, 0, 0)
+        self.vst_rows.setSpacing(2)
+        box.addLayout(self.vst_rows)
+        self.vst_knob_combos = []
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 4, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(2)
+        for n in range(VST_KNOBS):
+            lbl = QLabel(f"knob {n + 1}")
+            lbl.setProperty("role", "sub")
+            cb = QComboBox()
+            cb.setToolTip(f"The plugin parameter MIDI knob {n + 1} drives (Controls tab, "
+                          "master inserts)")
+            cb.currentIndexChanged.connect(lambda _i, n=n: self._vst_knob_changed(n))
+            self.vst_knob_combos.append(cb)
+            grid.addWidget(lbl, n % 4, (n // 4) * 2)
+            grid.addWidget(cb, n % 4, (n // 4) * 2 + 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        box.addLayout(grid)
+        self.vst_status = QLabel("")
+        self.vst_status.setProperty("role", "sub")
+        self.vst_status.setWordWrap(True)
+        box.addWidget(self.vst_status)
+        hint = QLabel("Effect plugins after the five racks, before the master gain and "
+                      "the limiter, in the audio thread: no added buffer. A plugin's "
+                      "editor blocks this interface while it is open (the sound keeps "
+                      "running); a plugin that crashes takes the app with it. plugdata: "
+                      "its [param] objects become the parameters the knobs can drive.")
+        hint.setProperty("role", "sub")
+        hint.setWordWrap(True)
+        box.addWidget(hint)
+        w = QWidget()
+        w.setLayout(box)
+        self._vst_rescan()
+        return w
+
+    def _vst_rescan(self):
+        cur = self.vst_pick.currentData()
+        self.vst_pick.blockSignals(True)
+        self.vst_pick.clear()
+        for label, path in scan_plugins():
+            self.vst_pick.addItem(label, path)
+        self.vst_pick.addItem("browse...", "")
+        if cur:
+            i = self.vst_pick.findData(cur)
+            if i >= 0:
+                self.vst_pick.setCurrentIndex(i)
+        self.vst_pick.blockSignals(False)
+
+    def _vst_add(self):
+        path = self.vst_pick.currentData()
+        if not path:
+            if sys.platform == "win32":                # a .vst3 is a file on Windows...
+                path, _f = QFileDialog.getOpenFileName(self, "VST3 plugin", str(Path.home()),
+                                                       "VST3 (*.vst3)")
+            else:                                      # ...and a folder on Linux and macOS
+                path = QFileDialog.getExistingDirectory(self, "VST3 plugin bundle (.vst3 folder)",
+                                                        str(Path.home()))
+            if not path or not path.lower().endswith(".vst3"):
+                if path:
+                    self.vst_status.setText("that is not a .vst3 bundle")
+                return
+        self.vst_status.setText(f"loading {Path(path).stem}...")
+        QApplication.processEvents()
+        try:
+            ins = self.inserts.add(path)
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            self.vst_status.setText(f"could not load {Path(path).stem}: {msg[:200]}")
+            self.log.appendPlainText(f"vst: {Path(path).stem}: {msg}")
+            return
+        self.log.appendPlainText(f"vst: {ins.name} loaded ({len(ins.params())} parameters, "
+                                 f"{ins.latency_samples()} samples of latency, compensated)")
+        self._vst_refresh()
+        self._vst_save()
+
+    def _vst_refresh(self):
+        """Rebuild the rows and the knob combos from the chain."""
+        while self.vst_rows.count():
+            item = self.vst_rows.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        for i, ins in enumerate(self.inserts.items):
+            on = QCheckBox(f"{i + 1}. {ins.name}")
+            on.setChecked(bool(ins.on))
+            on.setToolTip(ins.path)
+            on.toggled.connect(lambda v, ins=ins: self._vst_on(ins, v))
+            edit = QPushButton("edit")
+            edit.setToolTip("Open the plugin's own window; this interface waits until "
+                            "it is closed, the sound keeps running")
+            edit.clicked.connect(lambda _c=False, ins=ins: self._vst_edit(ins))
+            up = QPushButton("up")
+            up.clicked.connect(lambda _c=False, ins=ins: self._vst_move(ins, -1))
+            down = QPushButton("down")
+            down.clicked.connect(lambda _c=False, ins=ins: self._vst_move(ins, 1))
+            rm = QPushButton("remove")
+            rm.clicked.connect(lambda _c=False, ins=ins: self._vst_remove(ins))
+            for b in (edit, up, down, rm):
+                b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                b.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(4)
+            row.addWidget(on, stretch=1)
+            if ins.error:
+                err = QLabel(f"error, bypassed: {ins.error[:60]}")
+                err.setStyleSheet("color: rgb(255, 150, 120);")
+                row.addWidget(err)
+            for b in (edit, up, down, rm):
+                row.addWidget(b)
+            w = QWidget()
+            w.setLayout(row)
+            self.vst_rows.addWidget(w)
+        # the knob combos: every parameter of every plugin
+        choices = [("off", None)]
+        for i, ins in enumerate(self.inserts.items):
+            for name in ins.params():
+                choices.append((f"{i + 1}. {ins.name}: {name}", (i, name)))
+        for n, cb in enumerate(self.vst_knob_combos):
+            cb.blockSignals(True)
+            cb.clear()
+            for label, data in choices:
+                cb.addItem(label, data)
+            k = self.inserts.knobs[n]
+            idx = next((j for j, (_l, d) in enumerate(choices) if d == k), 0)
+            cb.setCurrentIndex(idx)
+            cb.blockSignals(False)
+        self.vst_bypass.blockSignals(True)
+        self.vst_bypass.setChecked(self.inserts.bypass)
+        self.vst_bypass.blockSignals(False)
+        n = len(self.inserts.items)
+        self.vst_status.setText("no insert" if not n else
+                                f"{n} insert{'s' if n > 1 else ''} in the chain"
+                                + (", bypassed" if self.inserts.bypass else ""))
+
+    def _vst_on(self, ins, on):
+        ins.on = bool(on)
+        if on and ins.error:
+            ins.error = None                      # try again
+        self._vst_save()
+
+    def _vst_move(self, ins, delta):
+        self.inserts.move(ins, delta)
+        self._vst_refresh()
+        self._vst_save()
+
+    def _vst_remove(self, ins):
+        self.inserts.remove(ins)
+        self.log.appendPlainText(f"vst: {ins.name} removed")
+        self._vst_refresh()
+        self._vst_save()
+
+    def _vst_edit(self, ins):
+        """The plugin's own window, blocking: Qt waits, the audio runs on."""
+        self.log.appendPlainText(f"vst: {ins.name} editor open, the interface waits for it")
+        self.vst_status.setText(f"{ins.name}: editor open, close it to come back here")
+        QApplication.processEvents()
+        try:
+            ins.plugin.show_editor()
+        except Exception as e:
+            self.log.appendPlainText(f"vst: {ins.name} editor: {e}")
+        self._vst_refresh()                       # parameters may have new names
+        self._vst_save()                          # the patch lives in the state
+
+    def _vst_knob_changed(self, n):
+        self.inserts.knobs[n] = self.vst_knob_combos[n].currentData()
+        self._vst_save()
+
+    def _vst_bypass_changed(self, on):
+        self.inserts.bypass = bool(on)
+        self._vst_refresh()
+        self._vst_save()
+
+    def _vst_save(self):
+        if getattr(self, "_vst_restoring", False):
+            return
+        self.settings.setValue("vst/inserts", self.inserts.to_json())
+
+    def _vst_restore(self):
+        """Load the remembered chain, plugin state included; slow, so it
+        runs once the window is up."""
+        text = self.settings.value("vst/inserts", "")
+        if not text:
+            return
+        self._vst_restoring = True
+        self.vst_status.setText("loading the remembered inserts...")
+        QApplication.processEvents()
+        try:
+            errors = self.inserts.load_json(text)
+        finally:
+            self._vst_restoring = False
+        for path, err in errors:
+            self.log.appendPlainText(f"vst: {Path(path).stem} not loaded: {err}")
+        for ins in self.inserts.items:
+            self.log.appendPlainText(f"vst: {ins.name} back ({len(ins.params())} parameters)")
+        self._vst_refresh()
+        if errors:
+            self.vst_status.setText(self.vst_status.text() + "; " +
+                                    ", ".join(f"{Path(p).stem} failed" for p, _e in errors))
 
     def _update_afx_status(self):
         """Which path the sound is on: the racks only touch what goes through
@@ -3644,6 +3893,7 @@ class Main(QMainWindow):
         for stem, cb in self.perf_stems.items():
             self.through.on[stem] = cb.isChecked()
         self._push_afx()
+        self.through.inserts = self.inserts
         self.through.start()
         self.through_status.setText("opening...")
         self._through_ticks = 0
@@ -4362,6 +4612,7 @@ class Main(QMainWindow):
             self.takes.stop()
         if self.through is not None:
             self.through.stop()
+        self._vst_save()
         if getattr(self, "midi", None) is not None:
             self.midi.close_all()
         if getattr(self.backdrop, "source", None) is not None:
