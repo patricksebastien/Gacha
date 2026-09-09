@@ -81,8 +81,9 @@ def vst_dirs():
 
 def scan_plugins():
     """[(label, path)] of every .vst3 found, the app's folder first, then
-    the rest alphabetically. Nothing is loaded: a JUCE plugin takes a
-    second or two to load, so that waits for the user's choice."""
+    the rest alphabetically; vendor subfolders (Common Files/VST3/Xfer/...)
+    one level down are looked into too. Nothing is loaded: a JUCE plugin
+    takes a second or two to load, so that waits for the user's choice."""
     found, seen = [], set()
     for d in vst_dirs():
         if not d.is_dir():
@@ -92,12 +93,59 @@ def scan_plugins():
         except OSError:
             continue
         for p in entries:
+            if p.suffix.lower() != ".vst3" and p.is_dir():      # a vendor folder
+                try:
+                    subs = sorted(p.iterdir(), key=lambda q: q.name.lower())
+                except OSError:
+                    continue
+                for q in subs:
+                    if q.suffix.lower() == ".vst3" and q.name not in seen:
+                        seen.add(q.name)
+                        found.append((f"{q.stem}  ({p.name})", str(q)))
+                continue
             if p.suffix.lower() != ".vst3" or p.name in seen:
                 continue
             seen.add(p.name)
             label = p.stem if d == VST_DIR else f"{p.stem}  ({d})"
             found.append((label, str(p)))
     return found
+
+
+def bundle_binary(path):
+    """The binary inside a .vst3 bundle folder, or None if `path` is not
+    such a folder or holds none for this platform. Windows bundles carry
+    Contents/x86_64-win/<name>.vst3 (a DLL), Linux ones
+    Contents/x86_64-linux/<name>.so, macOS ones Contents/MacOS/<name>."""
+    p = Path(path)
+    contents = p / "Contents"
+    if not (p.is_dir() and contents.is_dir()):
+        return None
+    if sys.platform == "win32":
+        archs, exts = ("x86_64-win", "arm64-win", "x86-win"), (".vst3",)
+    elif sys.platform == "darwin":
+        archs, exts = ("MacOS",), ("",)
+    else:
+        archs, exts = ("x86_64-linux", "aarch64-linux", "arm64-linux", "i386-linux"), (".so",)
+    for arch in archs:
+        d = contents / arch
+        if not d.is_dir():
+            continue
+        for f in sorted(d.iterdir()):
+            if f.is_file() and f.suffix.lower() in exts:
+                return f
+    return None
+
+
+def load_paths(path):
+    """The paths to try for `path`, best first. JUCE on Windows only opens
+    a .vst3 *file*, so a bundle folder (what Common Files/VST3 holds) is
+    handed over by its inner DLL; Linux and macOS take the folder as it
+    is, the inner binary is the fallback. A file is tried as given."""
+    p = Path(path)
+    inner = bundle_binary(p)
+    if inner is None:
+        return [p]
+    return [inner, p] if sys.platform == "win32" else [p, inner]
 
 
 class Insert:
@@ -120,7 +168,15 @@ class Insert:
         if not VST_AVAILABLE:
             raise RuntimeError("this pedalboard has no VST3 support")
         mute_plugin_stderr()
-        plugin = load_plugin(str(path))
+        plugin, errors = None, []
+        for candidate in load_paths(path):
+            try:
+                plugin = load_plugin(str(candidate))
+                break
+            except ImportError as e:              # not a plugin here: try the next form
+                errors.append(f"{candidate}: {e}")
+        if plugin is None:
+            raise ImportError("; ".join(errors))
         if not getattr(plugin, "is_effect", True):
             raise RuntimeError(f"{Path(path).stem} is an instrument, not an effect")
         return cls(path, plugin)
