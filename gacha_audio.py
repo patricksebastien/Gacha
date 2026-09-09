@@ -564,6 +564,42 @@ class LiveAudio:
             self._rec_req = None
         return blocks or []
 
+    def ping(self):
+        """Arm the round-trip test: the next block puts a short 1 kHz burst
+        on the output, and the input is watched for a second for it to come
+        back through a cable (output -> input). The result lands in
+        `ping_result`: {"ok", "ms", "frames", "msg"}."""
+        self.ping_result = None
+        self._ping = {"state": "armed", "pos": 0, "buf": []}
+
+    def _ping_finish(self, pg):
+        """Where did the burst come back? Cross-correlation against the
+        template, per channel, the stronger one wins. The capture began one
+        block after the block that carried the burst's start."""
+        bs, sr = self.block, self.sr
+        cap = np.concatenate(pg["buf"], axis=1)             # (2, n)
+        tpl = self._ping_tpl
+        best = None
+        for ch in range(cap.shape[0]):
+            corr = np.correlate(cap[ch], tpl, "valid")
+            if not corr.size:
+                continue
+            a = np.abs(corr)
+            idx = int(a.argmax())          # the one copy: the input is muted meanwhile
+            peak = float(a[idx])
+            floor = float(np.median(a)) + 1e-9
+            if best is None or peak / floor > best[0]:
+                best = (peak / floor, idx, peak)
+        if best is None or best[0] < 12.0 or best[2] < 1e-3:
+            self.ping_result = {"ok": False, "ms": None, "frames": None,
+                                "msg": "no burst came back: loop an output into the "
+                                       "live input with a cable, and turn its level up"}
+            return
+        frames = bs + best[1]
+        self.ping_result = {"ok": True, "frames": frames, "ms": 1000.0 * frames / sr,
+                            "msg": f"round trip {1000.0 * frames / sr:.1f} ms "
+                                   f"({frames} frames at {sr} Hz, block {bs})"}
+
     def stats(self):
         return {"in_peak": self.in_peak, "out_peak": self.out_peak,
                 "load": self.load, "dropped": self.dropped, "late": self.late,
@@ -620,7 +656,10 @@ class LiveAudio:
         raise RuntimeError("; ".join(errors))
 
     def _open_streams(self, extra, duplex=False, callback=False):
-        lat = 2 * self.block / self.sr                 # two blocks of device buffer
+        # two blocks of device buffer for the blocking loop; on ASIO the
+        # suggested latency becomes the driver's buffer size, so one block
+        # there, or the control panel shows twice what was asked
+        lat = (1 if duplex else 2) * self.block / self.sr
         # in callback mode PortAudio adapts the driver's buffer to our block
         # size; in blocking mode on ASIO the driver's size is taken as is
         bs = 0 if (duplex and not callback) else self.block
@@ -739,6 +778,11 @@ class LiveAudio:
         bs, sr = self.block, self.sr
         self._stem_gain = {}                      # stem -> on/off gain reached
         self._gain_now = 0.0                      # fade in from silence
+        # the round-trip test: a 4 ms 1 kHz burst at -10 dBFS, Hann-windowed
+        n = int(0.004 * self.sr)
+        t = np.arange(n) / self.sr
+        self._ping_tpl = (0.3 * np.sin(2 * np.pi * 1000.0 * t) * np.hanning(n)).astype(np.float32)
+        self._ping = None
         self._ring_n = int(MAX_DELAY_MS / 1000.0 * sr) + bs
         self._ring = np.zeros((2, self._ring_n), dtype=np.float32)
         self._wpos = 0
@@ -759,6 +803,12 @@ class LiveAudio:
         self.in_peak = float(np.abs(x).max()) if x.size else 0.0
         mono = x.mean(axis=0).astype(np.float32, copy=False)
         dry = x.copy()
+        pg = self._ping
+        if pg is not None and pg["state"] in ("sending", "listen"):   # the echo, dry input
+            pg["buf"].append(dry)          # from the block after the burst's first one
+            if len(pg["buf"]) * bs >= sr:                 # a second is plenty
+                self._ping = None
+                self._ping_finish(pg)
         with self._lock:
             self._blocks.append((mono, now))
             self._pre.append((dry, now))
@@ -790,6 +840,9 @@ class LiveAudio:
         else:
             a = ab
         y = y * np.sqrt(1.0 - a)
+        if pg is not None:
+            y = y * 0.0          # round-trip test: no input to the output, or the
+                                 # cable feeds the burst back round and round
         sec = self.player.block(bs, now, ramp)
         song = self.song.block(bs)
         sec_w = np.sqrt(a)
@@ -816,6 +869,14 @@ class LiveAudio:
         elif self._gain_now != 1.0:
             y = y * self._gain_now
         y = np.ascontiguousarray(y, dtype=np.float32)
+        if pg is not None and pg["state"] in ("armed", "sending"):
+            # the burst, spread over as many blocks as it needs; listening
+            # starts with the block after the one that carried its start
+            tpl, p0 = self._ping_tpl, pg["pos"]
+            n = min(bs, len(tpl) - p0)
+            y[:, :n] += tpl[p0:p0 + n]
+            pg["pos"] = p0 + n
+            pg["state"] = "sending" if pg["pos"] < len(tpl) else "listen"
         y = self._limiter.process(y, sr, reset=False)      # the racks can get loud
         np.clip(y, -1.0, 1.0, out=y)
         self.out_peak = float(np.abs(y).max()) if y.size else 0.0

@@ -2387,6 +2387,19 @@ class Main(QMainWindow):
                                               ("block", self.through_block),
                                               ("", self.through_excl)]))
         form.addRow("", self.through_status)
+        self.rt_btn = QPushButton("test round-trip")
+        self.rt_btn.setToolTip(
+            "Measure the real in-to-out latency: plug a cable from an output of "
+            "the interface into the live input, turn the input level up, stop "
+            "any song, then press. A short 1 kHz burst goes out and the input "
+            "is watched for it to come back; the result is the round trip "
+            "through the device, its buffers and one processing block, what "
+            "a guitar through the app experiences. The live input is muted "
+            "during the test so the cable cannot feed back.")
+        self.rt_btn.clicked.connect(self._ping_start)
+        self.rt_lbl = QLabel("")
+        self.rt_lbl.setProperty("role", "sub")
+        form.addRow("", self._row([("", self.rt_btn), ("", self.rt_lbl)]))
         form.addRow("Live input", self.through_on)
         form.addRow("", self._row([("device", self.through_in),
                                    ("sync", self.through_sync)]))
@@ -3540,6 +3553,36 @@ class Main(QMainWindow):
                 i = 1                                  # a real input if there is one
             combo.setCurrentIndex(max(0, i))
             combo.blockSignals(False)
+
+    def _ping_start(self):
+        """The round-trip test: needs the stream open with a live input."""
+        la = self.through
+        if la is None or not la.running:
+            self.rt_lbl.setText("the audio output is not open")
+            return
+        if not la.in_name:
+            self.rt_lbl.setText("tick the live input first, with a cable from an output "
+                                "into it")
+            return
+        self.rt_lbl.setText("measuring...")
+        self.rt_btn.setEnabled(False)
+        la.ping()
+        self._ping_polls = 0
+        QTimer.singleShot(200, self._ping_poll)
+
+    def _ping_poll(self):
+        la = self.through
+        r = la.ping_result if la is not None else None
+        self._ping_polls += 1
+        if r is None and self._ping_polls < 20 and la is not None and la.running:
+            QTimer.singleShot(200, self._ping_poll)
+            return
+        self.rt_btn.setEnabled(True)
+        if r is None:
+            self.rt_lbl.setText("no result (stream stopped?)")
+            return
+        self.rt_lbl.setText(r["msg"])
+        self.log.appendPlainText(f"audio: round-trip test: {r['msg']}")
 
     def _toggle_through(self, on):
         """A: the live input joins the stream, or leaves it."""
