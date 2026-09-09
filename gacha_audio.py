@@ -427,20 +427,68 @@ class LiveAudio:
 
     # ------------------------------------------------------------ control
     def start(self):
-        """Open in a thread. On ASIO the streams are opened here, on the
-        calling thread: ASIO drivers are COM objects and refuse (error -9999)
-        when opened from another thread than the one PortAudio started on."""
-        self._preopened = None
+        """Open the devices. On ASIO the driver drives us: the stream is
+        opened and started here, on the calling thread (ASIO drivers are COM
+        objects wanting the thread that made them, and its message loop),
+        and every buffer arrives in a callback on the driver's thread; the
+        blocking read/write layer, which timed out on real drivers (-9987),
+        is not used. Other host APIs keep the blocking loop on a thread."""
+        self._cb_stream = None
         if sd is not None and self._api_name() == "ASIO":
             try:
-                self._preopened = self._open()
+                src, snk = self._open(callback=True)
+                self._dsp_init()
+                snk.start()
+                lat = snk.latency
+                self.out_latency_ms = 1000.0 * float(lat[1] if isinstance(lat, tuple) else lat)
+                self.buffer_ms = 1000.0 * float(sum(lat) if isinstance(lat, tuple) else lat)
+                self._cb_stream = snk
+                self.mode += " callback"
+                self.running = True
             except Exception as e:
                 self.error = self._explain(e)
-                self.ready.set()
-                return
+            self.ready.set()
+            return
         self._thread = threading.Thread(target=self._run, name="gacha-audio",
                                         daemon=True)
         self._thread.start()
+
+    def _cb_duplex(self, indata, outdata, frames, _time, status):
+        self._cb_process(indata, outdata, frames, status)
+
+    def _cb_out(self, outdata, frames, _time, status):
+        self._cb_process(None, outdata, frames, status)
+
+    def _cb_process(self, indata, outdata, frames, status):
+        """One driver buffer in, one out, on the driver's thread."""
+        try:
+            if status:
+                if status.input_overflow:
+                    self.dropped += 1
+                if status.output_underflow:
+                    self.underruns += 1
+            now = time.monotonic()
+            t0 = time.perf_counter()
+            if indata is None:
+                x = np.zeros((2, frames), np.float32)
+            else:
+                x = indata.T if indata.shape[1] == 2 else np.repeat(indata.T, 2, axis=0)
+                x = np.ascontiguousarray(x, dtype=np.float32)
+            if frames != self.block:                 # a driver handing odd sizes
+                y = np.zeros((2, frames), np.float32)
+                n = min(frames, self.block)
+                xb = np.zeros((2, self.block), np.float32)
+                xb[:, :n] = x[:, :n]
+                y[:, :n] = self._dsp_block(xb, now)[:, :n]
+            else:
+                y = self._dsp_block(x, now)
+            outdata[:] = y.T
+            dsp = time.perf_counter() - t0
+            self.load = 0.9 * self.load + 0.1 * (dsp / (frames / self.sr))
+            self.rounds += 1
+        except Exception as e:                       # never let the driver see one
+            self.error = f"audio callback: {e}"
+            outdata.fill(0)
 
     def _api_name(self):
         try:
@@ -483,6 +531,14 @@ class LiveAudio:
 
     def stop(self):
         self._stop.set()
+        st = getattr(self, "_cb_stream", None)
+        if st is not None:                           # ASIO: same thread as start()
+            self._cb_stream = None
+            for op in (st.stop, st.close):
+                try:
+                    op()
+                except Exception:
+                    pass
         if self._thread is not None:
             self._thread.join(3.0)
         self.running = False
@@ -519,9 +575,10 @@ class LiveAudio:
         ms = min(MAX_DELAY_MS, max(0.0, float(self.delay_ms)))
         return int(round(ms / 1000.0 * self.sr))
 
-    def _open(self):
+    def _open(self, callback=False):
         """(src, snk): two blocking streams, or one duplex stream on ASIO
-        (src is snk then). Raises with every mode's error when none opens."""
+        (src is snk then), with our callbacks attached when `callback`.
+        Raises with every mode's error when none opens."""
         if sd is None:
             raise RuntimeError("sounddevice/PortAudio missing: pip install sounddevice "
                                f"(Linux: apt install libportaudio2) [{SD_ERROR}]")
@@ -552,7 +609,8 @@ class LiveAudio:
                 try:
                     if sr != self.sr:
                         self._set_sr(sr)
-                    src, snk = self._open_streams(extra, duplex=(api_name == "ASIO"))
+                    src, snk = self._open_streams(extra, duplex=(api_name == "ASIO"),
+                                                  callback=callback)
                     self.mode = label if sr == SR else f"{label} @ {sr} Hz"
                     if errors:
                         self.mode += f" ({errors[-1]})"
@@ -561,18 +619,18 @@ class LiveAudio:
                     errors.append(f"{label} {sr} Hz: {str(e).strip()[:90]}")
         raise RuntimeError("; ".join(errors))
 
-    def _open_streams(self, extra, duplex=False):
+    def _open_streams(self, extra, duplex=False, callback=False):
         lat = 2 * self.block / self.sr                 # two blocks of device buffer
-        # ASIO: the driver's control panel owns the buffer size; asking for
-        # another one is what some drivers refuse. 0 = whatever it has, and
-        # the blocking read/write still deal in our blocks.
-        bs = 0 if duplex else self.block
+        # in callback mode PortAudio adapts the driver's buffer to our block
+        # size; in blocking mode on ASIO the driver's size is taken as is
+        bs = 0 if (duplex and not callback) else self.block
         j, _d = _device_index(self.out_name, "output", self.api)
         if duplex and self.in_name:                    # ASIO: one stream, in and out
             i, d = _device_index(self.in_name, "input", self.api)
             st = sd.Stream(device=(i, j), samplerate=self.sr, blocksize=bs,
                            channels=(min(2, int(d["max_input_channels"])), 2),
-                           dtype="float32", latency=lat, extra_settings=extra)
+                           dtype="float32", latency=lat, extra_settings=extra,
+                           callback=self._cb_duplex if callback else None)
             return st, st
         src = None
         if self.in_name:
@@ -583,7 +641,8 @@ class LiveAudio:
         try:
             snk = sd.OutputStream(device=j, samplerate=self.sr, blocksize=bs,
                                   channels=2, dtype="float32", latency=lat,
-                                  extra_settings=extra)
+                                  extra_settings=extra,
+                                  callback=self._cb_out if callback else None)
         except Exception:
             if src is not None:
                 src.close()
@@ -611,8 +670,7 @@ class LiveAudio:
     def _run(self):
         old_switch = sys.getswitchinterval()
         try:
-            src, snk = self._preopened if self._preopened is not None else self._open()
-            self._preopened = None
+            src, snk = self._open()
         except Exception as e:
             self.error = self._explain(e)
             self.ready.set()
