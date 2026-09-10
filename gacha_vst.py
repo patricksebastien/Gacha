@@ -211,6 +211,13 @@ def place_editor_window(owner_hwnd=None, timeout=5.0):
             time.sleep(0.05)
         else:
             return
+        # the move is a message to the window's thread (the GUI thread, in
+        # pedalboard's loop): if that thread answers nothing in 3 s, give up
+        # rather than hang on it
+        res = wt.DWORD()
+        if not u.SendMessageTimeoutW(wt.HWND(h), 0, 0, 0, 0x0002 | 0x0008, 3000,
+                                     ctypes.byref(res)):     # WM_NULL, ABORTIFHUNG | BLOCK
+            return
         r = wt.RECT()
         u.GetWindowRect(h, ctypes.byref(r))
         w, ht = r.right - r.left, r.bottom - r.top

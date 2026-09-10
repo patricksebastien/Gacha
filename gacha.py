@@ -111,6 +111,12 @@ QPushButton {
 }
 QPushButton:hover { background: rgba(212, 48, 30, 189); }
 QPushButton:disabled { color: rgba(242,233,229,72); }
+QPushButton#generate {
+    background: rgba(212, 48, 30, 198); border: 1px solid rgba(255, 120, 90, 240);
+    font-weight: bold;
+}
+QPushButton#generate:hover { background: rgba(255, 96, 70, 220); }
+QPushButton#small { padding: 2px 10px; font-size: 12px; }
 QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit {
     background: rgba(28, 11, 9, 117); border: 1px solid rgba(212, 48, 30, 170);
     border-radius: 6px; padding: 2px 6px;
@@ -297,6 +303,12 @@ KEYMAP += [("vst", "inserts", "", "master inserts (VST3 plugins) off/on")]
 KEYMAP += [("vst", f"vst_{n}", "", f"insert knob {n}: the plugin parameter it is "
                                   "pointed at in the Audio FX tab")
            for n in range(1, VST_KNOBS + 1)]
+# the Video FX tab's pool: every video effect and every shader file can be
+# taken out of the show; a button per row toggles that tick
+KEYMAP += [("vfx", f"vfx_{k}", "", f"{lbl}: video effect in the show, off/on")
+           for k, lbl, _d, _t in VIDEO_EFFECTS]
+KEYMAP += [("vfx", f"shd_{p.stem}", "", f"{p.stem}: shader in the pool, off/on")
+           for p in shader_files()]
 # ids that take a value (0..1) instead of firing; only a CC can drive them
 CONTINUOUS = {"ab", "volume", "sync", "shader_mix", "shader_pick", "avol"} \
     | {f"grade_{k}" for k, *_ in VIDEO_GRADE} | {f"fx_{k}" for k, *_ in VIDEO_EFFECTS} \
@@ -307,7 +319,7 @@ KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
                  "section": "section engine", "mix": "mix and shader",
                  "grade": "source grade", "fx": "video effects",
                  "audio_focus": "audio racks: focused channel",
-                 "vst": "master inserts (VST3)",
+                 "vst": "master inserts (VST3)", "vfx": "video fx: the pool",
                  **{f"audio_{_ch}": f"audio rack: {_ch}" for _ch in CHANNELS}}
 
 
@@ -1101,7 +1113,7 @@ class Main(QMainWindow):
 
         # ---------- audio player ----------
         self.audio_out = QAudioOutput()
-        self.audio_out.setVolume(0.9)
+        self.audio_out.setVolume(1.0)
         # songs play through the app's audio stream when one is open (racks,
         # stems, F1-F4), through Qt otherwise
         self.player = AppPlayer(lambda: self.through if (getattr(self, "through", None)
@@ -1123,6 +1135,7 @@ class Main(QMainWindow):
         self._travel = 0            # mouse distance since the interface hid
         self._last_mouse = None
         self._cursor_hidden = False
+        self._fullscreen = False                    # see toggle_fullscreen
         self._look = {}             # per-section random multipliers per effect
         self._look_idx = None       # (section, 4-bar phrase) of the current look
         self._reverse_bar = None    # (section, bar) last rolled for a rewind
@@ -1178,13 +1191,21 @@ class Main(QMainWindow):
         self.log.setMaximumBlockCount(2000)
         params_box = self._build_params()
 
-        self.generate_btn = QPushButton("Generate")
+        self.generate_btn = QPushButton("Generate song")
+        self.generate_btn.setObjectName("generate")     # the orange one, see STYLE
         self.generate_btn.setMinimumHeight(36)
         self.generate_btn.clicked.connect(self.generate)
+        fs_btn = QPushButton("Fullscreen (F11)")
+        fs_btn.setObjectName("small")
+        fs_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        fs_btn.clicked.connect(self.toggle_fullscreen)
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.addWidget(self.generate_btn, stretch=1)
+        top_row.addWidget(fs_btn, alignment=Qt.AlignTop)
 
         left = QVBoxLayout()
         left.addWidget(params_box, stretch=1)
-        left.addWidget(self.generate_btn)
         left_w = QWidget()
         left_w.setLayout(left)
 
@@ -1202,6 +1223,9 @@ class Main(QMainWindow):
         self.videos_tree.changed.connect(self._on_videos_changed)
 
         refresh_btn = QPushButton("Refresh")
+        refresh_btn.setObjectName("small")
+        refresh_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        refresh_btn.setToolTip("Read the samples, videos and outputs folders again")
         refresh_btn.clicked.connect(self.refresh_lists)
 
         tabs = QTabWidget()
@@ -1239,8 +1263,9 @@ class Main(QMainWindow):
         self.time_lbl = QLabel("0:00 / 0:00")
         self.vol = QSlider(Qt.Horizontal, maximumWidth=100)
         self.vol.setRange(0, 100)
-        self.vol.setValue(90)
-        self.vol.setToolTip("Volume of the audio stream: songs, sections, the live input")
+        self.vol.setValue(100)
+        self.vol.setToolTip("Volume of the audio stream: songs, sections, the live input. "
+                            "Unity at the top; the level of the room is the sound system's business")
         self.vol.valueChanged.connect(self._set_volume)
         vol = self.vol
 
@@ -1253,8 +1278,9 @@ class Main(QMainWindow):
         bar.addWidget(vol)
 
         right = QVBoxLayout()
-        right.addWidget(refresh_btn)
+        right.addLayout(top_row)
         right.addWidget(tabs, stretch=1)
+        right.addWidget(refresh_btn, alignment=Qt.AlignRight)
         right.addWidget(self.now_playing)
         right.addLayout(bar)
         right_w = QWidget()
@@ -1364,6 +1390,10 @@ class Main(QMainWindow):
         for ch in CHANNELS:
             self.actions[f"focus_{ch}"] = lambda ch=ch: self.afx_focus.setCurrentText(ch)
         self.actions["inserts"] = self.vst_bypass.toggle
+        for k, cb in self.vfx_on.items():
+            self.actions[f"vfx_{k}"] = cb.toggle
+        for name, cb in self.shader_on.items():
+            self.actions[f"shd_{name}"] = cb.toggle
         for n in range(1, VST_KNOBS + 1):
             self.actions[f"vst_{n}"] = lambda x, n=n: self.inserts.knob(n - 1, x)
         missing = [ident for _g, ident, _k, _w in KEYMAP if ident not in self.actions]
@@ -1378,6 +1408,12 @@ class Main(QMainWindow):
             self.shortcuts.append(sc)
         self._midi_setup()
         self._update_afx_status()
+        # every combo's list is a window of its own, and Windows does not
+        # keep it above a fullscreen window: in F11 the list opened out of
+        # sight, behind the picture. Stay-on-top puts it in the band above.
+        for cb in self.findChildren(QComboBox):
+            popup = cb.view().window()
+            popup.setWindowFlags(popup.windowFlags() | Qt.WindowStaysOnTopHint)
 
         self.refresh_lists()
         # the audio stream: open at launch on the remembered output, with the
@@ -1485,6 +1521,7 @@ class Main(QMainWindow):
         tabs.addTab(self._tab_video(), "Video")
         tabs.addTab(self._tab_perform(), "Perform")
         tabs.addTab(self._tab_audio_fx(), "Audio FX")
+        tabs.addTab(self._tab_video_fx(), "Video FX")
         tabs.addTab(self._tab_controls(), "Controls")
         tabs.addTab(self._tab_log(), "Log")
         HoverTabs(tabs)                  # hover a tab to open it, no click
@@ -1508,7 +1545,7 @@ class Main(QMainWindow):
     def _pick_shader_frac(self, x):
         """A knob over the shaders: the bottom of its travel is off, the rest
         is split evenly between the shader files in list order."""
-        files = shader_files()
+        files = self._shader_pool()
         n = len(files) + 1
         idx = min(n - 1, int(max(0.0, min(1.0, x)) * n))
         if idx == 0:
@@ -1620,7 +1657,7 @@ class Main(QMainWindow):
             self.midi_items[ident] = item
         tree.expandAll()
         for group in groups:                     # long knob lists: folded at first
-            if group in ("grade", "fx") or group.startswith("audio_") and group != "audio_focus":
+            if group in ("grade", "fx", "vfx") or group.startswith("audio_") and group != "audio_focus":
                 groups[group].setExpanded(False)
         for c in range(3):
             tree.resizeColumnToContents(c)
@@ -2406,10 +2443,6 @@ class Main(QMainWindow):
         self.shuffle_look.setToolTip("Each section re-rolls which of the "
                                      "effects below are active and how hard")
         form.addRow("", self.shuffle_look)
-        fs_btn = QPushButton("Fullscreen (F11)")
-        fs_btn.setMinimumHeight(30)
-        fs_btn.clicked.connect(self.toggle_fullscreen)
-        form.addRow("", fs_btn)
 
         self.grade = {}
         for key, label, (lo, hi, step, val), tip in VIDEO_GRADE:
@@ -2484,8 +2517,100 @@ class Main(QMainWindow):
         form.addRow("", hint)
         return self._wrap(form, self._randomize_video)
 
+    def _tab_video_fx(self):
+        """The pool: which video effects and which shaders are in the show at
+        all, for whoever cannot stand one of them. An unticked effect counts
+        as strength 0 whatever its knob in the Video tab says (the knob greys
+        out) and Randomize leaves it alone; an unticked shader never comes up
+        by random, Space, the digit keys or the shader knob, only by name in
+        the Video tab's combo. Every tick is a MIDI button (Controls tab,
+        group 'video fx: the pool'), and the ticks are remembered."""
+        try:
+            off = json.loads(self.settings.value("videofx/off", "") or "{}")
+        except ValueError:
+            off = {}
+        fx_off, sh_off = set(off.get("effects", [])), set(off.get("shaders", []))
+        form = QFormLayout()
+        self.vfx_on = {}
+        for key, label, _d, tip in VIDEO_EFFECTS:
+            cb = QCheckBox(label)
+            cb.setToolTip(tip)
+            cb.setChecked(key not in fx_off)
+            cb.toggled.connect(lambda on, key=key: self._vfx_on_changed(key, on))
+            self.vfx_on[key] = cb
+        form.addRow("Effects", self._pool_box(self.vfx_on))
+        self.shader_on = {}
+        for p in shader_files():
+            cb = QCheckBox(p.stem)
+            cb.setToolTip(f"{p.name}: in the pool the random choice, Space, the digit "
+                          "keys and the shader knob draw from")
+            cb.setChecked(p.stem not in sh_off)
+            cb.toggled.connect(lambda on, name=p.stem: self._shader_on_changed(name, on))
+            self.shader_on[p.stem] = cb
+        form.addRow("Shaders", self._pool_box(self.shader_on))
+        hint = QLabel("what is unticked is out of the show: an effect's strength counts "
+                      "as 0 and its knob greys out in the Video tab; a shader is left "
+                      "out of random, Space, the digit keys and the shader knob, and "
+                      "only comes up when picked by name. Remembered; every tick is "
+                      "also a MIDI button in the Controls tab")
+        hint.setProperty("role", "sub")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        for key, cb in self.vfx_on.items():
+            self.vfx[key].setEnabled(cb.isChecked())
+        return self._wrap(form)
+
+    def _pool_box(self, boxes):
+        """A grid of tick boxes, seven per column, with all / none below."""
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(2)
+        for i, cb in enumerate(boxes.values()):
+            grid.addWidget(cb, i % 7, i // 7)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        for text, on in (("all", True), ("none", False)):
+            b = QPushButton(text)
+            b.setObjectName("small")
+            b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            b.clicked.connect(lambda _c=False, on=on: [cb.setChecked(on) for cb in boxes.values()])
+            row.addWidget(b)
+        row.addStretch(1)
+        box = QVBoxLayout()
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(4)
+        box.addLayout(grid)
+        box.addLayout(row)
+        w = QWidget()
+        w.setLayout(box)
+        return w
+
+    def _vfx_on_changed(self, key, on):
+        self.vfx[key].setEnabled(on)
+        self._vfx_save()
+
+    def _shader_on_changed(self, name, on):
+        self._vfx_save()
+        cur = getattr(getattr(self, "backdrop", None), "shader_path", None)
+        if not on and cur is not None and cur.stem == name \
+                and self.shader.currentText() == "random":
+            self._pick_section_shader()         # the one on screen left the pool
+
+    def _vfx_save(self):
+        self.settings.setValue("videofx/off", json.dumps({
+            "effects": [k for k, cb in self.vfx_on.items() if not cb.isChecked()],
+            "shaders": [n for n, cb in self.shader_on.items() if not cb.isChecked()]}))
+
+    def _shader_pool(self):
+        """The shader files ticked in the Video FX tab, in list order (all of
+        them before that tab exists)."""
+        on = getattr(self, "shader_on", {})
+        return [p for p in shader_files() if p.stem not in on or on[p.stem].isChecked()]
+
     def _randomize_video(self):
-        self._shuffle(*self.vfx.values(), self.shader_blend, self.reverse_len)
+        self._shuffle(*[sp for k, sp in self.vfx.items() if self.vfx_on[k].isChecked()],
+                      self.shader_blend, self.reverse_len)
         self.shader_mix.setValue(random.choice([0.3, 0.5, 0.7, 1.0]))
         self.shader.setCurrentText("random")
         self._look_idx = None                  # re-roll the look right away
@@ -2532,7 +2657,7 @@ class Main(QMainWindow):
             self.shader.setCurrentText("off")
             self._shader_user_off = True
         else:
-            files = shader_files()
+            files = self._shader_pool()
             if n > len(files):
                 return
             self.shader.setCurrentText(files[n - 1].stem)
@@ -2544,7 +2669,7 @@ class Main(QMainWindow):
         """Space: a new random effect look, plus the next shader (random when
         the combo says random). With the shader layer off (S) only the video
         effects cycle. Never brings the interface back."""
-        files = shader_files()
+        files = self._shader_pool()
         choice = self.shader.currentText()
         if choice == "off":
             pass                               # shaders stay off
@@ -2561,21 +2686,69 @@ class Main(QMainWindow):
         self.log.appendPlainText(f"video: next fx -> new look, shader {shown}")
 
     def _pick_section_shader(self):
-        files = shader_files()
-        if not files:
+        files = self._shader_pool()
+        if not files:                          # an empty pool: no layer
+            self.backdrop.set_shader(None)
             return
         cur = getattr(self.backdrop, "shader_path", None)
         pool = [p for p in files if p != cur] or files
         self.backdrop.set_shader(random.choice(pool))
 
     def toggle_fullscreen(self):
-        if self.isFullScreen():
-            self.showNormal()
+        """Fullscreen on/off. Own flag rather than isFullScreen(): on Windows
+        the window is kept a pixel taller than the screen while fullscreen
+        (see _fullscreen_size), and Qt then no longer reports the state."""
+        if self._fullscreen:
+            self._fullscreen = False
+            self._fullscreen_size(0)    # exact again, and once Qt has seen
+            QApplication.processEvents()  # that it is fullscreen in its own
+            self.showNormal()           # eyes again, it restores the frame
             self._show_ui()             # back to the desktop: interface back
             self._arm_hide()
         else:
+            self._fullscreen = True
             self.showFullScreen()
+            self._fullscreen_size(1)
             self._hide_ui(force=True)   # straight to the picture
+
+    def _fullscreen_size(self, extra):
+        """Windows: a window exactly the size of its screen is handed to the
+        display directly (the shell reports a D3D fullscreen application)
+        and nothing else is composited over it any more: a combo's list
+        opened out of sight behind the picture, working only by keyboard.
+        One extra pixel of height keeps the window an ordinary one that
+        happens to cover the screen (the taskbar still steps aside). Qt
+        drops its fullscreen state when the size differs, so extra=0 puts
+        the exact size back before showNormal(); Qt notices on the next
+        event round and then restores the frame and the old geometry as
+        usual. Nothing to do elsewhere."""
+        if sys.platform != "win32":
+            return
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
+                        ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+        u = ctypes.windll.user32
+        h = wt.HWND(int(self.winId()))
+        mon = u.MonitorFromWindow(h, 2)                     # MONITOR_DEFAULTTONEAREST
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not (mon and u.GetMonitorInfoW(mon, ctypes.byref(mi))):
+            return
+        r = mi.rcMonitor
+        u.SetWindowPos(h, None, r.left, r.top, r.right - r.left,
+                       r.bottom - r.top + extra, 0x0004 | 0x0010)   # NOZORDER | NOACTIVATE
+        # Windows 11 rounds the corners of an ordinary window, which the
+        # fullscreen one now is: square them (DWMWA_WINDOW_CORNER_PREFERENCE,
+        # DONOTROUND), back to the default on the way out; Windows 10 has no
+        # such attribute and the call just fails
+        pref = ctypes.c_int(1 if extra else 0)
+        try:
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(h, 33, ctypes.byref(pref), 4)
+        except OSError:
+            pass
 
     def _live_io_rows(self, form):
         """The live I/O, below the song parameters in the General tab: the app's audio output
@@ -3397,7 +3570,7 @@ class Main(QMainWindow):
 
     def _render_done(self, ok):
         self.generate_btn.setEnabled(True)
-        self.generate_btn.setText("Generate")
+        self.generate_btn.setText("Generate song")
         self.refresh_lists()
         if ok and self.outputs_list.count():
             self._shader_user_off = False              # a fresh song: the show is on
@@ -4355,7 +4528,8 @@ class Main(QMainWindow):
             env = 0.5
             if self._env is not None and len(self._env):
                 env = float(self._env[min(len(self._env) - 1, int(pos // 50))])
-        v = {k: sp.value() for k, sp in self.vfx.items()}
+        v = {k: (sp.value() if self.vfx_on[k].isChecked() else 0.0)
+             for k, sp in self.vfx.items()}
         idx, sec, kind = 0, None, "groove"
         sec_start_ms = 0
         if live:
@@ -4622,8 +4796,8 @@ class Main(QMainWindow):
             # only the widget-level copy: the same press also arrives on the
             # native QWindow object, which would count it twice
             if t == QEvent.KeyPress and event.key() == Qt.Key_Escape \
-                    and self.isFullScreen() and not event.isAutoRepeat():
-                self.showNormal()
+                    and self._fullscreen and not event.isAutoRepeat():
+                self.toggle_fullscreen()
             if not self.ui.isVisible():
                 self._show_ui()
             self._arm_hide()
