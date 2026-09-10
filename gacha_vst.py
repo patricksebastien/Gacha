@@ -9,7 +9,8 @@ compensates that by itself). The chain sits after the five racks are summed
 and before the master gain and the limiter, so the limiter still protects
 the PA. The price of the in-process choice: a plugin's editor window blocks
 the Qt interface while it is open (the audio keeps running), and a plugin
-that crashes takes the app down with it.
+that crashes takes the app down with it. On Windows the editor window has
+to be moved on screen by hand (place_editor_window), see there.
 
     chain = InsertChain()
     ins = chain.add("vst/plugdata-fx.vst3")   # GUI thread, ~1-2 s for plugdata
@@ -25,6 +26,8 @@ import base64
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -148,6 +151,79 @@ def load_paths(path):
     return [inner, p] if sys.platform == "win32" else [p, inner]
 
 
+def place_editor_window(owner_hwnd=None, timeout=5.0):
+    """Windows only: bring the editor window pedalboard is about to open
+    onto the screen. Call right before plugin.show_editor(). pedalboard's
+    window is a JUCE DocumentWindow it never positions, so its client
+    area lands at (0, 0) and the native title bar, which JUCE adds around
+    it, sits above the screen edge: the plugin shows in the top-left
+    corner with nothing to grab, move or close it by. Window managers on
+    X11 and macOS push a window back on screen; Windows leaves it there.
+    So a thread waits for the window (this process's top-level "Pedalboard",
+    up to `timeout` s), centres it on the monitor that holds `owner_hwnd`
+    (the app's window; the primary one without) clamped into the work area,
+    and brings it to the front. SetWindowPos from another thread is fine:
+    it is a message the window's own thread handles in pedalboard's loop,
+    which releases the GIL while it runs. No-op off Windows."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    import ctypes.wintypes as wt
+    u = ctypes.windll.user32
+    ENUM = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+    u.EnumWindows.argtypes = [ENUM, wt.LPARAM]
+    pid = os.getpid()
+
+    def find():
+        found = []
+
+        @ENUM
+        def cb(h, _):
+            owner_pid = wt.DWORD()
+            u.GetWindowThreadProcessId(h, ctypes.byref(owner_pid))
+            if owner_pid.value == pid and u.IsWindowVisible(h):
+                buf = ctypes.create_unicode_buffer(64)
+                u.GetWindowTextW(h, buf, 64)
+                if buf.value == "Pedalboard":
+                    found.append(h)
+            return True
+        u.EnumWindows(cb, 0)
+        return found[0] if found else None
+
+    def work_area(h):
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
+                        ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+        mon = u.MonitorFromWindow(wt.HWND(h), 2)          # MONITOR_DEFAULTTONEAREST
+        mi = MONITORINFO(); mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if mon and u.GetMonitorInfoW(mon, ctypes.byref(mi)):
+            return mi.rcWork
+        r = wt.RECT()
+        u.SystemParametersInfoW(48, 0, ctypes.byref(r), 0)  # SPI_GETWORKAREA
+        return r
+
+    def run():
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            h = find()
+            if h:
+                break
+            time.sleep(0.05)
+        else:
+            return
+        r = wt.RECT()
+        u.GetWindowRect(h, ctypes.byref(r))
+        w, ht = r.right - r.left, r.bottom - r.top
+        wa = work_area(owner_hwnd or h)
+        x = wa.left + max(0, (wa.right - wa.left - w) // 2)
+        y = wa.top + max(0, (wa.bottom - wa.top - ht) // 2)
+        u.SetWindowPos(wt.HWND(h), None, x, y, 0, 0, 0x0001 | 0x0004)  # NOSIZE | NOZORDER
+        u.SetForegroundWindow(wt.HWND(h))
+
+    threading.Thread(target=run, name="vst-editor-place", daemon=True).start()
+    return True
+
+
 class Insert:
     """One loaded plugin: on/off with a one-block fade, parameters by name,
     state as bytes. Built with Insert.load() on the GUI thread."""
@@ -220,6 +296,16 @@ class Insert:
 
     def latency_samples(self):
         return int(getattr(self.plugin, "reported_latency_samples", 0) or 0)
+
+    def raw_names(self):
+        """The plugin's parameter names as it reports them now, in its own
+        order, disabled slots included: a cheap fingerprint of its parameter
+        set (7 ms for plugdata-fx's 2595 slots, against 20 ms for params(),
+        which builds pedalboard's wrappers), safe from any thread."""
+        try:
+            return tuple(p.name for p in self.plugin._parameters)
+        except Exception:
+            return ()
 
     # ---- audio thread ----
     def _fit(self, y, x):
@@ -299,6 +385,32 @@ class InsertChain:
         if k is None or k[0] >= len(self.items):
             return False
         return self.items[k[0]].set_frac(k[1], x)
+
+    def fingerprint(self):
+        """The parameter names of the whole chain, for spotting a plugin
+        that renamed or added parameters (plugdata when a [param] object
+        is put in the patch, Surge XT Effects when its type is switched)."""
+        return tuple(ins.raw_names() for ins in self.items)
+
+    def watch(self, on_change, period=1.0):
+        """A daemon thread that calls on_change() (from that thread) when
+        fingerprint() differs from the last look, checked every `period` s.
+        Returns the threading.Event that stops it. Nothing is read while the
+        chain is empty."""
+        stop = threading.Event()
+
+        def run():
+            last = None
+            while not stop.wait(period):
+                if not self.items:
+                    last = None
+                    continue
+                fp = self.fingerprint()
+                if last is not None and fp != last:
+                    on_change()
+                last = fp
+        threading.Thread(target=run, name="vst-params-watch", daemon=True).start()
+        return stop
 
     def to_json(self):
         return json.dumps({

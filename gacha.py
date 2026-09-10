@@ -59,7 +59,7 @@ from gacha_video import VideoSource, video_has_audio, video_input_modes, video_i
 from gacha_midi import (MIDI_AVAILABLE, MidiIn, format_binding, midi_inputs,
                         parse_binding)
 from gacha_fx import AUDIO_FX, BIPOLAR, CHANNELS
-from gacha_vst import KNOBS as VST_KNOBS, InsertChain, scan_plugins
+from gacha_vst import KNOBS as VST_KNOBS, InsertChain, place_editor_window, scan_plugins
 try:
     import psutil                    # cpu and memory for the stats HUD
 except ImportError:                  # pragma: no cover
@@ -1091,6 +1091,8 @@ class RenderWorker(QThread):
 
 
 class Main(QMainWindow):
+    vst_params_changed = Signal()               # from the inserts' watch thread
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Gacha")
@@ -1933,6 +1935,14 @@ class Main(QMainWindow):
             grid.addWidget(cb, n % 4, (n // 4) * 2 + 1)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
+        self._vst_choices = None                    # what the knob combos list now
+        # plugins rename or add parameters at any time; a thread looks once a
+        # second (7 ms for plugdata's 2595 slots, too much for the GUI thread)
+        # and the combos are rebuilt here when it saw a change
+        self.vst_params_changed.connect(self._vst_params_changed)
+        self._vst_watch_stop = self.inserts.watch(self.vst_params_changed.emit)
+        self._vst_editor_close = threading.Event()  # set: the open editor window closes
+        self._closing = False
         box.addLayout(grid)
         self.vst_status = QLabel("")
         self.vst_status.setProperty("role", "sub")
@@ -2028,20 +2038,7 @@ class Main(QMainWindow):
             w = QWidget()
             w.setLayout(row)
             self.vst_rows.addWidget(w)
-        # the knob combos: every parameter of every plugin
-        choices = [("off", None)]
-        for i, ins in enumerate(self.inserts.items):
-            for name in ins.params():
-                choices.append((f"{i + 1}. {ins.name}: {name}", (i, name)))
-        for n, cb in enumerate(self.vst_knob_combos):
-            cb.blockSignals(True)
-            cb.clear()
-            for label, data in choices:
-                cb.addItem(label, data)
-            k = self.inserts.knobs[n]
-            idx = next((j for j, (_l, d) in enumerate(choices) if d == k), 0)
-            cb.setCurrentIndex(idx)
-            cb.blockSignals(False)
+        self._vst_fill_knobs(self._vst_choices_now())
         self.vst_bypass.blockSignals(True)
         self.vst_bypass.setChecked(self.inserts.bypass)
         self.vst_bypass.blockSignals(False)
@@ -2049,6 +2046,55 @@ class Main(QMainWindow):
         self.vst_status.setText("no insert" if not n else
                                 f"{n} insert{'s' if n > 1 else ''} in the chain"
                                 + (", bypassed" if self.inserts.bypass else ""))
+
+    def _vst_choices_now(self):
+        """[(label, data)] for the knob combos: off, then every parameter of
+        every plugin in the chain, read from the plugins now. Names are
+        live: a plugin may rename or add parameters at any time (plugdata
+        when a [param] object is put in the patch, Surge XT Effects when
+        its type changes), so this is asked again by _vst_poll."""
+        choices = [("off", None)]
+        for i, ins in enumerate(self.inserts.items):
+            for name in ins.params():
+                choices.append((f"{i + 1}. {ins.name}: {name}", (i, name)))
+        return choices
+
+    def _vst_fill_knobs(self, choices):
+        """The knob combos from `choices`. A slot pointing at a name the
+        plugin does not offer right now stays assigned (the name may come
+        back, as when a plugin's type is switched and switched back) and is
+        shown as such, rather than silently reading as off."""
+        self._vst_choices = choices
+        for n, cb in enumerate(self.vst_knob_combos):
+            cb.blockSignals(True)
+            cb.clear()
+            for label, data in choices:
+                cb.addItem(label, data)
+            k = self.inserts.knobs[n]
+            idx = next((j for j, (_l, d) in enumerate(choices) if d == k), None)
+            if idx is None and k is not None:
+                if k[0] < len(self.inserts.items):
+                    cb.addItem(f"{k[0] + 1}. {self.inserts.items[k[0]].name}: {k[1]}"
+                               "  (not a parameter now)", k)
+                    idx = cb.count() - 1
+                else:
+                    idx = 0
+            cb.setCurrentIndex(idx or 0)
+            cb.blockSignals(False)
+
+    def _vst_params_changed(self):
+        """The watch thread saw a plugin's parameter names change: rebuild
+        the knob combos if what they list differs. Not while a combo's list
+        is open under the mouse (the next change, or an add/remove, catches
+        up), nor in the middle of a restore."""
+        if not self.inserts.items or getattr(self, "_vst_restoring", False):
+            return
+        if any(cb.view().isVisible() for cb in self.vst_knob_combos):
+            return
+        choices = self._vst_choices_now()
+        if choices != self._vst_choices:
+            self._vst_fill_knobs(choices)
+            self.log.appendPlainText("vst: parameters changed, knob choices updated")
 
     def _vst_on(self, ins, on):
         ins.on = bool(on)
@@ -2068,14 +2114,23 @@ class Main(QMainWindow):
         self._vst_save()
 
     def _vst_edit(self, ins):
-        """The plugin's own window, blocking: Qt waits, the audio runs on."""
+        """The plugin's own window, blocking: Qt waits, the audio runs on.
+        pedalboard's loop checks `_vst_editor_close` every 10 ms and closes
+        the window when it is set, which closeEvent does: closing the app
+        while an editor is open takes the editor with it (the window
+        manager's close request reaches closeEvent through the messages
+        pedalboard's loop dispatches, so it runs from inside this call)."""
         self.log.appendPlainText(f"vst: {ins.name} editor open, the interface waits for it")
         self.vst_status.setText(f"{ins.name}: editor open, close it to come back here")
         QApplication.processEvents()
+        place_editor_window(int(self.winId()))    # Windows: else it opens with its title bar off screen
+        self._vst_editor_close.clear()
         try:
-            ins.plugin.show_editor()
+            ins.plugin.show_editor(self._vst_editor_close)
         except Exception as e:
             self.log.appendPlainText(f"vst: {ins.name} editor: {e}")
+        if self._closing:
+            return
         self._vst_refresh()                       # parameters may have new names
         self._vst_save()                          # the patch lives in the state
 
@@ -4605,6 +4660,8 @@ class Main(QMainWindow):
         return f"{s // 60}:{s % 60:02d}"
 
     def closeEvent(self, event):
+        self._closing = True
+        self._vst_editor_close.set()            # a plugin editor still open goes too
         self._show_ui()                         # never leave the cursor hidden
         self.player.stop()
         self.live.stop()
@@ -4613,6 +4670,7 @@ class Main(QMainWindow):
         if self.through is not None:
             self.through.stop()
         self._vst_save()
+        self._vst_watch_stop.set()
         if getattr(self, "midi", None) is not None:
             self.midi.close_all()
         if getattr(self.backdrop, "source", None) is not None:
