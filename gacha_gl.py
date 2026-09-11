@@ -99,6 +99,7 @@ FX_FS = """#version 330 core
 in vec2 vUV;
 out vec4 fragColor;
 uniform sampler2D uVideo;      // the decoded frame (top row first)
+uniform sampler2D uTake;       // the section's take frame, dissolved in by uAB
 uniform sampler2D uPrev;       // previous output, for trails
 uniform vec2 uRes, uVidRes;
 uniform float uTime, uHasPrev;
@@ -108,6 +109,25 @@ uniform float uGrain, uVign, uPixel, uRgbShift, uGlitch, uGlitchMode, uTrails, u
 uniform float uKaleido, uRepeat, uRepeatK, uRepeatFrac, uSwell;
 // source grade (colour correction of the picture itself, before any effect)
 uniform float uGExposure, uGBlack, uGGamma, uGContrast, uGSat, uGWarm, uGTint, uGSharpen;
+uniform float uAB;             // 0 = the live picture, 1 = the take frame
+uniform float uABMode;         // 0 mix, 1 add, 2 screen (same order as the shader layer)
+
+// the source pixel: the live picture dissolved toward the take frame by
+// uAB, the picture's side of the A/B pedal. Every mode is pure tape at 0
+// and pure take at 1, like the sound; they differ in the middle: mix is a
+// plain dissolve, add and screen superimpose the two at full strength
+// halfway (each side fades in over the first half of its travel and out
+// over the second), add clipping bright on bright, screen never clipping.
+vec3 src(vec2 p) {
+    vec3 a = texture(uVideo, p).rgb;
+    if (uAB <= 0.0) return a;
+    vec3 b = texture(uTake, p).rgb;
+    if (uABMode < 0.5) return mix(a, b, uAB);
+    a *= min(1.0, 2.0 * (1.0 - uAB));
+    b *= min(1.0, 2.0 * uAB);
+    if (uABMode < 1.5) return a + b;
+    return 1.0 - (1.0 - a) * (1.0 - b);
+}
 
 vec3 grade(vec3 c) {
     c = max(c * uGExposure + uGBlack, 0.0);
@@ -148,11 +168,11 @@ vec2 coverUV(vec2 uv, float zoom) {
 // at tape resolution, then graded
 vec3 video(vec2 uv, float zoom) {
     vec2 p = coverUV(uv, zoom);
-    vec3 c = texture(uVideo, p).rgb;
+    vec3 c = src(p);
     if (uGSharpen > 0.0) {
         vec2 d = 1.0 / uVidRes;
-        vec3 b = (texture(uVideo, p + vec2(d.x, 0.0)).rgb + texture(uVideo, p - vec2(d.x, 0.0)).rgb
-                + texture(uVideo, p + vec2(0.0, d.y)).rgb + texture(uVideo, p - vec2(0.0, d.y)).rgb) * 0.25;
+        vec3 b = (src(p + vec2(d.x, 0.0)) + src(p - vec2(d.x, 0.0))
+                + src(p + vec2(0.0, d.y)) + src(p - vec2(0.0, d.y))) * 0.25;
         c = max(c + (c - b) * uGSharpen, 0.0);
     } else if (uGSharpen < 0.0) {
         // blur: a 3x3 box whose radius grows with the knob (1 to 10 source
@@ -163,7 +183,7 @@ vec3 video(vec2 uv, float zoom) {
         for (int i = -1; i <= 1; i++)
             for (int j = -1; j <= 1; j++)
                 if (i != 0 || j != 0)
-                    b += texture(uVideo, p + vec2(float(i), float(j)) * d).rgb;
+                    b += src(p + vec2(float(i), float(j)) * d);
         c = mix(c, b / 9.0, min(a, 1.0));
     }
     return grade(c);
@@ -222,9 +242,9 @@ void main() {
         float thr = 1.0 - 0.6 * uSolar;
         col = mix(col, 1.0 - col, step(thr, col));
     }
-    if (uMonoTones > 0.5) {
+    if (uMonoTones > 0.5) {                          // 1 = smooth gray, 2 = threshold, 3+ = tones
         float g = luma(col);
-        if (uMonoTones < 2.5) g = step(uMonoThr, g);
+        if (uMonoTones > 1.5 && uMonoTones < 2.5) g = step(uMonoThr, g);
         else if (uMonoTones > 2.5) g = floor(clamp(g, 0.0, 0.999) * uMonoTones) / (uMonoTones - 1.0);
         col = vec3(g);
     }
@@ -325,6 +345,7 @@ class GLBackdrop(QOpenGLWidget):
         self.videos_fn, self.default_video = videos_fn, default_video
         self._start_random = False
         self._shown = None               # Frame now on the video texture
+        self._shown_ov = None            # Frame now on the take texture
         self._src_error = None           # last decoder error already logged
         self._frozen = False
         self._gl_ok = False
@@ -339,7 +360,9 @@ class GLBackdrop(QOpenGLWidget):
         self.shader_mix = 0.5
         self.shader_blend = 0             # index into BLEND_MODES
         self.grade = {}                   # source grade: exposure, black, gamma, ...
-        self.override = None              # a Frame from RAM shown instead of the source
+        self.override = None              # a Frame from RAM (the section's take frame)
+        self.override_ab = 0.0            # how far the picture is dissolved into it, 0..1
+        self.override_blend = 0           # index into BLEND_MODES: how the two pictures meet
         self._gen_prog = None
         self._gen_pending = None          # path to compile on next paint
         self._gen_cache = {}              # path -> (mtime, program): compile once
@@ -419,6 +442,8 @@ class GLBackdrop(QOpenGLWidget):
         self._vao.create()                       # even with no attributes
         self._video_tex = None
         self._vid_size = (0, 0)
+        self._take_tex = None
+        self._take_size = (0, 0)
         self._fbo_fx = [None, None]
         self._fbo_gen = [None, None]
         self._ping = 0
@@ -430,10 +455,11 @@ class GLBackdrop(QOpenGLWidget):
     def _cleanup_gl(self):
         """Free GL objects while the context is still current (on exit)."""
         self.makeCurrent()
-        tex = getattr(self, "_video_tex", None)
-        if tex is not None:
-            tex.destroy()
-        self._video_tex = None
+        for name in ("_video_tex", "_take_tex"):
+            tex = getattr(self, name, None)
+            if tex is not None:
+                tex.destroy()
+            setattr(self, name, None)
         self._fbo_fx = [None, None]
         self._fbo_gen = [None, None]
         self._gen_prog = None
@@ -511,6 +537,16 @@ class GLBackdrop(QOpenGLWidget):
 
     def _upload_frame(self, img):
         """Newest decoded frame -> the persistent video texture (0.6 ms)."""
+        self._video_tex, self._vid_size = self._upload(img, self._video_tex, self._vid_size)
+        self._frame_img = img            # what last_frame() hands out: the live picture
+
+    def _upload_take(self, img):
+        """The section's take frame -> its own texture, dissolved in by uAB."""
+        self._take_tex, self._take_size = self._upload(img, self._take_tex, self._take_size)
+
+    def _upload(self, img, tex, size):
+        """A QImage into `tex` (reallocated when the size changes); returns
+        the (texture, size) pair to keep."""
         if img.format() in (QImage.Format_ARGB32, QImage.Format_RGB32,
                             QImage.Format_ARGB32_Premultiplied):
             fmt = GL_BGRA
@@ -520,20 +556,20 @@ class GLBackdrop(QOpenGLWidget):
         w, h = img.width(), img.height()
         if img.bytesPerLine() != w * 4:
             img = img.copy()             # tight rows
-        if self._video_tex is None or self._vid_size != (w, h):
-            if self._video_tex is not None:
-                self._video_tex.destroy()
+        if tex is None or size != (w, h):
+            if tex is not None:
+                tex.destroy()
             tex = QOpenGLTexture(QOpenGLTexture.Target2D)
             tex.setFormat(QOpenGLTexture.RGBA8_UNorm)
             tex.setSize(w, h)
             tex.allocateStorage()
             tex.setMinMagFilters(QOpenGLTexture.Linear, QOpenGLTexture.Linear)
             tex.setWrapMode(QOpenGLTexture.ClampToEdge)
-            self._video_tex, self._vid_size = tex, (w, h)
-        self._video_tex.bind()
+            size = (w, h)
+        tex.bind()
         self.gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, fmt,
                                 GL_UNSIGNED_BYTE, img.constBits())
-        self._frame_img = img            # what last_frame() hands out
+        return tex, size
 
     def _bind_tex(self, unit, tex_id):
         self.gl.glActiveTexture(GL_TEXTURE0 + unit)
@@ -565,15 +601,29 @@ class GLBackdrop(QOpenGLWidget):
                 self.source.set_speed(float(st["speed"]))
             else:
                 self.source.set_speed(-float(rev) if rev else 1.0)
-            fr = self.override if self.override is not None else self.source.latest()
+            fr = self.source.latest()
             if fr is not None and fr.img is not None and fr is not self._shown \
                     and not self._frozen:
                 self._upload_frame(fr.img)
                 self._shown = fr                 # keeps fr.arr alive with it
-        if self._video_tex is None:
+            ov = self.override                   # the section's take frame, if any
+            if ov is not None and ov.img is not None and ov is not self._shown_ov \
+                    and not self._frozen:
+                self._upload_take(ov.img)
+                self._shown_ov = ov
+        # the picture's A/B: 0 = the live picture, 1 = the take frame; with
+        # no take frame to show, or one texture still missing, no dissolve
+        vid, take = self._video_tex, self._take_tex
+        ab = min(1.0, max(0.0, float(self.override_ab))) if self.override is not None else 0.0
+        if vid is None:
+            vid, self._vid_size = take, self._take_size   # nothing live yet: the take alone
+            ab = 1.0 if take is not None else 0.0
+        if vid is None:
             gl.glClearColor(16 / 255, 9 / 255, 7 / 255, 1.0)
             gl.glClear(GL_COLOR_BUFFER_BIT)
             return
+        if take is None:
+            take, ab = vid, 0.0
         self._ensure_fbos()
         W, H = self._fbo_size
         now = time.monotonic()
@@ -588,10 +638,14 @@ class GLBackdrop(QOpenGLWidget):
         gl.glViewport(0, 0, W, H)
         p = self._fx
         p.bind()
-        self._bind_tex(0, self._video_tex.textureId())
+        self._bind_tex(0, vid.textureId())
         self._bind_tex(1, self._fbo_fx[prev].texture())
+        self._bind_tex(2, take.textureId())
         p.setUniformValue1i("uVideo", 0)
         p.setUniformValue1i("uPrev", 1)
+        p.setUniformValue1i("uTake", 2)
+        p.setUniformValue1f("uAB", ab)
+        p.setUniformValue1f("uABMode", float(self.override_blend))
         p.setUniformValue("uRes", QVector2D(W, H))
         p.setUniformValue("uVidRes", QVector2D(*self._vid_size))
         p.setUniformValue1f("uTime", t)
@@ -694,9 +748,9 @@ class GLBackdrop(QOpenGLWidget):
         f("uInvert", 1.0 if g("invert") else 0.0)
         f("uBits", float(g("bits", 0) or 0))
         f("uDither", float(g("dither", 0.0)))
-        mono = g("mono") or (0, 0.5)
-        f("uMonoTones", float(mono[0]))
-        f("uMonoThr", float(mono[1]))
+        mono = g("mono")                    # (tones, threshold); tones 0 = smooth gray
+        f("uMonoTones", float(mono[0] or 1) if mono else 0.0)   # 0 here = mono off
+        f("uMonoThr", float(mono[1]) if mono else 0.5)
         f("uSolar", float(g("solarize", 0.0)))
         f("uEdges", float(g("edges", 0.0)))
         f("uScan", float(g("scanlines", 0.0)))

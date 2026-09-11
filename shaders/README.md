@@ -48,6 +48,7 @@ give `iDrop` a moment.
 | `glyphs.frag` | picture rebuilt from procedural glyphs, refreshed every beat |
 | `halftone.frag` | CMYK halftone print with three slowly rotating dot screens |
 | `leaks.frag` | light leaks washing in from the edges on each beat |
+| `lanes.frag` | one narrow vertical lane of the picture repeated across the screen, a new random one every beat, wider when loud, broad stripes on a drop (replaces the picture) |
 | `mirrorhall.frag` | mirror wall of full-height panels (replaces the picture) |
 | `mosaic.frag` | video cut into tiles that flip and shift on each beat |
 | `plasma.frag` | slow plasma warping the picture in its own colours |
@@ -55,6 +56,7 @@ give `iDrop` a moment.
 | `relief.frag` | embossed relief lit by a light orbiting once per bar |
 | `skyline.frag` | skyline equaliser, each column rising to its own brightness |
 | `slitscan.frag` | slit-scan sweeping once per bar, freezing motion into streaks |
+| `strips.frag` | a real slice of the picture, a vertical strip about 100 px wide and the full height, tiled across the screen; a new random strip every beat, wider when loud, a third of the screen on a drop (replaces the picture) |
 | `sparks.frag` | tiny particles born on bright spots, drifting up and fading |
 | `super8.frag` | Super 8 home movie: 18 fps frame hold, faded Kodachrome grade with halation, grain, dust, hairs and dark scratches, exposure flicker, splices and flash frames on downbeats, the reel burning out on a drop |
 | `thermal.frag` | thermal camera palette with animated iso-lines |

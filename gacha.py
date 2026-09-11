@@ -273,7 +273,8 @@ KEYMAP = [
     ("show", "grade_neutral", "", "source grade back to neutral"),
     ("show", "blend_next", "", "next shader blend mode (mix, add, screen)"),
     ("section", "kind_next", "", "next section kind (random, groove, break, ...)"),
-    ("section", "picture_next", "", "picture while a section plays: auto, take, live"),
+    ("section", "picture_next", "", "picture while a section plays: follow, take, live"),
+    ("section", "dissolve_next", "", "how the A/B pedal blends the two pictures: mix, add, screen"),
     ("mix", "volume", "", "main volume: the audio stream (songs, sections, live input)"),
     ("mix", "sync", "", "audio sync delay, 0 to 2000 ms"),
     ("mix", "shader_mix", "", "shader layer opacity"),
@@ -309,6 +310,11 @@ KEYMAP += [("vfx", f"vfx_{k}", "", f"{lbl}: video effect in the show, off/on")
            for k, lbl, _d, _t in VIDEO_EFFECTS]
 KEYMAP += [("vfx", f"shd_{p.stem}", "", f"{p.stem}: shader in the pool, off/on")
            for p in shader_files()]
+# the clip on screen by hand: the ticked videos of the Videos tab
+KEYMAP += [("show", "video_prev", "", "previous ticked video, in list order"),
+           ("show", "video_next", "", "next ticked video, in list order"),
+           ("show", "video_random", "", "a random ticked video: a shuffled order, each "
+                                        "one once before any comes again")]
 # ids that take a value (0..1) instead of firing; only a CC can drive them
 CONTINUOUS = {"ab", "volume", "sync", "shader_mix", "shader_pick", "avol"} \
     | {f"grade_{k}" for k, *_ in VIDEO_GRADE} | {f"fx_{k}" for k, *_ in VIDEO_EFFECTS} \
@@ -579,6 +585,8 @@ class VideoBackdrop(QWidget):
         self.state_fn = None
         self.fx = VideoFX()
         self.override = None       # RAM frame from the section engine (GL only shows it)
+        self.override_ab = 0.0     # how far the picture dissolves into it (GL only)
+        self.override_blend = 0    # mix, add or screen (GL only)
         self.grade = {}            # source grade (GL only applies it)
         self._last_fx = 0.0
         self._zoom = 0.0
@@ -1128,6 +1136,8 @@ class Main(QMainWindow):
         self._sec_bounds = []       # section start times (ms) of the playing file
         self._sec_idx = -1          # which section the playhead is in
         self._last_switch_ms = 0.0  # song position of the last clip switch
+        self._video_deck = []       # video_random: the shuffled order left to deal
+        self._video_deck_pool = []  # ...and the ticked videos it was dealt from
         self._sections = []         # full section dicts of the playing file
         self._beat_ms = 500.0
         self._env = None            # loudness envelope, one value per 50 ms
@@ -1368,6 +1378,7 @@ class Main(QMainWindow):
             "blend_next": lambda: self._combo_next(self.shader_blend),
             "kind_next": lambda: self._combo_next(self.perf_kind),
             "picture_next": lambda: self._combo_next(self.perf_picture),
+            "dissolve_next": lambda: self._combo_next(self.perf_dissolve),
         })
         # knobs: a CC's 0..1 spread over the widget's range
         self.actions.update({
@@ -1394,6 +1405,9 @@ class Main(QMainWindow):
             self.actions[f"vfx_{k}"] = cb.toggle
         for name, cb in self.shader_on.items():
             self.actions[f"shd_{name}"] = cb.toggle
+        self.actions["video_prev"] = lambda: self._video_step(-1)
+        self.actions["video_next"] = lambda: self._video_step(1)
+        self.actions["video_random"] = self._video_random
         for n in range(1, VST_KNOBS + 1):
             self.actions[f"vst_{n}"] = lambda x, n=n: self.inserts.knob(n - 1, x)
         missing = [ident for _g, ident, _k, _w in KEYMAP if ident not in self.actions]
@@ -2299,20 +2313,33 @@ class Main(QMainWindow):
         self.perf_ab.setRange(0, 100)
         self.perf_ab.setValue(0)
         self.perf_ab.setToolTip("A/B: 0 = the tape through only, 100 = the section "
-                                "only, equal power in between. Keys [ and ] step "
-                                "by 10; a MIDI expression pedal drives it "
+                                "only, equal power in between; the picture "
+                                "dissolves with it (Picture = follow). Keys [ and ] "
+                                "step by 10; a MIDI expression pedal drives it "
                                 "through the Controls tab.")
         self.perf_ab.valueChanged.connect(self._perf_ab_changed)
         self.perf_ab_lbl = QLabel("A 100 %  ·  B 0 %")
         self.perf_ab_lbl.setProperty("role", "sub")
         form.addRow("A/B", self._row([("", self.perf_ab), ("", self.perf_ab_lbl)]))
         self.perf_picture = QComboBox()
-        self.perf_picture.addItems(["auto", "take", "live"])
+        self.perf_picture.addItems(["follow", "take", "live"])
         self.perf_picture.setToolTip(
-            "What the screen shows while a section plays: take = the frames "
-            "the sounds were cut from (needs takes with video), live = the "
-            "tape as it comes in, auto = the take frames once A/B passes 50 %.")
-        form.addRow("Picture", self._row([("", self.perf_picture)]))
+            "What the screen shows while a section plays: follow = the picture "
+            "dissolves from the tape to the take frames with the A/B pedal, the "
+            "way the sound does; take = the frames the sounds were cut from "
+            "(needs takes with video); live = the tape as it comes in.")
+        self.perf_dissolve = QComboBox()
+        self.perf_dissolve.addItems(BLEND_MODES)
+        self.perf_dissolve.setToolTip(
+            "How the tape and the take frames meet under the A/B pedal. All "
+            "three are the tape alone at 0 and the take alone at 100; mix is a "
+            "plain dissolve, add and screen lay the two pictures over each "
+            "other at full strength halfway (add clips bright on bright, "
+            "screen never clips).")
+        self.perf_dissolve.currentIndexChanged.connect(
+            lambda i: setattr(self.backdrop, "override_blend", i))
+        form.addRow("Picture", self._row([("", self.perf_picture),
+                                          ("dissolve", self.perf_dissolve)]))
         self.perf_status = QLabel("no section")
         self.perf_status.setProperty("role", "sub")
         self.perf_status.setWordWrap(True)
@@ -2526,16 +2553,16 @@ class Main(QMainWindow):
         the Video tab's combo. Every tick is a MIDI button (Controls tab,
         group 'video fx: the pool'), and the ticks are remembered."""
         try:
-            off = json.loads(self.settings.value("videofx/off", "") or "{}")
+            pool = json.loads(self.settings.value("videofx/pool", "") or "{}")
         except ValueError:
-            off = {}
-        fx_off, sh_off = set(off.get("effects", [])), set(off.get("shaders", []))
+            pool = {}
+        fx_on, sh_off = set(pool.get("effects_on", [])), set(pool.get("shaders_off", []))
         form = QFormLayout()
         self.vfx_on = {}
         for key, label, _d, tip in VIDEO_EFFECTS:
             cb = QCheckBox(label)
             cb.setToolTip(tip)
-            cb.setChecked(key not in fx_off)
+            cb.setChecked(key in fx_on)              # all off until ticked
             cb.toggled.connect(lambda on, key=key: self._vfx_on_changed(key, on))
             self.vfx_on[key] = cb
         form.addRow("Effects", self._pool_box(self.vfx_on))
@@ -2551,8 +2578,10 @@ class Main(QMainWindow):
         hint = QLabel("what is unticked is out of the show: an effect's strength counts "
                       "as 0 and its knob greys out in the Video tab; a shader is left "
                       "out of random, Space, the digit keys and the shader knob, and "
-                      "only comes up when picked by name. Remembered; every tick is "
-                      "also a MIDI button in the Controls tab")
+                      "only comes up when picked by name. With nothing playing, a "
+                      "ticked effect runs on the clip at its strength, on the tap "
+                      "tempo's clock. Remembered; every tick is also a MIDI button "
+                      "in the Controls tab")
         hint.setProperty("role", "sub")
         hint.setWordWrap(True)
         form.addRow("", hint)
@@ -2591,16 +2620,75 @@ class Main(QMainWindow):
         self._vfx_save()
 
     def _shader_on_changed(self, name, on):
+        """A shader's tick (the tab or its MIDI pad) shows on screen: ticking
+        one while the layer is off switches the layer on, in random mode over
+        the pool, so with that one tick alone it is the one that shows;
+        unticking the one on screen (or the one the combo names) draws
+        another from the pool, and the last tick to go takes the layer off."""
         self._vfx_save()
-        cur = getattr(getattr(self, "backdrop", None), "shader_path", None)
-        if not on and cur is not None and cur.stem == name \
-                and self.shader.currentText() == "random":
-            self._pick_section_shader()         # the one on screen left the pool
+        if not hasattr(self, "backdrop"):
+            return
+        choice = self.shader.currentText()
+        cur = getattr(self.backdrop, "shader_path", None)
+        if on:
+            if choice == "off":
+                self._shader_user_off = False
+                self.shader.setCurrentText("random")   # draws from the pool
+                self.log.appendPlainText(f"video: shader layer on, {name} joins the pool")
+            elif choice == "random" and (cur is None or len(self._shader_pool()) == 1):
+                self._pick_section_shader()             # nothing was showing
+            return
+        if not self._shader_pool():
+            if choice in ("random", name):
+                self._shader_user_off = True
+                self.shader.setCurrentText("off")
+                self.log.appendPlainText("video: the shader pool is empty, layer off")
+            return
+        if choice == name:                              # named on the combo: to the pool
+            self.shader.setCurrentText("random")
+        if (cur is not None and cur.stem == name) or choice == name:
+            self._pick_section_shader()                 # the one on screen left the pool
 
     def _vfx_save(self):
-        self.settings.setValue("videofx/off", json.dumps({
-            "effects": [k for k, cb in self.vfx_on.items() if not cb.isChecked()],
-            "shaders": [n for n, cb in self.shader_on.items() if not cb.isChecked()]}))
+        self.settings.setValue("videofx/pool", json.dumps({
+            "effects_on": [k for k, cb in self.vfx_on.items() if cb.isChecked()],
+            "shaders_off": [n for n, cb in self.shader_on.items() if not cb.isChecked()]}))
+
+    # ---------- the clip by hand (MIDI) ----------
+    def _show_clip(self, path):
+        """Put `path` on screen now; the automatic switching starts its count
+        from here. Nothing while a video input is on."""
+        if self.backdrop.set_video(path, random_start=self.video_jump.isChecked()) is None:
+            return
+        self._live_switch_t = time.monotonic()
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self._last_switch_ms = self._playhead_ms()
+        self.log.appendPlainText(f"video: {Path(path).name}")
+
+    def _video_step(self, delta):
+        """The previous / next ticked video, in the Videos tab's order."""
+        pool = self._song_videos()
+        if not pool:
+            return
+        cur = self.backdrop.current
+        i = pool.index(cur) if cur in pool else -1
+        self._show_clip(pool[(i + delta) % len(pool)])
+
+    def _video_random(self):
+        """A random ticked video, never the same twice in a row and none
+        again before every other one has had its turn: the pool is shuffled
+        into a deck once, dealt from the top, and shuffled again when it
+        runs out or when the ticks change."""
+        pool = self._song_videos()
+        if not pool:
+            return
+        if not self._video_deck or set(self._video_deck_pool) != set(pool):
+            deck = list(pool)
+            random.shuffle(deck)
+            if len(deck) > 1 and deck[0] == self.backdrop.current:
+                deck.append(deck.pop(0))           # not the one on screen first
+            self._video_deck, self._video_deck_pool = deck, list(pool)
+        self._show_clip(self._video_deck.pop(0))
 
     def _shader_pool(self):
         """The shader files ticked in the Video FX tab, in list order (all of
@@ -3899,11 +3987,13 @@ class Main(QMainWindow):
         else:
             self.perf_status.setText(
                 f"playing {sec.kind} {pl.bpm:.0f} bpm  ·  bar {bar}/{pl.bars}  ·  {ready}")
-        # picture: the frame the sounding sample was cut from
+        # picture: the frame the sounding sample was cut from, dissolved into
+        # the live picture by the A/B pedal (follow), or pinned to either side
         mode = self.perf_picture.currentText()
-        show = mode == "take" or (mode == "auto" and la.ab >= 0.5)
-        fr = self._perf_frame(pos) if (show and sec is not None) else None
+        ab = 1.0 if mode == "take" else (0.0 if mode == "live" else float(la.ab))
+        fr = self._perf_frame(pos) if (ab > 0.0 and sec is not None) else None
         self.backdrop.override = fr
+        self.backdrop.override_ab = ab if fr is not None else 0.0
 
     def _perf_frame(self, pos):
         """Frame of the take the loudest-priority event sounding at `pos`
@@ -4433,16 +4523,17 @@ class Main(QMainWindow):
         except Exception:
             pass
 
-    def _roll_look(self, idx, phrase):
+    def _roll_look(self, idx, phrase, shuffle=True):
         """Random look: which stylistic effects are on and how hard. Re-rolled
         every 4-bar phrase so long sections keep moving; section-level
-        choices (kaleidoscope, mono tones, shader) change per section."""
+        choices (kaleidoscope, mono tones, shader) change per section.
+        shuffle=False (idle) keeps every effect at its knob's strength."""
         key = (idx, phrase)
         if key == self._look_idx:
             return
         section_changed = self._look_idx is None or self._look_idx[0] != idx
         self._look_idx = key
-        if self.shuffle_look.isChecked():
+        if shuffle and self.shuffle_look.isChecked():
             self._look = {k: (0.0 if random.random() < 0.5
                               else random.uniform(0.4, 1.3))
                           for k, *_ in VIDEO_EFFECTS if k not in LOOK_EXEMPT}
@@ -4451,8 +4542,8 @@ class Main(QMainWindow):
         if not section_changed:
             return
         # kaleidoscope: strength is the chance a section gets it
-        self._kaleido = random.choice([4, 6, 8]) \
-            if random.random() < self.vfx["kaleido"].value() else 0
+        kal = self.vfx["kaleido"].value() if self.vfx_on["kaleido"].isChecked() else 0.0
+        self._kaleido = random.choice([4, 6, 8]) if random.random() < kal else 0
         if self.shader.currentText() == "random":
             self._pick_section_shader()
         # mono: hard tones with probability = strength, else smooth gray
@@ -4509,19 +4600,26 @@ class Main(QMainWindow):
 
     def _video_state(self):
         """Effect state for the frame being drawn, from the playhead: the
-        song's, or in live mode the tap-tempo clock with the input's loudness."""
+        song's, or in live mode the tap-tempo clock with the input's loudness.
+        With nothing playing (idle) the ticked effects of the Video FX tab
+        still run, on the tap-tempo clock at a steady mid loudness: no random
+        look, so what is ticked is what shows, and the clip is left alone."""
         live = self._live_active()
-        if live:
+        idle = not live and self.player.playbackState() != QMediaPlayer.PlayingState
+        if idle and not any(cb.isChecked() for cb in self.vfx_on.values()):
+            return None                         # the clip as it is
+        if live or idle:
             now = time.monotonic()
-            if self.live_auto.isChecked():
+            if live and self.live_auto.isChecked():
                 self._follow_analyzer(now)
             pos = self.tempo.pos_ms(now)
             fade = 1.0
-            env = self.live.loud
             beat_ms = self.tempo.beat_ms
+            if live:
+                env = self.live.loud
+            else:                               # idle: a pulse on every beat
+                env = 0.35 + 0.65 * (1.0 - (pos % beat_ms) / beat_ms) ** 2
         else:
-            if self.player.playbackState() != QMediaPlayer.PlayingState:
-                return None
             pos = self._playhead_ms()
             fade = self._outro_fade(pos)
             beat_ms = self._beat_ms
@@ -4532,7 +4630,7 @@ class Main(QMainWindow):
              for k, sp in self.vfx.items()}
         idx, sec, kind = 0, None, "groove"
         sec_start_ms = 0
-        if live:
+        if live or idle:
             # no section map: every 8 bars count as a section, so the look,
             # the shader and the clip keep changing the way they do in a song
             sec_len = self.LIVE_SECTION_BARS * 4 * beat_ms
@@ -4540,7 +4638,8 @@ class Main(QMainWindow):
             sec_start_ms = idx * sec_len
             if idx != self._sec_idx:
                 self._sec_idx = idx
-                self._on_live_section(idx, pos)
+                if live:                        # idle: the clip is yours
+                    self._on_live_section(idx, pos)
         elif self._sections and self._sec_bounds:
             idx = max(0, bisect.bisect_right(self._sec_bounds, pos) - 1)
             sec = self._sections[idx]
@@ -4548,7 +4647,7 @@ class Main(QMainWindow):
             sec_start_ms = self._sec_bounds[idx]
         # bars counted from the section's own first bar, so phrases line up
         bar_i = int(max(0, pos - sec_start_ms) // (4 * beat_ms))
-        self._roll_look(idx, bar_i // 4)
+        self._roll_look(idx, bar_i // 4, shuffle=not idle)
         lk = lambda k: v[k] * self._look.get(k, 1.0)     # strength x look
 
         # music data for generative shaders (iLoud, iBeat, ...)
@@ -4564,6 +4663,8 @@ class Main(QMainWindow):
             if self._live_drop_t is not None:
                 drop_age = (now - self._live_drop_t) * 1000.0
                 drop = max(0.0, 1 - drop_age / 400.0)
+        elif idle:
+            root = NOTE_NAMES[(idx * 7) % 12]   # no music: round the circle of fifths
         elif sec is not None and sec.get("transition"):
             drop = max(0.0, 1 - (pos - self._sec_bounds[idx]) / 400.0)
         st = {"music": {
@@ -4574,7 +4675,7 @@ class Main(QMainWindow):
             "drop": drop,
             # live: no song to be a fraction of; a slow 5-minute loop keeps
             # the shaders that age with it (vhs) moving
-            "song_pos": (pos / 300000.0) % 1.0 if live
+            "song_pos": (pos / 300000.0) % 1.0 if live or idle
             else pos / total_ms if total_ms else 0.0}}
         # clean video: rolled once per bar, on its downbeat, with probability
         # = strength; the first 1/16 note of the bar then flashes the video as
@@ -4585,7 +4686,7 @@ class Main(QMainWindow):
             self._clean_bar = bar_key
             self._clean_on = random.random() < v["clean"]
         in_bar = (pos - sec_start_ms) - bar_i * 4 * beat_ms
-        if not live:
+        if not (live or idle):
             self._follow_video(pos, st, (idx, bar_i // 4))
         if v["reverse"]:
             # rolled once per bar on its downbeat, with probability =
@@ -4619,7 +4720,7 @@ class Main(QMainWindow):
             return st
         if v["pump"]:
             st["brightness"] = 0.7 + 0.7 * v["pump"] * env
-        if live:
+        if live or idle:
             # the song-side colour moves, on the live clock's pseudo-sections
             if v["color"]:
                 st["hue"] = v["color"] * ((idx * 0.37) % 1.0) * 0.5
@@ -4628,6 +4729,11 @@ class Main(QMainWindow):
                 st["tint"] = (NOTE_HUES[root], 0.6 * lk("tint"))
             if v["flash"] and drop_age is not None and drop_age < 120 * v["flash"]:
                 st["invert"] = True            # the drop hits
+            if v["pixel"]:                     # no breaks here: the break's rhythm
+                r = random.Random(hash((idx, bar_i // 2, self._pix_seed)))   # on every section
+                if r.random() < 0.66:
+                    size = (2 + 10 * v["pixel"]) * r.uniform(0.5, 1.5)
+                    st["pixelate"] = max(2, int(size * (0.7 + 0.6 * env)))
         if sec is not None:
             if v["color"]:
                 st["hue"] = v["color"] * ((idx * 0.37) % 1.0) * 0.5
