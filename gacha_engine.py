@@ -1225,7 +1225,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
 
     if drum_style == "random" or drum_style not in DRUM_STYLES:
         drum_style = rng.choice(DRUM_STYLES)
-    bpm = bpm if bpm is not None else rng.randint(84, 128)
+    bpm = bpm if bpm is not None else rng.randint(60, 180)
     beat = 60.0 / bpm
     bar = 4 * beat
     step_len = beat / 4                               # 16th notes

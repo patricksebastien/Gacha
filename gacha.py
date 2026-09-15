@@ -49,6 +49,7 @@ from gacha_gl import BLEND_MODES, GLBackdrop, gl_available, shader_files
 from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
+from gacha_link import INSTALL_HINT as LINK_INSTALL_HINT, LINK_AVAILABLE, LinkClock
 from gacha_audio import LiveAudio, audio_apis, audio_devices, audio_status
 from gacha_takes import TakeStore
 from gacha_section import Material, render_section, render_oneshot, KINDS, STEMS
@@ -273,6 +274,7 @@ KEYMAP = [
     ("show", "grade_neutral", "", "source grade back to neutral"),
     ("show", "blend_next", "", "next shader blend mode (mix, add, screen)"),
     ("section", "kind_next", "", "next section kind (random, groove, break, ...)"),
+    ("clock", "link", "", "Ableton Link: tempo and bar shared with the network, off/on"),
     ("section", "picture_next", "", "picture while a section plays: follow, take, live"),
     ("section", "dissolve_next", "", "how the A/B pedal blends the two pictures: mix, add, screen"),
     ("mix", "volume", "", "main volume: the audio stream (songs, sections, live input)"),
@@ -1171,6 +1173,18 @@ class Main(QMainWindow):
         # song's loudness envelope and section map
         self.live = LiveInput(self)
         self.tempo = TapTempo()
+        # Ableton Link: with the General tab's Link button on, the live clock
+        # shares the network session's tempo (gacha_link.py), polled
+        self.link = None
+        if LINK_AVAILABLE:
+            try:
+                self.link = LinkClock(self.tempo.bpm)
+            except Exception as e:                  # a broken wheel must not take the app down
+                print(f"ableton link unavailable: {e}", file=sys.stderr)
+        self._link_timer = QTimer(self)
+        self._link_timer.timeout.connect(self._poll_link)
+        self._link_ticks = 0
+        self._link_peers = -1                       # last peer count shown in the log
         self._live_timer = QTimer(self)             # level meter refresh
         self._live_timer.timeout.connect(self._update_live_meter)
         self.through = None                         # LiveAudio: the audio stream, when open
@@ -1377,6 +1391,7 @@ class Main(QMainWindow):
             "grade_neutral": self._reset_grade,
             "blend_next": lambda: self._combo_next(self.shader_blend),
             "kind_next": lambda: self._combo_next(self.perf_kind),
+            "link": self.link_on.toggle,
             "picture_next": lambda: self._combo_next(self.perf_picture),
             "dissolve_next": lambda: self._combo_next(self.perf_dissolve),
         })
@@ -2425,27 +2440,15 @@ class Main(QMainWindow):
         self.take_status.setProperty("role", "sub")
         form.addRow("", self.take_status)
         self._refresh_through_devices()
-        self.live_bpm = QDoubleSpinBox(minimum=40.0, maximum=240.0,
-                                       singleStep=1.0, decimals=1, suffix=" bpm")
-        self.live_bpm.setValue(self.tempo.bpm)
-        self.live_bpm.setToolTip("Tempo of the live clock; tapping sets it")
-        self.live_bpm.valueChanged.connect(self._live_bpm_edited)
-        tap_btn = QPushButton("Tap (T)")
-        tap_btn.setToolTip("Tap on the beat, four or more times, the first "
-                           "one on the downbeat")
-        tap_btn.clicked.connect(self.tap_tempo)
-        down_btn = QPushButton("Downbeat (D)")
-        down_btn.setToolTip("Restart the bar now, keeping the tempo")
-        down_btn.clicked.connect(self.live_downbeat)
-        form.addRow("", self._row([("tempo", self.live_bpm), ("", tap_btn),
-                                   ("", down_btn)]))
         self.live_auto = QCheckBox("auto: tempo, beat and root note from the audio")
         self.live_auto.setChecked(True)
         self.live_auto.setToolTip(
             "Listens along: the tempo and beat phase from the onsets (kicks "
             "first), the root note from a running chroma for the tint. Needs "
             "about 4 s of music. Tapping T switches this off and follows "
-            "your taps instead; X marks a drop by hand and restarts the bar.")
+            "your taps instead; X marks a drop by hand and restarts the bar. "
+            "With Ableton Link on (General tab) the tempo is the session's "
+            "and only the root note is taken from the audio.")
         self.live_status = QLabel("")
         self.live_status.setProperty("role", "sub")
         form.addRow("", self._row([("", self.live_auto), ("", self.live_status)]))
@@ -2993,12 +2996,7 @@ class Main(QMainWindow):
                                  suffix=" s")
         form.addRow("Duration", self.duration)
 
-        self.bpm_random = QCheckBox("random (84–128)")
-        self.bpm_random.setChecked(True)
-        self.bpm = QSpinBox(minimum=40, maximum=220, value=110)
-        self.bpm.setEnabled(False)
-        self.bpm_random.toggled.connect(lambda on: self.bpm.setEnabled(not on))
-        form.addRow("BPM", self._pair(self.bpm, self.bpm_random))
+        self._live_clock_rows(form)
 
         self.seed_random = QCheckBox("random")
         self.seed_random.setChecked(True)
@@ -3019,6 +3017,56 @@ class Main(QMainWindow):
         form.addRow("", gap)
         self._live_io_rows(form)
         return self._wrap(form)
+
+    def _live_clock_rows(self, form):
+        """The one BPM: the live clock. It runs the visuals, the racks' delays
+        and the section engine whenever no song plays, a generated song takes
+        it unless random is ticked, and a song that plays sets it to its own;
+        from the box, from taps, or shared with an Ableton Link session."""
+        self.live_bpm = QDoubleSpinBox(minimum=40.0, maximum=240.0,
+                                       singleStep=1.0, decimals=1, suffix=" bpm")
+        self.live_bpm.setValue(self.tempo.bpm)
+        self.live_bpm.setToolTip(
+            "The tempo: of the visuals, the racks' delays and the section "
+            "engine whenever no song plays, and of the next generated song "
+            "unless random is ticked. Type it, tap it (T), or share it with "
+            "Ableton Link below; a song that starts playing sets it to its own.")
+        self.live_bpm.valueChanged.connect(self._live_bpm_edited)
+        self.bpm_random = QCheckBox("random")
+        self.bpm_random.setChecked(True)
+        self.bpm_random.setToolTip(
+            "Generate picks a tempo between 60 and 180 for each song. Unticked, "
+            "the song is rendered at the BPM shown here (the live clock, or the "
+            "Link session's).")
+        tap_btn = QPushButton("Tap (T)")
+        tap_btn.setToolTip("Tap on the beat, four or more times, the first "
+                           "one on the downbeat: the intervals set the tempo")
+        tap_btn.clicked.connect(self.tap_tempo)
+        down_btn = QPushButton("Downbeat (D)")
+        down_btn.setToolTip(
+            "Mark the one of the bar: the bar restarts now, tempo kept, so the "
+            "bar count (the 8-bar sections, the shaders' iBar, the tint's walk) "
+            "lines up with the music. Not sent over Link.")
+        down_btn.clicked.connect(self.live_downbeat)
+        form.addRow("BPM", self._row([("", self.live_bpm), ("", self.bpm_random),
+                                      ("", tap_btn), ("", down_btn)]))
+        self.link_on = QPushButton("off")
+        self.link_on.setCheckable(True)
+        self.link_on.setToolTip(
+            "Ableton Link, tempo only: on, the live clock joins the Link "
+            "session on the network (Live, Traktor, drum machines...) and takes "
+            "its bpm; typing in the box, tapping T or a playing section then "
+            "changes the bpm for everyone. The beat and the bar stay this "
+            "app's own. Remembered.")
+        self.link_on.toggled.connect(self._link_toggled)
+        self.link_status = QLabel("off")
+        self.link_status.setProperty("role", "sub")
+        form.addRow("Ableton Link", self._row([("", self.link_on), ("", self.link_status)]))
+        if self.link is None:
+            self.link_on.setEnabled(False)
+            self.link_status.setText(f"aalink not installed ({LINK_INSTALL_HINT})")
+        else:
+            self.link_on.setChecked(self.settings.value("clock/link", False, type=bool))
 
     def _tab_drums(self):
         form = QFormLayout()
@@ -3592,7 +3640,7 @@ class Main(QMainWindow):
                "pan_layers": self.pan_layers.value(),
                "pan_events": self.pan_events.value(),
                "seed": None if self.seed_random.isChecked() else self.seed.value(),
-               "bpm": None if self.bpm_random.isChecked() else self.bpm.value()}
+               "bpm": None if self.bpm_random.isChecked() else self._song_bpm()}
         if not self.all_samples.isChecked():
             job["num_samples"] = self.num_samples.value()
         if self.intro_cap.isChecked():
@@ -3975,9 +4023,8 @@ class Main(QMainWindow):
             pl.swapped = False
             self.tempo.set_bpm(pl.bpm)
             self.tempo.anchor = pl.loop_t0 if pl.loop_t0 else time.monotonic()
-            self.live_bpm.blockSignals(True)
-            self.live_bpm.setValue(self.tempo.bpm)
-            self.live_bpm.blockSignals(False)
+            self._show_live_bpm()
+            self._link_push(pl.bpm)                    # and so does the Link session
         sec = self._perf_playing
         pos = pl.pos_s()
         bar = int(pos * pl.bpm / 60.0 / 4) + 1
@@ -4267,7 +4314,10 @@ class Main(QMainWindow):
     def _update_live_meter(self):
         self.live_level.setValue(int(100 * self.live.loud))
         an = self.live.analyzer
-        if an is not None and self.live_auto.isChecked():
+        if self._link_active():
+            root = NOTE_NAMES[an.root] if an is not None and an.root >= 0 else "-"
+            self.live_status.setText(f"{self.tempo.bpm:.1f} bpm from link, root {root}")
+        elif an is not None and self.live_auto.isChecked():
             bpm = f"{an.bpm:.0f} bpm" if an.bpm else "listening..."
             key = NOTE_NAMES[an.root] if an.root >= 0 else "-"
             self.live_status.setText(f"{bpm}, root {key}")
@@ -4281,12 +4331,11 @@ class Main(QMainWindow):
         if an is None:
             return
         if an.bpm and an.beat_time is not None \
-                and an.beat_time != self._last_beat_sync:
+                and an.beat_time != self._last_beat_sync \
+                and not self._link_active():          # Link owns tempo and beat then
             self._last_beat_sync = an.beat_time
             self.tempo.align(an.bpm, an.beat_time)
-            self.live_bpm.blockSignals(True)
-            self.live_bpm.setValue(self.tempo.bpm)
-            self.live_bpm.blockSignals(False)
+            self._show_live_bpm()
         if self.LIVE_AUTO_DROPS and an.drop_time is not None \
                 and an.drop_time != self._last_auto_drop:
             self._last_auto_drop = an.drop_time
@@ -4314,6 +4363,19 @@ class Main(QMainWindow):
 
     def _live_bpm_edited(self, bpm):
         self.tempo.set_bpm(bpm)
+        self._link_push(bpm)
+
+    def _song_bpm(self):
+        """The clock's tempo for a render: whole when it is (clean file
+        names), else to a tenth."""
+        bpm = round(self.tempo.bpm, 1)
+        return int(bpm) if bpm == int(bpm) else bpm
+
+    def _show_live_bpm(self):
+        """The bpm box shows the clock, without that counting as an edit."""
+        self.live_bpm.blockSignals(True)
+        self.live_bpm.setValue(self.tempo.bpm)
+        self.live_bpm.blockSignals(False)
 
     def tap_tempo(self):
         """T: one tap on the beat. The first tap of a series is the downbeat,
@@ -4323,13 +4385,66 @@ class Main(QMainWindow):
             self.log.appendPlainText("live: auto off, following your taps")
         n = self.tempo.tap()
         if n >= 2:
-            self.live_bpm.blockSignals(True)
-            self.live_bpm.setValue(self.tempo.bpm)
-            self.live_bpm.blockSignals(False)
+            self._show_live_bpm()
+            self._link_push(self.tempo.bpm)
 
     def live_downbeat(self):
         """D: the bar starts now, tempo unchanged."""
         self.tempo.downbeat()
+
+    # ------------------------------------------------------------ Ableton Link
+    def _link_active(self):
+        return self.link is not None and self.link_on.isChecked()
+
+    def _link_toggled(self, on):
+        """The General tab's Link button: join or leave the Link session. Alone
+        our tempo is the session's; joining peers, theirs comes in (Link's
+        rule: the session that is already there wins) and shows in the bpm
+        box within a poll."""
+        if self.link is None:
+            return
+        self.settings.setValue("clock/link", on)
+        self.link_on.setText("on" if on else "off")
+        if on:
+            self.link.tempo = self.tempo.bpm
+            self.link.enabled = True
+            self._link_ticks = 0
+            self._link_timer.start(50)
+            self.link_status.setText("joining...")
+            self.log.appendPlainText(f"link: on, {self.tempo.bpm:.1f} bpm, looking for peers")
+        else:
+            self._link_timer.stop()
+            self.link.enabled = False
+            self.link_status.setText("off")
+            self.log.appendPlainText("link: off")
+
+    def _link_push(self, bpm):
+        """Our tempo changed (a tap, the box, a section): the session follows."""
+        if self._link_active() and abs(self.link.tempo - bpm) > 0.01:
+            self.link.tempo = bpm
+
+    def _poll_link(self):
+        """Every 50 ms while Link is on: the session's tempo sets the live
+        clock (the bar position is kept: tempo only), unless a section
+        plays, whose loop is the clock's master then (its tempo is pushed
+        out on every swap instead). The status shows the peers."""
+        if not self._link_active():
+            return
+        bpm, _beat, _phase = self.link.snapshot()
+        la = self.through
+        pl = la.player if la is not None and la.running else None
+        if (pl is None or not pl.playing) and abs(bpm - self.tempo.bpm) > 0.01:
+            self.tempo.set_bpm(bpm)
+            self._show_live_bpm()
+        self._link_ticks += 1
+        if self._link_ticks % 4 == 0:
+            peers = self.link.peers
+            if peers != self._link_peers:
+                self._link_peers = peers
+                self.log.appendPlainText(f"link: {peers} peer{'s' if peers != 1 else ''}, {bpm:.1f} bpm")
+            who = "no peers, the session is ours" if peers == 0 \
+                else f"{peers} peer{'s' if peers != 1 else ''}"
+            self.link_status.setText(f"{who}  ·  {bpm:.1f} bpm")
 
     def _on_live_section(self, idx, pos):
         """The live clock crossed into pseudo-section idx: swap the clip
@@ -4500,6 +4615,9 @@ class Main(QMainWindow):
             self._sec_bounds = [int(s["start_sec"] * 1000)
                                 for s in self._sections]
             self._beat_ms = 60000.0 / meta["bpm"]
+            self.tempo.set_bpm(meta["bpm"])            # the BPM box shows what plays
+            self._show_live_bpm()
+            self._link_push(self.tempo.bpm)
             plan = FollowPlan(meta.get("events") or [],
                               meta.get("video_sources") or {})
             self._follow = plan if plan.n else None
@@ -4953,6 +5071,8 @@ class Main(QMainWindow):
         self._vst_watch_stop.set()
         if getattr(self, "midi", None) is not None:
             self.midi.close_all()
+        if self.link is not None:
+            self.link.close()
         if getattr(self.backdrop, "source", None) is not None:
             self.backdrop.source.stop()
         if self.worker and self.worker.isRunning():

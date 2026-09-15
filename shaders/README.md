@@ -54,7 +54,6 @@ give `iDrop` a moment.
 | `plasma.frag` | slow plasma warping the picture in its own colours |
 | `pointcloud.frag` | LiDAR-style dot cloud with fake depth and parallax |
 | `relief.frag` | embossed relief lit by a light orbiting once per bar |
-| `skyline.frag` | skyline equaliser, each column rising to its own brightness |
 | `slitscan.frag` | slit-scan sweeping once per bar, freezing motion into streaks |
 | `strips.frag` | a real slice of the picture, a vertical strip about 100 px wide and the full height, tiled across the screen; a new random strip every beat, wider when loud, a third of the screen on a drop (replaces the picture) |
 | `sparks.frag` | tiny particles born on bright spots, drifting up and fading |

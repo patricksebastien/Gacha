@@ -11,6 +11,8 @@ python-rtmidi
 psutil
 # realtime audio I/O (PortAudio); Linux also needs the library: apt install libportaudio2
 sounddevice
+# Ableton Link (the General tab's Live clock rows): prebuilt wheels for Windows, macOS and Linux
+aalink
 # ffmpeg itself is a system install (see README); this gives a fallback
 # static ffmpeg binary when none is on PATH (no ffprobe, so gacha_transcode.py
 # still wants the system one)
