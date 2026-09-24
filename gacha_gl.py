@@ -111,6 +111,8 @@ uniform float uKaleido, uRepeat, uRepeatK, uRepeatFrac, uSwell;
 uniform float uGExposure, uGBlack, uGGamma, uGContrast, uGSat, uGWarm, uGTint, uGSharpen;
 uniform float uAB;             // 0 = the live picture, 1 = the take frame
 uniform float uABMode;         // 0 mix, 1 add, 2 screen (same order as the shader layer)
+uniform vec2 uTakeScale;       // the B layer's cover-crop against the video's: a 16:9
+                               // webcam over a 5:4 tape is cropped, not squeezed
 
 // the source pixel: the live picture dissolved toward the take frame by
 // uAB, the picture's side of the A/B pedal. Every mode is pure tape at 0
@@ -121,7 +123,7 @@ uniform float uABMode;         // 0 mix, 1 add, 2 screen (same order as the shad
 vec3 src(vec2 p) {
     vec3 a = texture(uVideo, p).rgb;
     if (uAB <= 0.0) return a;
-    vec3 b = texture(uTake, p).rgb;
+    vec3 b = texture(uTake, (p - 0.5) * uTakeScale + 0.5).rgb;
     if (uABMode < 0.5) return mix(a, b, uAB);
     a *= min(1.0, 2.0 * (1.0 - uAB));
     b *= min(1.0, 2.0 * uAB);
@@ -342,6 +344,10 @@ class GLBackdrop(QOpenGLWidget):
         self.state_fn = None
         self.current = None
         self.input = None                # live capture device while video in is on
+        self.source2 = None              # a second capture device (the webcam), kept open
+        self.input2 = None               # its device string while it is on
+        self.second_on_b = False         # the second input is the B layer, in place of the take frames
+        self._src_error2 = None
         self.videos_fn, self.default_video = videos_fn, default_video
         self._start_random = False
         self._shown = None               # Frame now on the video texture
@@ -395,6 +401,40 @@ class GLBackdrop(QOpenGLWidget):
             self.source.open(device, options=options)
         elif self.current is not None:
             self.source.open(self.current, random_start=True)
+
+    def set_second(self, device, options=None):
+        """A second capture device (a webcam next to the VHS grabber) opened
+        alongside the first. With `set_second_on_b` it is the B side of the
+        A/B pedal, where the section's take frames go otherwise, so the
+        pedal dissolves the tape into the webcam. None closes it; the first
+        input is untouched."""
+        self.input2 = device
+        if device:
+            if self.source2 is None:
+                self.source2 = VideoSource(parent=self)
+            self._src_error2 = None
+            self.source2.open(device, options=options)
+        elif self.source2 is not None:
+            self.source2.close()
+
+    def set_second_on_b(self, on):
+        """On: the second input's picture is the B layer under the pedal
+        (`override_ab`) whenever no take frame or burst is set as `override`.
+        Off: B is the take frames again. Without a second device nothing
+        changes."""
+        self.second_on_b = bool(on)
+
+    def second_frame(self):
+        """The second input's latest Frame while it stands in for the take
+        frames, else None."""
+        if self.second_on_b and self.input2 and self.source2 is not None:
+            return self.source2.latest()
+        return None
+
+    def live_source(self):
+        """The capture device behind the A picture, or None when a clip is."""
+        src = self.source
+        return src if (self.input and src is not None and src.is_live) else None
 
     def set_video(self, path, random_start=False):
         if self.source is None or self.input:
@@ -571,6 +611,20 @@ class GLBackdrop(QOpenGLWidget):
                                 GL_UNSIGNED_BYTE, img.constBits())
         return tex, size
 
+    def _take_scale(self, W, H, same):
+        """How the B texture's cover-crop relates to the video's, so both fill
+        the widget by their own aspect: (1, 1) when they share it."""
+        if same:
+            return (1.0, 1.0)
+
+        def cover(w, h):
+            if w <= 0 or h <= 0:
+                return (1.0, 1.0)
+            wr, ir = W / max(1, H), w / h
+            return (wr / ir, 1.0) if ir > wr else (1.0, ir / wr)
+        sv, st = cover(*self._vid_size), cover(*self._take_size)
+        return (st[0] / sv[0], st[1] / sv[1])
+
     def _bind_tex(self, unit, tex_id):
         self.gl.glActiveTexture(GL_TEXTURE0 + unit)
         self.gl.glBindTexture(GL_TEXTURE_2D, tex_id)
@@ -592,29 +646,36 @@ class GLBackdrop(QOpenGLWidget):
         gl = self.gl
         st = (self.state_fn() if self.state_fn else None) or {}
         self._frozen = bool(st.get("repeat") or st.get("freeze"))
-        if self.source is not None:
-            if self.source.error and self.source.error != self._src_error:
-                self._src_error = self.source.error
-                self.log.append(f"video: {self._src_error}")
+        src = self.source
+        for s, attr, who in ((self.source, "_src_error", "video"),
+                             (self.source2, "_src_error2", "video input 2")):
+            if s is not None and s.error and s.error != getattr(self, attr):
+                setattr(self, attr, s.error)
+                self.log.append(f"{who}: {s.error}")
+        # the B layer: a take frame or burst set by the window, else the
+        # second input (the webcam) when it stands in for them
+        ov = self.override
+        if ov is None:
+            ov = self.second_frame()
+        if ov is not None and ov.img is not None and ov is not self._shown_ov \
+                and not self._frozen:
+            self._upload_take(ov.img)
+            self._shown_ov = ov
+        if src is not None:
             rev = st.get("reverse")              # a real rewind, any speed
             if "speed" in st:                    # the song's sample timeline
-                self.source.set_speed(float(st["speed"]))
+                src.set_speed(float(st["speed"]))
             else:
-                self.source.set_speed(-float(rev) if rev else 1.0)
-            fr = self.source.latest()
+                src.set_speed(-float(rev) if rev else 1.0)
+            fr = src.latest()
             if fr is not None and fr.img is not None and fr is not self._shown \
                     and not self._frozen:
                 self._upload_frame(fr.img)
                 self._shown = fr                 # keeps fr.arr alive with it
-            ov = self.override                   # the section's take frame, if any
-            if ov is not None and ov.img is not None and ov is not self._shown_ov \
-                    and not self._frozen:
-                self._upload_take(ov.img)
-                self._shown_ov = ov
-        # the picture's A/B: 0 = the live picture, 1 = the take frame; with
-        # no take frame to show, or one texture still missing, no dissolve
+        # the picture's A/B: 0 = the live picture, 1 = the B layer (take frame
+        # or webcam); with nothing on B, or one texture still missing, no dissolve
         vid, take = self._video_tex, self._take_tex
-        ab = min(1.0, max(0.0, float(self.override_ab))) if self.override is not None else 0.0
+        ab = min(1.0, max(0.0, float(self.override_ab))) if ov is not None else 0.0
         if vid is None:
             vid, self._vid_size = take, self._take_size   # nothing live yet: the take alone
             ab = 1.0 if take is not None else 0.0
@@ -646,6 +707,7 @@ class GLBackdrop(QOpenGLWidget):
         p.setUniformValue1i("uTake", 2)
         p.setUniformValue1f("uAB", ab)
         p.setUniformValue1f("uABMode", float(self.override_blend))
+        p.setUniformValue("uTakeScale", QVector2D(*self._take_scale(W, H, take is vid)))
         p.setUniformValue("uRes", QVector2D(W, H))
         p.setUniformValue("uVidRes", QVector2D(*self._vid_size))
         p.setUniformValue1f("uTime", t)

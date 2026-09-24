@@ -4,11 +4,14 @@ gacha_section.py — one section at a time, from material in memory, for the
 live show. Where gacha_engine.compose() writes a whole song to disk, this
 renders a single 8-bar loop out of the takes (or any bank of stereo arrays)
 as separate stems the performer switches on stage: drums, layers, chops,
-events. Every stem loops seamlessly (tails wrap around to the start), and
+events. The sub bass the songs carry is here too, one note per bar on the
+first kick, on the root the layers land on (into the drums stem, as in a
+song). Every stem loops seamlessly (tails wrap around to the start), and
 the same event timeline the songs carry is kept, so the picture can show
 the frames each sound was cut from.
 
     mat = Material(bank, seed)                    # carves the drum kits once
+    mat.k = knobs.sanitized()                     # the Generate tab, as of this press
     sec = render_section(mat, seed=1, bpm=124, bars=8, kind="groove")
     sec.stems["drums"]                            # (n, 2) float32 at 44.1 kHz
     sec.events                                    # [t, src, off, dur, rate, role]
@@ -22,6 +25,7 @@ material is carved.
 import random
 
 import numpy as np
+from scipy.signal import resample_poly
 
 import gacha_engine as E
 from gacha_engine import SR
@@ -67,11 +71,14 @@ class Material:
 
 
 class Section:
-    def __init__(self, kind, bpm, bars, seed, stems, events, notes):
+    def __init__(self, kind, bpm, bars, seed, stems, events, notes, root=None,
+                 drum_style=None):
         self.kind, self.bpm, self.bars, self.seed = kind, bpm, bars, seed
+        self.drum_style = drum_style    # the style the drums were patterned in
         self.stems = stems              # {stem: (n, 2) float32 @ SR}, all n equal
         self.events = events            # [[t, src, off, dur, rate, role]] t in s
         self.notes = notes              # human-readable what-went-in
+        self.root = root                # note name of the layers ("A#"), for the sub and the tint
         self.n = len(next(iter(stems.values())))
 
     @property
@@ -148,6 +155,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         build_from.setdefault("ohat", build_from.get("hihat", 0))
     active = [r for r in active if gains[r] > 0 and mat.kit.get(r)]
     buf = stems["drums"]
+    kick_hits = []                                    # (pos, bar, step) for the sub
     for bi in range(bars):
         bar_start = int(bi * bar * SR)
         bar_pats = {r: (E.mutate(rng, pats[r], k.mutation_amount)
@@ -170,6 +178,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                     pos += int(swing)
                 pos += E.humanize_time(rng, k.humanize)
                 vel = E.humanize_vel(rng, vel, s, k.humanize)
+                if role == "kick":
+                    kick_hits.append((max(0, pos), bi, s))
                 vi = rng.randrange(len(mat.kit[role]))
                 hit = E.pick_layer(mat.kit[role][vi], vel)
                 ksrc, onset = mat.kit_src[role][vi]
@@ -280,12 +290,99 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         ev(pos, shot["src"], shot["off"], shot["dur"], shot["rate"], "oneshot")
         notes.append(f"event <- {shot['src']}")
 
+    # ---- root of the section (from the layers), then the sub bass: one
+    #      note per bar on its first kick, as in a song. Its own rng, so
+    #      toggling the sub leaves the rest of the section unchanged ----
+    root_rng = random.Random(seed ^ 0x5B)
+    pc = section_root(stems["layers"])
+    if pc is None:
+        pc = root_rng.randrange(12)
+    root = E.NOTE_NAMES[pc]
+    if k.sub_level > 0 and kick_hits:
+        first_kick = {}                              # bar -> (pos, step)
+        for pos, bar_i, s in kick_hits:
+            if bar_i not in first_kick or s < first_kick[bar_i][1]:
+                first_kick[bar_i] = (pos, s)
+        starts = []
+        for bar_i in sorted(first_kick):
+            if root_rng.random() < k.sub_chance:     # weighted occurrence
+                midi = E.sub_midi(pc)
+                if root_rng.random() < 0.2:          # some bars sit on the fifth
+                    midi = midi + 7 if midi + 7 <= E.SUB_HI else midi - 5
+                starts.append((first_kick[bar_i][0], midi))
+        hits = []
+        note_len = int((beat + k.sub_release) * SR)  # one-beat hold + release
+        for i, (pos, midi) in enumerate(starts):
+            # the next note (the first one again, a loop later) cuts this one
+            nxt = starts[i + 1][0] if i + 1 < len(starts) else starts[0][0] + n
+            length = min(note_len, nxt - pos - int(0.01 * SR))
+            if length > int(0.05 * SR):
+                hits.append((pos, midi, length))
+        if hits:
+            # rendered a note longer than the loop, the tail folds onto the start
+            sub = E.render_sub(hits, n + note_len, k.sub_phaser, k.sub_pan, k.sub_release)
+            sub[:note_len] += sub[n:n + note_len]
+            sub = sub[:n]
+            active = np.abs(sub).sum(axis=1) > 1e-6
+            if active.any():
+                mix = stems["drums"] + stems["layers"] + stems["chops"]
+                ref = E.rms(mix) or E.rms(stems["drums"])
+                sub *= k.sub_level * ref / E.rms(sub[active])
+                stems["drums"] += sub
+                notes.append(f"sub {root}: {len(hits)} notes over {len(first_kick)} bars")
+
     for s in STEMS:                                  # headroom, no clipping
         peak = float(np.abs(stems[s]).max()) if stems[s].size else 0.0
         if peak > 0.98:
             stems[s] *= 0.98 / peak
     events.sort(key=lambda e: e[0])
-    return Section(kind, bpm, bars, seed, stems, events, notes)
+    return Section(kind, bpm, bars, seed, stems, events, notes, root=root,
+                   drum_style=drum_style)
+
+
+SECTION_ROOT_MAX_S = 8.0     # the chroma looks at this much of the layers at most
+
+
+def section_root(layers):
+    """Dominant pitch class of the layers stem (E.section_root, on no more
+    than SECTION_ROOT_MAX_S seconds so a render stays quick), or None when
+    the layers are silent."""
+    return E.section_root(layers[: int(SECTION_ROOT_MAX_S * SR)])
+
+
+def cut_burst(audio, sr, off_s, len_s, out_sr=None, fade_s=0.003):
+    """`len_s` seconds of `audio` ((n, 2) float32 at `sr`) from `off_s`,
+    short fades on both ends so it never clicks, as a (2, n) float32 block
+    at `out_sr` (default `sr`). The tape at its own level: no gain, no fx."""
+    n = max(2, int(round(len_s * sr)))
+    i0 = int(min(max(0.0, off_s) * sr, max(0, len(audio) - n)))
+    clip = np.array(audio[i0:i0 + n], dtype=np.float32, copy=True)
+    f = int(min(fade_s * sr, len(clip) // 2))
+    if f > 0:
+        ramp = np.linspace(0.0, 1.0, f, dtype=np.float32)[:, None]
+        clip[:f] *= ramp
+        clip[-f:] *= ramp[::-1]
+    if out_sr and out_sr != sr:
+        from math import gcd
+        g = gcd(int(out_sr), int(sr))
+        clip = resample_poly(clip, int(out_sr) // g, int(sr) // g, axis=0).astype(np.float32)
+    return np.ascontiguousarray(clip.T)
+
+
+def render_swell(mat, seed, bpm, bars=1, gain=0.45):
+    """The song's reverse cymbal swell for a live break: a bar long at
+    `bpm`, from the kit's ride when there is one, else from half a second
+    of a random bank clip; (n, 2) float32 at SR, or None with no material."""
+    rng = random.Random(seed)
+    length = int(bars * 4 * 60.0 / bpm * SR)
+    if mat.kit.get("ride"):
+        hit = E.pick_layer(rng.choice(mat.kit["ride"]), 1.0)
+    elif mat.names:
+        clip = mat.bank[rng.choice(mat.names)]
+        hit = E.random_window(rng, clip, min(len(clip), SR // 2), True)
+    else:
+        return None
+    return (E.cymbal_swell(rng, hit, length) * gain).astype(np.float32)
 
 
 def render_oneshot(mat, seed, beat=0.5, pan_events=0.5):

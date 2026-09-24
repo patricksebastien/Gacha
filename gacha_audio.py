@@ -65,6 +65,7 @@ from collections import deque
 import contextlib
 import math
 import os
+import random
 import threading
 from pathlib import Path
 
@@ -179,7 +180,17 @@ def _device_index(name, kind, api=None):
 class SectionPlayer:
     """Looping stems at the stream's rate, swapped on a bar, plus one-shots.
     Everything here is set from the GUI thread and read in the audio
-    thread; swaps go through `pending` and happen on a bar boundary."""
+    thread; swaps go through `pending` and happen on a bar boundary.
+
+    A break (`fill()`): from the next beat to the end of the bar, at least
+    two beats, the loop is taken over, and a section queued meanwhile drops
+    in on that bar. Two kinds, as in a generated song's run-up to a drop:
+    "glitch" throws sixteenths of the bar that was playing about, some
+    backwards, a stutter roll on the last beat and a gap right before the
+    bar; "break" is the song's own transition, a beat-repeat of the bar's
+    first slice (accelerating, steady or halving), a gap of silence before
+    the drop, and a reverse cymbal swell handed in by the GUI rising under
+    it. `fill_state()` tells the picture what is happening."""
 
     def __init__(self, sr):
         self.sr = sr
@@ -189,44 +200,191 @@ class SectionPlayer:
         self.bars = 8
         self.n = 0                           # loop length in frames
         self.pos = 0                         # play position in frames
-        self.pending = None                  # (stems, events, bpm, bars) for the next bar
+        self.pending = None                  # (stems, events, bpm, bars, bar_t0) for the next bar
+        self._lead = 0                       # frames of silence before a timed start
         self.on = {"drums": True, "layers": True, "chops": True, "events": True}
         self._gain_now = {}                  # stem -> gain reached (ramps)
         self.shots = []                      # [(clip (2, n), frames played)]
         self.shot_queue = []                 # clips waiting for the next beat
+        self.bursts = []                     # [(clip, played)]: now, and not under A/B
         self.loop_t0 = None                  # monotonic time the loop last wrapped
         self.swapped = False                 # a pending section just went live
         self.beat_frames = 0
+        self.fill_armed = None               # (kind, swell): a break asked, next beat
+        self._fill = None                    # dict: the break playing, see _fill_start
+        self.dropped = False                 # a break just ended in a swap (GUI resets)
 
     @property
     def playing(self):
         return self.stems is not None
 
-    def queue(self, stems, events, bpm, bars):
-        self.pending = (stems, events, bpm, bars)
+    @property
+    def filling(self):
+        return self._fill is not None
+
+    def fill(self, kind="glitch", swell=None):
+        """A break of `kind` ("glitch" or "break"), from the next beat: see
+        the class note. `swell`: a (2, n) float32 clip at sr to rise into the
+        drop (the break kind), its end on the bar. No-op with no section."""
+        if self.playing:
+            self.fill_armed = (kind, swell)
+
+    def fill_state(self):
+        """What the break is doing now, for the picture: {kind, k (retrigger
+        count so far), frac (0..1 into the slice), gap, swell (0..1 up to the
+        drop)}, or None."""
+        f = self._fill
+        if f is None:
+            return None
+        k = min(f["k"], len(f["idx"]) - 1)
+        sw = 0.0
+        if f["swell"] is not None and k >= f["swell_k0"]:
+            sw = (k - f["swell_k0"]) / max(1, f["swell"].shape[1])
+        return {"kind": f["kind"], "k": int(f["retrig"][k]), "frac": float(f["frac"][k]),
+                "gap": bool(f["retrig"][k] < 0), "swell": min(1.0, sw)}
+
+    # ---- the break's index map, built when it starts (audio thread)
+    def _fill_map(self, start, beats, rng, kind):
+        """(idx, gain, retrig, frac) for `beats` beats from `start`, drawn
+        from the bar `start` sits in. glitch: random sixteenths, some
+        reversed, repeats, the last beat a stutter roll, a sixteenth of
+        silence. break: a beat-repeat of the bar's first slice, per beat
+        1/8 1/16 1/32 1/64 (accelerate), 1/16 throughout (stutter) or 1/4
+        1/8 1/16 1/32 (halving), then half a beat or a beat of silence.
+        retrig counts the slices (-1 in the gap), frac runs 0..1 in each."""
+        bf, n = self.beat_frames, self.n
+        sx = max(1, bf // 4)                            # a sixteenth
+        bar0 = (start // (4 * bf)) * 4 * bf
+        idx, gain, retrig, frac = [], [], [], []
+        count = [0]
+
+        def piece(src, m, rev=False):
+            a = np.arange(src, src + m) if not rev else np.arange(src + m - 1, src - 1, -1)
+            idx.append(a % n)
+            g = np.ones(m, np.float32)
+            f = min(int(0.002 * self.sr), m // 2)      # 2 ms fades: no clicks
+            if f:
+                g[:f] = np.linspace(0.0, 1.0, f, dtype=np.float32)
+                g[-f:] = np.linspace(1.0, 0.0, f, dtype=np.float32)
+            gain.append(g)
+            retrig.append(np.full(m, count[0], np.int32))
+            frac.append(np.linspace(0.0, 1.0, m, endpoint=False, dtype=np.float32))
+            count[0] += 1
+
+        def silence(m):
+            idx.append(np.zeros(m, np.int64))
+            gain.append(np.zeros(m, np.float32))
+            retrig.append(np.full(m, -1, np.int32))
+            frac.append(np.zeros(m, np.float32))
+
+        if kind == "break":
+            flavour = rng.choice(["accelerate", "accelerate", "stutter", "halving"])
+            full = {"accelerate": [1, 2, 4, 8, 16], "halving": [1, 1, 2, 4, 8],
+                    "stutter": [4, 4, 4, 4, 4]}[flavour]
+            divs = full[-beats:] if beats <= 4 or flavour != "accelerate" else full
+            if beats == 2 and flavour == "accelerate":
+                divs = [4, 8]                           # two beats: 1/16 then 1/32
+            gap = int(bf * (0.5 if beats <= 2 else rng.choice([0.5, 1.0])))
+            total = beats * bf - gap
+            for div in divs:
+                m = max(1, bf // div)
+                for _ in range(div):
+                    if sum(len(a) for a in idx) + m > total:
+                        break
+                    piece(bar0, m)
+            silence(gap)
+        else:
+            prev = None
+            for _ in range(4 * (beats - 1)):            # every beat but the last
+                if prev is not None and rng.random() < 0.35:
+                    src = prev                          # stutter: the same slice again
+                else:
+                    src = bar0 + rng.randrange(16) * sx
+                piece(src, sx, rev=rng.random() < 0.3)
+                prev = src
+            piece(bar0, sx)                             # last beat: the roll
+            for _ in range(2):
+                piece(bar0, sx // 2)
+            for _ in range(4):
+                piece(bar0, sx // 4)
+            silence(sx)                                 # the gap before the drop
+        idx, gain = np.concatenate(idx), np.concatenate(gain)
+        retrig, frac = np.concatenate(retrig), np.concatenate(frac)
+        want = beats * bf                               # exactly to the bar
+        if len(idx) < want:
+            pad = want - len(idx)
+            idx = np.concatenate([idx, np.zeros(pad, np.int64)])
+            gain = np.concatenate([gain, np.zeros(pad, np.float32)])
+            retrig = np.concatenate([retrig, np.full(pad, -1, np.int32)])
+            frac = np.concatenate([frac, np.zeros(pad, np.float32)])
+        return idx[:want], gain[:want], retrig[:want], frac[:want]
+
+    def _fill_start(self, i0):
+        """The next beat has just passed at `i0`: the break runs from here to
+        the bar boundary at least two beats away."""
+        kind, swell = self.fill_armed
+        bf = self.beat_frames
+        beat = i0 // bf                                 # the beat we are in
+        left = 4 - (beat % 4)                           # beats to the bar, this one included
+        beats = left if left >= 2 else left + 4
+        end = (beat + beats) * bf                       # the bar boundary, in loop frames
+        idx, gain, retrig, frac = self._fill_map(beat * bf, beats, random.Random(), kind)
+        late = i0 - beat * bf                           # the block boundary: a few ms in
+        idx, gain, retrig, frac = idx[late:], gain[late:], retrig[late:], frac[late:]
+        k0 = 0
+        if swell is not None:                           # its end on the drop
+            if swell.shape[1] > len(idx):
+                swell = swell[:, swell.shape[1] - len(idx):]
+            k0 = len(idx) - swell.shape[1]
+        self._fill = {"idx": idx, "gain": gain, "retrig": retrig, "frac": frac, "k": 0,
+                      "end": end, "kind": kind, "swell": swell, "swell_k0": k0}
+        self.fill_armed = None
+
+    def queue(self, stems, events, bpm, bars, bar_t0=None):
+        """The next section: on the loop's next bar while one plays, else
+        from the next block, or, `bar_t0` given (monotonic seconds, the
+        Link session's bar), exactly then: silence up to it inside the
+        block, or, when it has just passed, the loop entered that far in."""
+        self.pending = (stems, events, bpm, bars, bar_t0)
+
+    def waiting_for(self):
+        """The bar time a queued section waits for, or None."""
+        p = self.pending
+        return p[4] if p is not None and p[0] != "clear" and self.stems is None else None
 
     def clear(self):
         self.pending = ("clear",)
 
-    def fire(self, clip):
+    def fire(self, clip, now=False):
         """A one-shot (2, n) float32 at sr, on the next beat (or now if no
-        section plays)."""
-        self.shot_queue.append(clip)
+        section plays). `now`: a burst, played from the next block on and
+        mixed outside the A/B crossfade, so it is heard over the tape too."""
+        if now:
+            self.bursts.append((clip, 0))
+        else:
+            self.shot_queue.append(clip)
 
     def pos_s(self):
         return self.pos / self.sr
 
-    def _swap(self):
+    def _swap(self, now=None, bs=0):
         p, self.pending = self.pending, None
         if p[0] == "clear":
             self.stems, self.events, self.n, self.pos = None, [], 0, 0
             return
-        stems, events, bpm, bars = p
+        stems, events, bpm, bars, bar_t0 = p
+        from_silence = self.stems is None
         self.stems, self.events, self.bpm, self.bars = stems, events, bpm, bars
         self.n = next(iter(stems.values())).shape[1]
-        self.pos = 0
+        self.pos, self._lead = 0, 0
         self.beat_frames = int(round(60.0 / bpm * self.sr))
-        self.loop_t0 = time.monotonic()
+        self.loop_t0 = time.monotonic() if now is None else now
+        if bar_t0 is not None and from_silence and now is not None:
+            if bar_t0 > now:                          # inside this block: silence first
+                self._lead = min(bs, int(round((bar_t0 - now) * self.sr)))
+            else:                                     # the bar just passed: enter late
+                self.pos = int((now - bar_t0) * self.sr) % self.n
+            self.loop_t0 = now + (self._lead - self.pos) / self.sr
         self.swapped = True
 
     def block(self, bs, now, ramp):
@@ -235,22 +393,36 @@ class SectionPlayer:
         racks. Empty dict when nothing plays."""
         out = {}
         bar_f = 4 * self.beat_frames
-        if self.pending is not None and (self.stems is None or self.pos == 0):
-            self._swap()
-        if self.stems is not None:
+        breaking = self.fill_armed or self._fill is not None
+        if self.pending is not None and (self.stems is None or (self.pos == 0 and not breaking)):
+            wait = self.waiting_for()
+            if wait is None or now + bs / self.sr >= wait:   # a timed start: not yet
+                self._swap(now, bs)
+        if self._fill is not None:
+            on_beat = self._fill_block(out, bs)
+        elif self.stems is not None:
+            lead = min(self._lead, bs)                # a timed start: silence up to it
+            self._lead -= lead
+            m = bs - lead
             i0 = self.pos
-            idx = (np.arange(bs) + i0) % self.n
+            idx = (np.arange(m) + i0) % self.n
             for name, data in self.stems.items():
-                out[name] = data[:, idx]
-            self.pos = (i0 + bs) % self.n
-            if i0 + bs >= self.n:                     # wrapped inside this block
-                self.loop_t0 = now + (self.n - i0) / self.sr
+                blk = data[:, idx]
+                if lead:
+                    blk = np.concatenate([np.zeros((2, lead), np.float32), blk], axis=1)
+                out[name] = blk
+            self.pos = (i0 + m) % self.n
+            if i0 + m >= self.n:                      # wrapped inside this block
+                self.loop_t0 = now + (self.n - i0 + lead) / self.sr
             # a bar boundary inside this block: a pending section comes in
             # at the next block (5 ms off at most), its position on the bar
-            if self.pending is not None and bar_f and (i0 // bar_f) != ((i0 + bs) // bar_f):
+            if self.pending is not None and bar_f and not breaking \
+                    and (i0 // bar_f) != ((i0 + m) // bar_f):
                 self.pos = 0                          # so the swap lands on the bar
-            on_beat = (i0 // self.beat_frames) != ((i0 + bs) // self.beat_frames) \
+            on_beat = (i0 // self.beat_frames) != ((i0 + m) // self.beat_frames) \
                 if self.beat_frames else True
+            if self.fill_armed and on_beat and self.beat_frames:
+                self._fill_start(self.pos)            # the break, from the next block
         else:
             on_beat = True
         if self.shot_queue and on_beat:
@@ -267,7 +439,59 @@ class SectionPlayer:
                     keep.append((clip, k + n))
             out["events"] = ev
         self.shots = keep
+        if self.bursts:
+            out["burst"], self.bursts = self._sum_clips(self.bursts, bs)
         return out
+
+    def _fill_block(self, out, bs):
+        """One block of the break into `out`; `pos` follows the slice that
+        sounds, so the picture glitches with it. At the end: the pending
+        section, or the loop on from the bar. Returns whether a beat passed."""
+        f = self._fill
+        idx, gain, k, end = f["idx"], f["gain"], f["k"], f["end"]
+        m = min(bs, len(idx) - k)
+        sl, g = idx[k:k + m], gain[k:k + m]
+        for name, data in self.stems.items():
+            blk = np.zeros((2, bs), np.float32)
+            blk[:, :m] = data[:, sl] * g
+            out[name] = blk
+        swell = f["swell"]
+        if swell is not None and k + m > f["swell_k0"]:   # the swell, under A/B
+            a = max(0, k - f["swell_k0"])                  # like the stems
+            b = min(swell.shape[1], k + m - f["swell_k0"])
+            if b > a:
+                ev = out.get("events")
+                ev = np.zeros((2, bs), np.float32) if ev is None else ev
+                o = max(0, f["swell_k0"] - k)
+                ev[:, o:o + b - a] += swell[:, a:b]
+                out["events"] = ev
+        on_beat = (k // self.beat_frames) != ((k + m) // self.beat_frames)
+        if k + m < len(idx):
+            f["k"] = k + m
+            self.pos = int(sl[-1]) if g[-1] > 0 else self.pos
+        else:                                         # done: the drop
+            self._fill = None
+            self.pos = end % self.n
+            if self.pending is not None:
+                self._swap()
+                self.dropped = True
+            elif self.pos == 0:
+                self.loop_t0 = time.monotonic()
+            on_beat = True
+        return on_beat
+
+    @staticmethod
+    def _sum_clips(clips, bs):
+        """Mix the next `bs` frames of every (clip, played) into one (2, bs)
+        block; returns it and the clips still sounding."""
+        blk = np.zeros((2, bs), np.float32)
+        keep = []
+        for clip, k in clips:
+            n = min(bs, clip.shape[1] - k)
+            blk[:, :n] += clip[:, k:k + n]
+            if k + n < clip.shape[1]:
+                keep.append((clip, k + n))
+        return blk, keep
 
 
 class SongPlayer:
@@ -400,6 +624,8 @@ class LiveAudio:
         self.mute = False
         self.delay_ms = 0.0                  # sync: hold the sound back this much
         self.ab = 0.0                        # 0 = tape through only, 1 = section only
+        self.hold_tape = False               # the pedal leaves the tape's sound whole
+                                             # (the webcam on B has none to bring in)
         self.player = SectionPlayer(self.sr)
         self.on = self.player.on             # stems in/out, for section and song alike
         self.song = SongPlayer(self.sr, self.on)
@@ -791,6 +1017,12 @@ class LiveAudio:
         self._ramp = np.linspace(0.0, 1.0, bs, dtype=np.float32)
         self._ar = np.arange(bs)
         self._ab_now = float(self.ab)
+        self._tw_now = self._tape_weight(self._ab_now)
+
+    def _tape_weight(self, ab):
+        """The tape's gain under the pedal: equal power against the section,
+        or 1 while hold_tape keeps its sound whole."""
+        return 1.0 if self.hold_tape else float(np.sqrt(1.0 - ab))
 
     def _ring_read(self, delay):
         idx = (self._ar + self._wpos - self.block - delay) % self._ring_n
@@ -840,16 +1072,26 @@ class LiveAudio:
             self._ab_now = ab
         else:
             a = ab
-        y = y * np.sqrt(1.0 - a)
+        # the tape's share: the pedal's, or whole while the pedal only moves
+        # the picture (hold_tape: the webcam on B); ramped over the block
+        tw = self._tape_weight(ab)
+        if tw != self._tw_now:
+            y = y * np.linspace(self._tw_now, tw, bs, dtype=np.float32)
+            self._tw_now = tw
+        else:
+            y = y * tw
         if pg is not None:
             y = y * 0.0          # round-trip test: no input to the output, or the
                                  # cable feeds the burst back round and round
         sec = self.player.block(bs, now, ramp)
         song = self.song.block(bs)
         sec_w = np.sqrt(a)
-        for stem in STEM_CHANNELS:
+        burst = sec.get("burst")                    # the bursts: into the events
+        for stem in STEM_CHANNELS:                  # rack, but not under A/B
             blk = sec.get(stem)
             blk = None if blk is None else blk * sec_w
+            if burst is not None and stem == "events":
+                blk = burst if blk is None else blk + burst
             if song is not None and stem in song:
                 blk = song[stem] if blk is None else blk + song[stem]
             if blk is None:

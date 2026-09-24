@@ -335,6 +335,15 @@ class VideoSource(QObject):
         """The Frame to show now, or None before the first decode."""
         return self._latest
 
+    def close(self):
+        """Let the file or device go; the thread stays for the next open().
+        A capture device is released for other programs, or for a later
+        open here, the moment the worker gets to it."""
+        self.current = None
+        with self._lock:
+            self._cmds.append(("close",))
+        self._wake.set()
+
     def stop(self):
         self._quit = True
         self._wake.set()
@@ -384,6 +393,7 @@ class VideoSource(QObject):
                 self._close()
                 self._wake.wait(0.5)
             self._wake.clear()
+        self._close()                        # the device is let go with the thread
 
     def _tick(self):
         with self._lock:
@@ -391,6 +401,11 @@ class VideoSource(QObject):
         for cmd in cmds:
             if cmd[0] == "open":
                 self._open(cmd[1], cmd[2], cmd[3] if len(cmd) > 3 else None)
+            elif cmd[0] == "close":
+                self._close()
+                self.is_live = False
+                self.duration = None
+                self._latest = None
             elif cmd[0] == "seek" and self._ctr is not None and not self.is_live:
                 t = cmd[1]
                 if t is None:
@@ -434,6 +449,7 @@ class VideoSource(QObject):
         self._ring_t.clear()
         self._ring.clear()
         self._live_pos = self._live_tick = None
+        self.capture_latency_ms = None
         if self._ctr is not None:
             try:
                 self._ctr.close()

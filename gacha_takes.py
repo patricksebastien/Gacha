@@ -18,10 +18,19 @@ frame time = audio_t0 + offset + video_lag, video_lag being how far behind
 the world the grabber's frames are (measured, about 40 ms).
 
 Memory: a minute of 720x576 frames is about 2.5 GB; `max_bytes` caps the
-store and the oldest takes go first. save() writes wav + MJPEG mov copies
-for rehearsal and offline work.
+store and the oldest takes go first. To disk, a take becomes an MJPEG mov
+with the sound muxed in (the spec the Videos tab seeks instantly), written
+by one background worker feeding ffmpeg. That encode is heavy enough to
+glitch the live sound, so it does not happen during the show: the takes
+stay in RAM and save() writes the ones not yet on disk when asked, which
+the app does when it quits (and on its save button). `archive_on_stop`
+brings back writing each take the moment it stops, for a machine that
+can afford it.
 """
+import queue
+import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -42,6 +51,7 @@ class Take:
         self.audio_t0 = audio_t0            # monotonic time of sample 0 (None if no audio)
         self.frames = frames                # [Frame] with .arr (h, w, 4) and .t
         self.video_lag = video_lag          # s: frame .t minus the world time it shows
+        self.saved = False                  # written to disk (by the archive worker)
         self._bank = None
 
     @property
@@ -89,18 +99,76 @@ class Take:
             self._t = np.array([f.t for f in self.frames])
         return self._t
 
+    def save(self, folder, keep_wav=False):
+        """Write this take into `folder`: an MJPEG mov (frames at their own
+        rate) with the sound muxed in, pcm, offset by the video lag; a wav
+        alone when there is no picture (or with `keep_wav`). Returns the
+        paths written; raises on an ffmpeg failure. Safe to call from a
+        thread: it only reads the take."""
+        import soundfile as sf
+        folder = Path(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        out = []
+        wav = None
+        if len(self.audio):
+            wav = folder / f"{self.name}.wav"
+            sf.write(str(wav), self.audio, self.sr)
+            out.append(wav)
+        if len(self.frames) > 1:
+            h, w = self.frames[0].arr.shape[:2]
+            dts = np.diff([f.t for f in self.frames])
+            fps = 1.0 / max(1e-3, float(np.median(dts)))
+            mov = folder / f"{self.name}.mov"
+            tmp = folder / f"{self.name}.part.mov"
+            cmd = [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
+                   "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}",
+                   "-r", f"{fps:.3f}", "-i", "-"]
+            if wav is not None:
+                cmd += ["-itsoffset", f"{self.video_lag:.3f}", "-i", str(wav),
+                        "-c:a", "pcm_s16le", "-shortest"]
+            cmd += ["-c:v", "mjpeg", "-q:v", "4", "-pix_fmt", "yuvj420p", "-f", "mov", str(tmp)]
+            try:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, **NO_WINDOW)
+            except OSError as e:                     # no ffmpeg: the wav is saved
+                raise RuntimeError(f"ffmpeg not found ({e}): frames of {self.name} not saved")
+            try:
+                for f in self.frames:
+                    proc.stdin.write(f.arr.tobytes())
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):      # ffmpeg died: its code says why
+                pass
+            rc = proc.wait()
+            if rc != 0:
+                tmp.unlink(missing_ok=True)
+                raise RuntimeError(f"ffmpeg failed ({rc}) on {self.name}")
+            tmp.replace(mov)
+            out.append(mov)
+            if wav is not None and not keep_wav:     # the mov holds the sound
+                wav.unlink(missing_ok=True)
+                out.remove(wav)
+        return out
+
 
 class TakeStore(QObject):
     """Record toggle, pre-roll, limit, RAM cap. `changed` fires on start,
-    stop and drop; poll `recording` / `elapsed` for the status line."""
+    stop and drop; poll `recording` / `elapsed` for the status line.
+
+    `archive_dir`: the folder (or None) takes are written into, by a
+    background worker, one take at a time: on save(), and with
+    `archive_on_stop` also the moment each take stops. `saved(take, paths,
+    error)` fires from that worker (error is "" when it went well)."""
 
     changed = Signal()
+    saved = Signal(object, list, str)
 
-    def __init__(self, pre_roll=10.0, limit=60.0, max_bytes=12e9, parent=None):
+    def __init__(self, pre_roll=0.0, limit=60.0, max_bytes=12e9, parent=None,
+                 archive_dir=None, archive_on_stop=False):
         super().__init__(parent)
         self.pre_roll = float(pre_roll)
         self.limit = float(limit)
         self.max_bytes = float(max_bytes)
+        self.archive_dir = Path(archive_dir) if archive_dir else None
+        self.archive_on_stop = bool(archive_on_stop)
         self.takes = []
         self.recording = False
         self.limit_hit = False
@@ -108,6 +176,23 @@ class TakeStore(QObject):
         self._audio = self._video = None
         self._frames = []
         self._n = 0
+        self._jobs = queue.Queue()               # (take, folder) for the worker
+        self._worker = None
+        self.pending = 0                         # takes queued or being written
+        if self.archive_dir is not None:         # a second session today: count on
+            self._n = self._on_disk(self.archive_dir)
+
+    @staticmethod
+    def _on_disk(folder):
+        """The highest takeNN index already written into `folder` (0 if none),
+        so a new session never overwrites an earlier one's files."""
+        n = 0
+        if folder.is_dir():
+            for p in folder.iterdir():
+                m = re.fullmatch(r"take(\d+)(?:\.part)?", p.stem)
+                if m:
+                    n = max(n, int(m.group(1)))
+        return n
 
     # ------------------------------------------------------------ control
     @property
@@ -164,6 +249,64 @@ class TakeStore(QObject):
         take = Take(self._n, audio, sr, t0, frames, lag)
         self.takes.append(take)
         self._enforce_cap()
+        if self.archive_dir is not None and self.archive_on_stop:
+            self.archive(take, self.archive_dir)  # queued first: `changed` sees it pending
+        self.changed.emit()
+        return take
+
+    # ------------------------------------------------------------ to disk
+    def archive(self, take, folder):
+        """Queue `take` for the background worker to write into `folder`."""
+        self.pending += 1
+        self._jobs.put((take, Path(folder)))
+        if self._worker is None or not self._worker.is_alive():
+            self._worker = threading.Thread(target=self._work, name="take-archive",
+                                            daemon=True)
+            self._worker.start()
+
+    def _work(self):
+        while True:
+            try:
+                take, folder = self._jobs.get(timeout=2.0)
+            except queue.Empty:
+                return                           # idle: the next archive() restarts us
+            paths, err = [], ""
+            try:
+                paths = take.save(folder)
+                take.saved = True
+            except Exception as e:               # noqa: BLE001 - report, keep going
+                err = str(e)
+            self.pending -= 1
+            self.saved.emit(take, [str(p) for p in paths], err)
+
+    def wait(self, timeout=None):
+        """Block until every queued take is written (or `timeout` s pass).
+        Returns True when the queue drained."""
+        end = None if timeout is None else time.monotonic() + timeout
+        while self.pending > 0:
+            if end is not None and time.monotonic() >= end:
+                return False
+            time.sleep(0.05)
+        return True
+
+    def discard_last(self):
+        """Forget the take being recorded (stopped, nothing kept) or, when
+        none is running, the last one recorded, from RAM only: a file it
+        already became stays. Returns "recording", the Take dropped, or
+        None when there was nothing to forget."""
+        if self.recording:
+            if self._audio is not None:
+                self._audio.record_stop()
+            if self._video is not None:
+                self._video.record_stop()
+            self._frames = []
+            self.recording = False
+            self.limit_hit = False
+            self.changed.emit()
+            return "recording"
+        if not self.takes:
+            return None
+        take = self.takes.pop()
         self.changed.emit()
         return take
 
@@ -178,8 +321,14 @@ class TakeStore(QObject):
             self.takes.pop(0)
 
     def clear(self):
+        """Forget every take, the one recording included (nothing kept); the
+        files already written stay. Returns how many were in RAM."""
+        n = len(self.takes)
+        if self.recording:
+            self.discard_last()
         self.takes = []
         self.changed.emit()
+        return n
 
     # ------------------------------------------------------------ material
     def bank(self):
@@ -187,38 +336,24 @@ class TakeStore(QObject):
         the sample bank the engine works from."""
         return {t.name: t.engine_audio() for t in self.takes if len(t.audio)}
 
-    def save(self, folder):
-        """Write every take as wav + MJPEG mov (frames at their own rate)
-        into `folder`; returns the paths written."""
-        import soundfile as sf
-        folder = Path(folder)
-        folder.mkdir(parents=True, exist_ok=True)
+    def unsaved(self):
+        """The takes not on disk yet (a failed encode counts as not saved)."""
+        return [t for t in self.takes if not t.saved]
+
+    def save(self, folder, background=True, takes=None):
+        """Write `takes` (default: every take not yet on disk) into `folder`
+        (mov with sound, or wav alone). `background`: through the worker,
+        `saved` reports each one; else right here, returning the paths
+        written (errors are printed)."""
+        takes = self.unsaved() if takes is None else list(takes)
+        if background:
+            for t in takes:
+                self.archive(t, folder)
+            return []
         out = []
-        for t in self.takes:
-            if len(t.audio):
-                p = folder / f"{t.name}.wav"
-                sf.write(str(p), t.audio, t.sr)
-                out.append(p)
-            if len(t.frames) > 1:
-                h, w = t.frames[0].arr.shape[:2]
-                dts = np.diff([f.t for f in t.frames])
-                fps = 1.0 / max(1e-3, float(np.median(dts)))
-                p = folder / f"{t.name}.mov"
-                cmd = [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
-                       "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}",
-                       "-r", f"{fps:.3f}", "-i", "-"]
-                if len(t.audio):
-                    cmd += ["-itsoffset", f"{t.video_lag:.3f}", "-i", str(folder / f"{t.name}.wav"),
-                            "-c:a", "pcm_s16le", "-shortest"]
-                cmd += ["-c:v", "mjpeg", "-q:v", "4", "-pix_fmt", "yuvj420p", str(p)]
-                try:
-                    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, **NO_WINDOW)
-                except OSError as e:                     # no ffmpeg: the wav is saved
-                    print(f"takes: ffmpeg not found ({e}): frames of {t.name} not saved")
-                    continue
-                for f in t.frames:
-                    proc.stdin.write(f.arr.tobytes())
-                proc.stdin.close()
-                proc.wait()
-                out.append(p)
+        for t in takes:
+            try:
+                out += t.save(folder)
+            except RuntimeError as e:
+                print(f"takes: {e}")
         return out

@@ -8,7 +8,10 @@ peer sees the same tempo and the same bar phase. This module wraps it with
 wheels: ``python -m pip install aalink``) into a small, polled object;
 ``gacha.py`` reads it from a timer and steers its TapTempo clock with what
 it finds, and pushes taps, the bpm box and the section engine's tempo back
-out, so the app is a peer like any other.
+out, so the app is a peer like any other. The session's start/stop is
+shared too (Link's start/stop sync): a peer's play starts the section
+engine's current section again, its stop stops it on the bar, and a
+section starting or stopping here does the same to the peers.
 
 aalink is written for asyncio: its callbacks are posted to an event loop.
 The app runs Qt's loop instead, so the Link object is built inside a
@@ -36,8 +39,9 @@ class LinkClock:
     """A Link peer, polled. ``enabled`` joins / leaves the network session;
     while enabled, ``snapshot()`` gives the session's tempo and where in the
     bar it is right now, and ``tempo`` (settable) pushes a change to every
-    peer. Only the tempo is used so far: the bar phase is read but the app
-    keeps its own bar, and start/stop is not wired."""
+    peer. ``playing`` (settable) is the session's transport, shared through
+    Link's start/stop sync. The bar phase is read but the app keeps its
+    own bar."""
 
     QUANTUM = 4.0                       # beats per bar: the bar phase we follow
 
@@ -55,6 +59,7 @@ class LinkClock:
                 return aalink.Link(float(bpm))
         self._link = self._loop.run_until_complete(make())
         self._link.quantum = self.QUANTUM
+        self._link.start_stop_sync_enabled = True   # share play / stop with the peers
 
     # ------------------------------------------------------------ session
     @property
@@ -79,11 +84,30 @@ class LinkClock:
     def tempo(self, bpm):
         self._link.tempo = float(min(999.0, max(20.0, bpm)))     # Link's range
 
+    # ------------------------------------------------------------ transport
+    @property
+    def playing(self):
+        """The session's transport: True while any peer plays (or we said so)."""
+        return bool(self._link.playing)
+
+    @playing.setter
+    def playing(self, on):
+        """Start or stop the session for every peer (Live starts on its own
+        quantum, as it does from its play button)."""
+        self._link.playing = bool(on)
+
     def snapshot(self):
         """(bpm, beat, phase) at this instant: the session tempo, the running
         beat count and the position inside the bar in beats, 0 <= phase < 4."""
         lk = self._link
         return float(lk.tempo), float(lk.beat), float(lk.phase)
+
+    def restart_bar(self):
+        """The session's bar starts now. Only for a session that is ours
+        alone (no peers): with peers this would yank their bar, Link's
+        request_beat is quantised onto the shared grid and moves nobody."""
+        if self.peers == 0:
+            self._link.force_beat(0.0)
 
     def close(self):
         try:
