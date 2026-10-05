@@ -8,9 +8,21 @@ path can carry effects and, later still, the generated material.
 Built on PortAudio (the sounddevice package) with Python in the loop:
 
     input device --read--> [analysis tap] -> live rack -> sync delay ----+
-    section player (looping stems, one-shots) x sqrt(A/B) --+            |
+    section player: 7 drum voices x sqrt(A/B) -> mute -> voice racks -+  |
+                    layers, chops, one-shots x sqrt(A/B) -------------+  |
     song player (a render's stems) -------------------------+-> 4 stem   +-> VST3 inserts -> gain -> limiter -->write--> output
                                                                racks, F1-F4    (gacha_vst)
+
+The drum voices (gacha_fx.VOICES: kick, snare, closed and open hat, ride,
+hat stutter, sub) each have a rack of their own and a mute and a solo; the
+voices' sum is the drums stem, through the drums rack (the kit's bus) and
+F1. A mute gates the voice before its rack, so a delay or a reverb on it
+rings out after the mute. Mutes, solos, F1-F4, the one-shots and the bursts
+land on the quantize grid (`quant`, a fraction of a bar: a sixteenth, an
+eighth, a beat, half a bar, the bar) while a section plays, at once with
+the grid off or nothing playing; with `midi_follow_mutes` a muted voice's
+hits leave the MIDI out too (off by default: the receiver does its own
+muting).
 
 The sync delay holds the sound back by a settable number of milliseconds so
 it lines up with the picture, which arrives late through the capture
@@ -47,7 +59,11 @@ occasional over- or underrun over long runs is normal.
 
     LiveAudio(in_name, out_name).start()   # opens in a thread (~2 s); in_name None = output only
     la.racks["live"].amounts["reverb"]     # gacha_fx.Rack per channel: live in + 4 stems
-    la.on["drums"] = False                 # F1-F4: stems in and out (section and song)
+    la.switch("stem", "drums", False)      # F1-F4: stems in and out (section and song)
+    la.switch("voice", "snare", False)     # a drum voice out (its MIDI notes too)
+    la.switch("solo", "kick", True)        # soloed: every other voice out
+    la.quant = 1 / 8                       # the switches, events and bursts land on eighths
+    la.racks["snare"].amounts["delay"]     # each voice has its own rack
     la.song.load(path); la.song.play()     # a generated song, its stems through the racks
     la.beat_s = 0.5                        # the delays' beat
     la.gain, la.mute                       # ramped, click-free
@@ -57,6 +73,22 @@ occasional over- or underrun over long runs is normal.
     la.player                              # SectionPlayer: stems, next, one-shots
     la.ab = 0.0 .. 1.0                     # A tape through <-> B the section
     la.stats()                             # peaks, load, drops, latency
+    la.midi_out = MidiOut()                # the drum hits as notes (gacha_midi)
+    la.midi_lead_ms = 25.0                 # sent this early: the receiver's latency
+
+MIDI out: every drum hit of the section and the song is in their event
+timelines (role, time, velocity), rendered before it sounds, so the block
+that will carry a hit is known ahead. Each block the players list the hits
+of a window `lookahead` frames ahead of what they render, and _dsp_block
+hands them to the MidiOut scheduler with the moment they should leave: the
+moment the hit will be heard (block start + the driver's output latency +
+its offset) minus the lead, the receiver's own latency, so its drum lands
+on ours. Section hits are under the A/B pedal like the section (velocity by
+sqrt(ab), none at 0); with midi_follow_mutes they follow the drums stem's
+F1 and each voice's mute and solo too, from the very frame a switch lands
+on (the hits already handed over for the lead's window, a few ms, are the
+one exception), otherwise every hit goes out and the receiver does its own
+muting; a break sends the retriggered slices' hits as they sound.
 """
 import sys
 import time
@@ -82,7 +114,10 @@ except (ImportError, OSError) as e:        # no package, or no libportaudio
     sd = None
     SD_ERROR = str(e)
 
-from gacha_fx import CHANNELS, Rack, STEM_CHANNELS
+from gacha_fx import ALL_CHANNELS, Rack, STEM_CHANNELS, VOICES
+from gacha_midi import DRUM_NOTES, DRUM_ROLES
+
+assert VOICES[:len(DRUM_ROLES)] == DRUM_ROLES      # one voice per MIDI role, then the sub
 
 SR = 48000
 PREFERRED_APIS = ("ASIO", "Windows WASAPI", "ALSA", "Core Audio",
@@ -177,20 +212,64 @@ def _device_index(name, kind, api=None):
     raise RuntimeError(f"{name}: not found (unplugged?)")
 
 
+def drum_table(events, sr):
+    """The drum hits of an event timeline ([t, src, off, dur, rate, role,
+    (vel)] with t in seconds) as (frames int64 sorted, roles, velocities
+    0..1), for the MIDI out; None when there is none."""
+    rows = []
+    for e in events or ():
+        if len(e) < 6 or e[5] not in DRUM_ROLES:
+            continue
+        vel = float(e[6]) if len(e) > 6 else 1.0
+        rows.append((int(round(float(e[0]) * sr)), e[5], min(1.0, max(0.0, vel))))
+    if not rows:
+        return None
+    rows.sort(key=lambda r: r[0])
+    return (np.array([r[0] for r in rows], dtype=np.int64),
+            [r[1] for r in rows], np.array([r[2] for r in rows], dtype=np.float32))
+
+
+def table_hits(table, lo, hi, shift, out):
+    """Append (frame + shift, role, vel) for the table's hits with lo <= frame < hi."""
+    if table is None or hi <= lo:
+        return
+    t, roles, vels = table
+    i0, i1 = np.searchsorted(t, lo, "left"), np.searchsorted(t, hi, "left")
+    for i in range(int(i0), int(i1)):
+        out.append((int(t[i]) + shift, roles[i], float(vels[i])))
+
+
+PHRASE_BARS = 4        # a live break lands on these bars' one (the loop's end too)
+
+
 class SectionPlayer:
     """Looping stems at the stream's rate, swapped on a bar, plus one-shots.
     Everything here is set from the GUI thread and read in the audio
     thread; swaps go through `pending` and happen on a bar boundary.
 
-    A break (`fill()`): from the next beat to the end of the bar, at least
-    two beats, the loop is taken over, and a section queued meanwhile drops
-    in on that bar. Two kinds, as in a generated song's run-up to a drop:
+    A break (`fill()`): on the phrase (PHRASE_BARS bars, or the loop when
+    it is shorter), the loop is taken over for the phrase's last bar, and
+    a section queued meanwhile drops in on the phrase's one, the loop's
+    middle or its end. Asked earlier it waits, armed, for that bar; asked
+    inside it, it runs from the next beat to the end, a beat at the least.
+    Two kinds, as in a generated song's run-up to a drop:
     "glitch" throws sixteenths of the bar that was playing about, some
     backwards, a stutter roll on the last beat and a gap right before the
     bar; "break" is the song's own transition, a beat-repeat of the bar's
     first slice (accelerating, steady or halving), a gap of silence before
     the drop, and a reverse cymbal swell handed in by the GUI rising under
-    it. `fill_state()` tells the picture what is happening."""
+    it. With `gap` off neither leaves silence: the roll and the repeat run
+    right into the one. `fill_state()` tells the picture what is happening.
+
+    A repeat (`repeat`, set from the GUI while a key or a note is held): a
+    cell of the bar, a division of it (bar, 1/2, ... 1/64), is read in place
+    of the transport, the cell playing at the press (the anchor), moved
+    some cells earlier or later round the loop, forwards or backwards. The
+    transport runs on underneath, so the bar, the clock and a queued
+    section are untouched and letting go lands where the loop would have
+    been; the cell edges sit on the bar's own grid, so a change of division
+    or offset is in time at once. A break wins over it; a stop ends it.
+    `heard_s()` and `repeat_state()` tell the picture what sounds."""
 
     def __init__(self, sr):
         self.sr = sr
@@ -204,15 +283,42 @@ class SectionPlayer:
         self._lead = 0                       # frames of silence before a timed start
         self.on = {"drums": True, "layers": True, "chops": True, "events": True}
         self._gain_now = {}                  # stem -> gain reached (ramps)
-        self.shots = []                      # [(clip (2, n), frames played)]
-        self.shot_queue = []                 # clips waiting for the next beat
-        self.bursts = []                     # [(clip, played)]: now, and not under A/B
+        self.quant = 0.0                     # the grid, a fraction of a bar; 0 = at once
+        self.gap = True                      # a break's silence before the drop (else it runs into it)
+        self.grid_off = 0                    # block offset of this block's grid line, or None
+        self.shots = []                      # [(clip (2, n), frames played; < 0: starts later)]
+        self.shot_queue = []                 # clips waiting for the grid
+        self.bursts = []                     # [(clip, played)]: not under A/B
+        self.burst_queue = []                # [(clip, number)] waiting for the grid
+        self.burst_n = 0                     # bursts asked so far
+        self.burst_fired = None              # (number, monotonic start) of the last one out
         self.loop_t0 = None                  # monotonic time the loop last wrapped
         self.swapped = False                 # a pending section just went live
         self.beat_frames = 0
         self.fill_armed = None               # (kind, swell): a break asked, next beat
         self._fill = None                    # dict: the break playing, see _fill_start
         self.dropped = False                 # a break just ended in a swap (GUI resets)
+        self._ev = None                      # drum_table of the section: the MIDI out
+        self.lookahead = 0                   # frames ahead of the block the hits are listed
+        self.hits = []                       # [(block offset, role, vel)] listed by block()
+        self._covered = 0                    # loop frame up to which hits were listed
+        self._pend_covered = 0               # same for the pending section, from its 0
+        # the MIDI clock: the loop frame at this block's start (after `grid_lead`
+        # frames of silence), None when nothing plays; the transport: the
+        # (lead, pos) a section started from silence with, and a stop, both
+        # consumed by LiveAudio in the same audio callback
+        self.grid_i0 = None
+        self.grid_lead = 0
+        self.started = None
+        self.stopped = False
+        # the repeat: (division of a bar, offset in cells, backwards) from
+        # the GUI, None = off; the anchor (the cell captured at the press,
+        # a loop frame) and what is heard belong to the audio thread
+        self.repeat = None
+        self._rep_anchor = None
+        self._heard = None                   # loop frame sounding at the block's end, or None
+        self._rep_info = (0, 0.0)            # (cell count, 0..1 into the cell)
+        self._resume = False                 # fade the transport back in after a repeat
 
     @property
     def playing(self):
@@ -222,10 +328,16 @@ class SectionPlayer:
     def filling(self):
         return self._fill is not None
 
+    def phrase_end(self, pos):
+        """The loop frame the phrase around `pos` ends on: the next
+        PHRASE_BARS boundary, or the loop's end when that comes first."""
+        ph = PHRASE_BARS * 4 * self.beat_frames
+        return min(self.n, (pos // ph + 1) * ph) if ph else self.n
+
     def fill(self, kind="glitch", swell=None):
-        """A break of `kind` ("glitch" or "break"), from the next beat: see
-        the class note. `swell`: a (2, n) float32 clip at sr to rise into the
-        drop (the break kind), its end on the bar. No-op with no section."""
+        """A break of `kind` ("glitch" or "break"), on the phrase's last bar:
+        see the class note. `swell`: a (2, n) float32 clip at sr to rise into
+        the drop (the break kind), its end on the bar. No-op with no section."""
         if self.playing:
             self.fill_armed = (kind, swell)
 
@@ -242,6 +354,117 @@ class SectionPlayer:
             sw = (k - f["swell_k0"]) / max(1, f["swell"].shape[1])
         return {"kind": f["kind"], "k": int(f["retrig"][k]), "frac": float(f["frac"][k]),
                 "gap": bool(f["retrig"][k] < 0), "swell": min(1.0, sw)}
+
+    def set_repeat(self, div, offset=0, rev=False):
+        """Hold: repeat `div` of a bar (1.0, 0.5, ... 1/64) from the cell
+        playing now, `offset` cells earlier (< 0) or later round the loop,
+        backwards with `rev`; call again to change any of them while held,
+        the anchor stays. See the class note. No-op with no section."""
+        if self.playing:
+            self.repeat = (float(div), int(offset), bool(rev))
+
+    def clear_repeat(self):
+        """Let go: the transport, which ran on underneath, is heard again."""
+        self.repeat = None
+
+    def heard_s(self):
+        """Seconds into the loop of what sounds now: the transport, or the
+        repeated cell's frame while a repeat is held (a break has `pos`
+        follow its slices already)."""
+        return (self.pos if self._heard is None else self._heard) / self.sr
+
+    def repeat_state(self):
+        """What the repeat is doing, for the picture: {k (cells so far),
+        frac (0..1 into the cell), div, rev}, or None while none sounds."""
+        if self._heard is None or self.repeat is None:
+            return None
+        k, frac = self._rep_info
+        return {"k": k, "frac": frac, "div": self.repeat[0], "rev": self.repeat[2]}
+
+    def repeat_window(self):
+        """The repeat's window for the display: (start, length) in loop
+        frames and whether it runs backwards, or None before it sounds."""
+        rep, a = self.repeat, self._rep_anchor
+        if rep is None or a is None or not self.beat_frames or not self.n:
+            return None
+        ln, start, rev = self._rep_geom(a, rep)
+        return start, ln, rev
+
+    # ---- the repeat (audio thread)
+    def _rep_geom(self, a, rep):
+        """(cell length, window start, backwards) of the repeat `rep` from
+        the anchor `a`: a coarser division snaps the anchor down within its
+        bar, a finer one keeps it, so the roll tightens from the same one;
+        the offset moves the window by cells, round the loop."""
+        div, off, rev = rep
+        bar_f = 4 * self.beat_frames
+        ln = max(1, min(bar_f, int(round(bar_f * div))))
+        start = ((a // bar_f) * bar_f + (a % bar_f // ln) * ln + off * ln) % self.n
+        return ln, start, rev
+
+    def _rep_cells(self, i0, rep):
+        """The repeat's geometry at transport frame `i0`; the anchor, set
+        at the first block, is the cell playing then."""
+        if self._rep_anchor is None:
+            bar_f = 4 * self.beat_frames
+            ln = max(1, min(bar_f, int(round(bar_f * rep[0]))))
+            self._rep_anchor = (i0 // bar_f) * bar_f + (i0 % bar_f // ln) * ln
+        return self._rep_geom(self._rep_anchor, rep)
+
+    def _repeat_idx(self, i0, m, rep):
+        """The loop frames read for transport frames [i0, i0+m) under the
+        repeat, and a gain with 2 ms fades at the cell edges (None when
+        the cells are too short for one). The phase inside the cell is the
+        transport's own, within its bar, so the hits land on the grid."""
+        ln, start, rev = self._rep_cells(i0, rep)
+        bar_f, n = 4 * self.beat_frames, self.n
+        t = np.arange(i0, i0 + m)
+        ph = (t % bar_f) % ln
+        src = start + (ln - 1 - ph if rev else ph)
+        idx = src % n
+        f = int(0.002 * self.sr)
+        g = None
+        if 0 < f <= ln // 2:
+            g = np.minimum(np.minimum(ph, ln - 1 - ph) / f, 1.0).astype(np.float32)
+        self._heard = int(idx[-1])
+        self._rep_info = (int(t[-1] // ln), float(ph[-1]) / ln)
+        return idx, g
+
+    def _src_hits(self, lo, cnt, off, rev):
+        """The hits of loop frames [lo, lo+cnt) (round the loop's end) to
+        the MIDI window, the first frame at block offset `off`, the range
+        played backwards with `rev`."""
+        n = self.n
+        lo %= n
+        done = 0
+        while done < cnt:
+            take = min(cnt - done, n - lo)
+            tmp = []
+            table_hits(self._ev, lo, lo + take, 0, tmp)
+            for s, role, v in tmp:
+                j = (s - lo) + done
+                self.hits.append((off + (cnt - 1 - j if rev else j), role, v))
+            done += take
+            lo = 0
+
+    def _repeat_hits(self, i0, m, lead, rep):
+        """The MIDI out's window under a repeat: cell by cell, the repeated
+        slice's hits where they sound (backwards when reversed)."""
+        ln, start, rev = self._rep_cells(i0, rep)
+        bar_f, n, L = 4 * self.beat_frames, self.n, self.lookahead
+        a0, end = i0 + L, i0 + L + m
+        t = max(i0, min(a0, self._covered))
+        while t < end:
+            tb = t % bar_f
+            ph = tb % ln
+            cnt = min(end - t, ln - ph, bar_f - tb)
+            off = lead + (t - a0)                     # block offset of transport frame t
+            if rev:
+                self._src_hits(start + ln - ph - cnt, cnt, off, True)
+            else:
+                self._src_hits(start + ph, cnt, off, False)
+            t += cnt
+        self._covered = end - (n if i0 + m >= n else 0)
 
     # ---- the break's index map, built when it starts (audio thread)
     def _fill_map(self, start, beats, rng, kind):
@@ -284,7 +507,7 @@ class SectionPlayer:
             divs = full[-beats:] if beats <= 4 or flavour != "accelerate" else full
             if beats == 2 and flavour == "accelerate":
                 divs = [4, 8]                           # two beats: 1/16 then 1/32
-            gap = int(bf * (0.5 if beats <= 2 else rng.choice([0.5, 1.0])))
+            gap = int(bf * (0.5 if beats <= 2 else rng.choice([0.5, 1.0]))) if self.gap else 0
             total = beats * bf - gap
             for div in divs:
                 m = max(1, bf // div)
@@ -307,7 +530,11 @@ class SectionPlayer:
                 piece(bar0, sx // 2)
             for _ in range(4):
                 piece(bar0, sx // 4)
-            silence(sx)                                 # the gap before the drop
+            if self.gap:
+                silence(sx)                             # the gap before the drop
+            else:                                       # or the roll on into it
+                for _ in range(8):
+                    piece(bar0, sx // 8)
         idx, gain = np.concatenate(idx), np.concatenate(gain)
         retrig, frac = np.concatenate(retrig), np.concatenate(frac)
         want = beats * bf                               # exactly to the bar
@@ -320,14 +547,13 @@ class SectionPlayer:
         return idx[:want], gain[:want], retrig[:want], frac[:want]
 
     def _fill_start(self, i0):
-        """The next beat has just passed at `i0`: the break runs from here to
-        the bar boundary at least two beats away."""
+        """A beat has just passed at `i0`, inside a phrase's last bar: the
+        break runs from here to the phrase's end."""
         kind, swell = self.fill_armed
         bf = self.beat_frames
         beat = i0 // bf                                 # the beat we are in
-        left = 4 - (beat % 4)                           # beats to the bar, this one included
-        beats = left if left >= 2 else left + 4
-        end = (beat + beats) * bf                       # the bar boundary, in loop frames
+        end = self.phrase_end(i0)                       # in loop frames
+        beats = max(1, -(-(end - beat * bf) // bf))     # beats to it, this one included
         idx, gain, retrig, frac = self._fill_map(beat * bf, beats, random.Random(), kind)
         late = i0 - beat * bf                           # the block boundary: a few ms in
         idx, gain, retrig, frac = idx[late:], gain[late:], retrig[late:], frac[late:]
@@ -337,7 +563,8 @@ class SectionPlayer:
                 swell = swell[:, swell.shape[1] - len(idx):]
             k0 = len(idx) - swell.shape[1]
         self._fill = {"idx": idx, "gain": gain, "retrig": retrig, "frac": frac, "k": 0,
-                      "end": end, "kind": kind, "swell": swell, "swell_k0": k0}
+                      "end": end, "kind": kind, "swell": swell, "swell_k0": k0,
+                      "covered": 0, "after": 0}     # the MIDI out's window, see _fill_hits
         self.fill_armed = None
 
     def queue(self, stems, events, bpm, bars, bar_t0=None):
@@ -345,7 +572,8 @@ class SectionPlayer:
         from the next block, or, `bar_t0` given (monotonic seconds, the
         Link session's bar), exactly then: silence up to it inside the
         block, or, when it has just passed, the loop entered that far in."""
-        self.pending = (stems, events, bpm, bars, bar_t0)
+        self.pending = (stems, events, bpm, bars, bar_t0, drum_table(events, self.sr))
+        self._pend_covered = 0
 
     def waiting_for(self):
         """The bar time a queued section waits for, or None."""
@@ -356,13 +584,30 @@ class SectionPlayer:
         self.pending = ("clear",)
 
     def fire(self, clip, now=False):
-        """A one-shot (2, n) float32 at sr, on the next beat (or now if no
-        section plays). `now`: a burst, played from the next block on and
-        mixed outside the A/B crossfade, so it is heard over the tape too."""
+        """A one-shot (2, n) float32 at sr, on the next line of the quantize
+        grid (at once with the grid off or no section playing). `now`: a
+        burst, mixed outside the A/B crossfade, so it is heard over the
+        tape too; returns its number, and `burst_fired` tells when it
+        started sounding."""
         if now:
-            self.bursts.append((clip, 0))
-        else:
-            self.shot_queue.append(clip)
+            self.burst_n += 1
+            self.burst_queue.append((clip, self.burst_n))
+            return self.burst_n
+        self.shot_queue.append(clip)
+        return None
+
+    def _grid_offset(self, i0, m, lead):
+        """Block offset of the first quantize grid line inside this block's
+        loop frames [i0, i0 + m) (the loop's end is one), None when there
+        is none; 0 with the grid off."""
+        q, bf = self.quant, self.beat_frames
+        if q <= 0 or not bf:
+            return 0
+        step = max(1, int(round(4 * bf * q)))
+        g = -(-i0 // step) * step
+        if self.n and i0 + m > self.n:
+            g = min(g, self.n)
+        return lead + (g - i0) if g < i0 + m else None
 
     def pos_s(self):
         return self.pos / self.sr
@@ -370,11 +615,17 @@ class SectionPlayer:
     def _swap(self, now=None, bs=0):
         p, self.pending = self.pending, None
         if p[0] == "clear":
+            if self.stems is not None:
+                self.stopped = True
             self.stems, self.events, self.n, self.pos = None, [], 0, 0
+            self._ev = None
+            self.repeat, self._rep_anchor, self._heard = None, None, None
             return
-        stems, events, bpm, bars, bar_t0 = p
+        stems, events, bpm, bars, bar_t0, table = p
         from_silence = self.stems is None
         self.stems, self.events, self.bpm, self.bars = stems, events, bpm, bars
+        self._ev = table
+        self._covered, self._pend_covered = self._pend_covered, 0
         self.n = next(iter(stems.values())).shape[1]
         self.pos, self._lead = 0, 0
         self.beat_frames = int(round(60.0 / bpm * self.sr))
@@ -384,14 +635,101 @@ class SectionPlayer:
                 self._lead = min(bs, int(round((bar_t0 - now) * self.sr)))
             else:                                     # the bar just passed: enter late
                 self.pos = int((now - bar_t0) * self.sr) % self.n
+                self._covered = self.pos
             self.loop_t0 = now + (self._lead - self.pos) / self.sr
+        if from_silence:
+            self.started = (self._lead, self.pos)
         self.swapped = True
+
+    # ---- the MIDI out's window: the hits `lookahead` frames ahead of the block
+    def _next_table(self):
+        """What plays after this loop's end: the pending section's hits,
+        our own again, or None once a clear waits."""
+        p = self.pending
+        if p is None:
+            return self._ev
+        return None if p[0] == "clear" else p[5]
+
+    def _collect(self, table, pos, m, off, nxt):
+        """Hits from loop frame `pos` of `table` for `m` frames, at block
+        offset `off` on; past the loop's end `nxt` takes over from 0."""
+        n = self.n
+        while m > 0 and n:
+            take = min(m, n - pos) if pos < n else m
+            table_hits(table, pos, pos + take, off - pos, self.hits)
+            m, off, pos, table = m - take, off + take, 0, nxt
+
+    def _loop_hits(self, i0, m, lead, breaking, bar_f):
+        """The normal path: the window ahead of [i0, i0+m), from where the
+        last one ended (a section just started from silence has its first
+        frames listed now, late by the lead at worst); a pending section
+        starts at the first block after the next bar (as the swap does), so
+        its first hits are listed from there."""
+        L, n = self.lookahead, self.n
+        a0, end = i0 + L, i0 + L + m
+        a = max(i0, min(a0, self._covered))
+        cut = None
+        if self.pending is not None and not breaking and bar_f:
+            b = (i0 // bar_f + 1) * bar_f                  # the next bar boundary
+            cut = i0 + m * -(-(b - i0) // m)               # the block start after it
+        own_end = end if cut is None else min(end, cut)
+        if own_end > a:
+            self._collect(self._ev, a % n, own_end - a, lead + (a - a0), self._ev)
+        if cut is not None and cut < end:
+            nxt = self._next_table()
+            start = max(a, cut)
+            if nxt is not None:
+                self._collect(nxt, start - cut, end - start, lead + (start - a0), nxt)
+            self._pend_covered = end - cut
+        self._covered = end - (n if i0 + m >= n else 0)
+
+    def _fill_hits(self, k, bs):
+        """A break: the window over the fill's slice map, each slice's hits
+        where they sound (reversed slices reversed), then what follows the
+        drop: the pending section from 0, or the loop on from the bar."""
+        f = self._fill
+        idx, retrig, end = f["idx"], f["retrig"], f["end"]
+        L = self.lookahead
+        a0, b = k + L, k + L + bs
+        a = max(k, min(a0, f["covered"]))
+        f["covered"] = b
+        w1 = min(b, len(idx))
+        p = a
+        while p < w1:
+            r = retrig[p]
+            q = p + 1
+            while q < w1 and retrig[q] == r:
+                q += 1
+            if r >= 0:
+                src0 = int(idx[p])
+                rev = q - p > 1 and idx[q - 1] < src0
+                if rev:                                    # frames src0, src0-1, ...
+                    tmp = []
+                    table_hits(self._ev, src0 - (q - p) + 1, src0 + 1, 0, tmp)
+                    self.hits.extend((p - a0 + (src0 - t), role, v) for t, role, v in tmp)
+                else:
+                    table_hits(self._ev, src0, src0 + (q - p), p - a0 - src0, self.hits)
+            p = q
+        if b > len(idx):                                   # past the drop
+            start = max(a, len(idx))
+            if self.pending is not None:
+                nxt = self._next_table()
+                if nxt is not None:
+                    self._collect(nxt, start - len(idx), b - start, start - a0, nxt)
+                self._pend_covered = b - len(idx)
+            elif self.n:
+                self._collect(self._ev, (end + start - len(idx)) % self.n, b - start,
+                              start - a0, self._ev)
+            f["after"] = b - len(idx)
 
     def block(self, bs, now, ramp):
         """The next bs frames of the section, {stem: (2, bs) float32}, the
         one-shots in "events". Stem on/off is applied by LiveAudio after the
         racks. Empty dict when nothing plays."""
         out = {}
+        self.hits = []
+        self.grid_i0, self.grid_lead = None, 0
+        self.grid_off = 0
         bar_f = 4 * self.beat_frames
         breaking = self.fill_armed or self._fill is not None
         if self.pending is not None and (self.stems is None or (self.pos == 0 and not breaking)):
@@ -399,18 +737,41 @@ class SectionPlayer:
             if wait is None or now + bs / self.sr >= wait:   # a timed start: not yet
                 self._swap(now, bs)
         if self._fill is not None:
+            self._rep_anchor, self._heard = None, None   # a break wins; a held repeat re-anchors after
             on_beat = self._fill_block(out, bs)
         elif self.stems is not None:
             lead = min(self._lead, bs)                # a timed start: silence up to it
             self._lead -= lead
             m = bs - lead
             i0 = self.pos
-            idx = (np.arange(m) + i0) % self.n
+            self.grid_i0, self.grid_lead = i0, lead
+            self.grid_off = self._grid_offset(i0, m, lead)
+            rep = self.repeat
+            if rep is not None:                       # a hold: the cell, not the transport
+                idx, g = self._repeat_idx(i0, m, rep)
+                self._resume = True
+            else:
+                idx, g = (np.arange(m) + i0) % self.n, None
+                self._rep_anchor = None
+                if self._resume:                      # just let go: no click on the way back
+                    self._resume = False
+                    f = min(m, int(0.002 * self.sr))
+                    if f > 1:
+                        g = np.ones(m, np.float32)
+                        g[:f] = np.linspace(0.0, 1.0, f, dtype=np.float32)
+                self._heard = None
             for name, data in self.stems.items():
                 blk = data[:, idx]
+                if g is not None:
+                    blk = blk * g
                 if lead:
                     blk = np.concatenate([np.zeros((2, lead), np.float32), blk], axis=1)
                 out[name] = blk
+            if self._ev is not None:
+                if rep is not None:
+                    self._repeat_hits(i0, m, lead, rep)
+                else:
+                    self._loop_hits(i0, m, lead, breaking, bar_f)
             self.pos = (i0 + m) % self.n
             if i0 + m >= self.n:                      # wrapped inside this block
                 self.loop_t0 = now + (self.n - i0 + lead) / self.sr
@@ -421,24 +782,26 @@ class SectionPlayer:
                 self.pos = 0                          # so the swap lands on the bar
             on_beat = (i0 // self.beat_frames) != ((i0 + m) // self.beat_frames) \
                 if self.beat_frames else True
-            if self.fill_armed and on_beat and self.beat_frames:
-                self._fill_start(self.pos)            # the break, from the next block
+            # an armed break waits for the phrase's last bar, then starts on
+            # the next beat: from the next block, to the phrase's end
+            if self.fill_armed and on_beat and self.beat_frames                     and self.pos >= self.phrase_end(self.pos) - bar_f:
+                self._fill_start(self.pos)
         else:
             on_beat = True
-        if self.shot_queue and on_beat:
-            self.shots.extend((c, 0) for c in self.shot_queue)
-            self.shot_queue = []
-        keep = []
+        o = self.grid_off                             # the grid: one-shots and bursts start there
+        if o is not None:
+            if self.shot_queue:
+                q, self.shot_queue = self.shot_queue, []
+                self.shots.extend((c, -o) for c in q)
+            if self.burst_queue:
+                q, self.burst_queue = self.burst_queue, []
+                self.bursts.extend((c, -o) for c, _k in q)
+                self.burst_fired = (q[-1][1], now + o / self.sr)
         if self.shots:
             ev = out.get("events")
             ev = np.zeros((2, bs), np.float32) if ev is None else ev.copy()
-            for clip, k in self.shots:
-                n = min(bs, clip.shape[1] - k)
-                ev[:, :n] += clip[:, k:k + n]
-                if k + n < clip.shape[1]:
-                    keep.append((clip, k + n))
+            _, self.shots = self._sum_clips(self.shots, bs, ev)
             out["events"] = ev
-        self.shots = keep
         if self.bursts:
             out["burst"], self.bursts = self._sum_clips(self.bursts, bs)
         return out
@@ -449,7 +812,11 @@ class SectionPlayer:
         section, or the loop on from the bar. Returns whether a beat passed."""
         f = self._fill
         idx, gain, k, end = f["idx"], f["gain"], f["k"], f["end"]
+        self.grid_i0 = end - (len(idx) - k)       # the break keeps the bar's grid
+        if self._ev is not None:
+            self._fill_hits(k, bs)
         m = min(bs, len(idx) - k)
+        self.grid_off = self._grid_offset(self.grid_i0, m, 0)
         sl, g = idx[k:k + m], gain[k:k + m]
         for name, data in self.stems.items():
             blk = np.zeros((2, bs), np.float32)
@@ -472,6 +839,7 @@ class SectionPlayer:
         else:                                         # done: the drop
             self._fill = None
             self.pos = end % self.n
+            self._covered = self.pos + f["after"]
             if self.pending is not None:
                 self._swap()
                 self.dropped = True
@@ -481,14 +849,19 @@ class SectionPlayer:
         return on_beat
 
     @staticmethod
-    def _sum_clips(clips, bs):
+    def _sum_clips(clips, bs, blk=None):
         """Mix the next `bs` frames of every (clip, played) into one (2, bs)
-        block; returns it and the clips still sounding."""
-        blk = np.zeros((2, bs), np.float32)
+        block (`blk`, added into, or a new one); played < 0 is a clip that
+        starts that many frames into the block. Returns the block and the
+        clips still sounding."""
+        if blk is None:
+            blk = np.zeros((2, bs), np.float32)
         keep = []
         for clip, k in clips:
-            n = min(bs, clip.shape[1] - k)
-            blk[:, :n] += clip[:, k:k + n]
+            o, k = max(0, -k), max(0, k)
+            n = min(bs - o, clip.shape[1] - k)
+            if n > 0:
+                blk[:, o:o + n] += clip[:, k:k + n]
             if k + n < clip.shape[1]:
                 keep.append((clip, k + n))
         return blk, keep
@@ -515,6 +888,13 @@ class SongPlayer:
         self.has_stems = False
         self._gen = 0
         self._want_play = False
+        self._ev = None                       # drum_table of the render: the MIDI out
+        self.lookahead = 0
+        self.hits = []
+
+    def set_events(self, events):
+        """The render's event timeline (its meta's `events`), for the MIDI out."""
+        self._ev = drum_table(events, self.sr)
 
     def load(self, path, play=True):
         self._gen += 1
@@ -591,10 +971,14 @@ class SongPlayer:
 
     def block(self, bs):
         """{stem: (2, bs)} for the next block, or None when not playing."""
+        self.hits = []
         if self.state != "playing" or self.stems is None:
             return None
         i0 = self.pos
         end = min(self.n, i0 + bs)
+        if self._ev is not None:
+            a = i0 + self.lookahead
+            table_hits(self._ev, a, min(self.n, a + bs), -a, self.hits)
         out = {}
         for name, data in self.stems.items():
             blk = np.zeros((2, bs), np.float32)
@@ -618,7 +1002,7 @@ class LiveAudio:
         self.exclusive = bool(exclusive)     # Windows: WASAPI exclusive first
         self.api = api                       # host API name, None = the best present
         self.mode = ""                       # how the devices were opened, for the status
-        self.racks = {ch: Rack(self.sr) for ch in CHANNELS}   # live in + the 4 stems
+        self.racks = {ch: Rack(self.sr) for ch in ALL_CHANNELS}   # live in, 4 stems, 7 voices
         self.beat_s = 0.5                    # the delays follow this
         self.gain = 1.0
         self.mute = False
@@ -629,8 +1013,28 @@ class LiveAudio:
         self.player = SectionPlayer(self.sr)
         self.on = self.player.on             # stems in/out, for section and song alike
         self.song = SongPlayer(self.sr, self.on)
+        # the drum voices: in or out, and soloed (then every other voice is
+        # out); set through switch(), which lands them on the grid
+        self.voice_on = {v: True for v in VOICES}
+        self.voice_solo = set()
+        self.quant = 0.0                     # the grid, a fraction of a bar (1/8 = eighths); 0 = at once
+        self._sw_req = []                    # (kind, key, on) asked, under _sw_lock
+        self._sw_lock = threading.Lock()
+        self._sw_wait = []                   # ...and waiting for the grid (audio thread)
+        self._aud_before = frozenset()
         self._limiter = Limiter(threshold_db=-1.0, release_ms=100.0)
         self.inserts = None                  # gacha_vst.InsertChain on the master, or None
+        # the drum hits as MIDI notes (see the module note): a gacha_midi.MidiOut
+        self.midi_out = None
+        self.midi_channel = 10
+        self.midi_channels = None            # role -> channel instead (a Model:Cycles), or None
+        self.midi_lead_ms = 0.0              # how early a note leaves: the receiver's latency
+        self.midi_gate_ms = 50.0             # note on to note off
+        self.midi_notes = dict(DRUM_NOTES)   # role -> note, -1 = not sent
+        self.midi_drums_only = False         # our own drum voices silent while sending (the sub stays)
+        self.midi_follow_mutes = False       # F1, the voice mutes and solos take notes out too;
+                                             # off: every hit goes out, the receiver mutes
+        self.midi_sent = 0
         self.running = False
         self.error = None
         self.ready = threading.Event()       # set once open (or failed)
@@ -653,6 +1057,51 @@ class LiveAudio:
         self.out_latency_ms = 1000.0 * self.block / self.sr   # what is written but not yet heard
 
     # ------------------------------------------------------------ control
+    def switch(self, kind, key, on):
+        """A stem ("stem", F1-F4), a drum voice ("voice", in or out) or a
+        solo ("solo") switched, from any thread: it lands on the next line
+        of the quantize grid while a section plays, at once otherwise. The
+        audio gate ramps there, and the MIDI out follows from the same
+        frame on."""
+        with self._sw_lock:
+            self._sw_req.append((kind, key, bool(on)))
+
+    def _audible(self):
+        """The roles whose hits go out: every role unless the notes follow
+        the mutes, then the drums stem in, the voice in, and not soloed out."""
+        if not self.midi_follow_mutes:
+            return frozenset(VOICES)
+        if not self.on.get("drums", True):
+            return frozenset()
+        solo = self.voice_solo
+        return frozenset(v for v in VOICES
+                         if self.voice_on.get(v, True) and (not solo or v in solo))
+
+    def _land_switches(self, grid_off):
+        """The switches asked for land at `grid_off`, the player's grid line
+        in this block (None: none this block, they keep waiting; 0: at
+        once). Returns the offset they landed at, or None. What was audible
+        before is kept for the hits before that frame."""
+        with self._sw_lock:
+            if self._sw_req:
+                self._sw_wait.extend(self._sw_req)
+                self._sw_req = []
+        self._aud_before = self._audible()
+        if not self._sw_wait or grid_off is None:
+            return None
+        for kind, key, on in self._sw_wait:
+            if kind == "stem":
+                self.on[key] = on
+            elif kind == "voice":
+                self.voice_on[key] = on
+            elif kind == "solo":
+                if on:
+                    self.voice_solo.add(key)
+                else:
+                    self.voice_solo.discard(key)
+        self._sw_wait = []
+        return int(grid_off)
+
     def start(self):
         """Open the devices. On ASIO the driver drives us: the stream is
         opened and started here, on the calling thread (ASIO drivers are COM
@@ -745,12 +1194,14 @@ class LiveAudio:
             return
         old_racks = self.racks
         self.sr = sr
-        self.racks = {ch: Rack(sr) for ch in CHANNELS}
+        self.racks = {ch: Rack(sr) for ch in ALL_CHANNELS}
         for ch, r in self.racks.items():
             r.amounts.update(old_racks[ch].amounts)
             r.vol = old_racks[ch].vol
+        old_player = self.player
         self.player = SectionPlayer(sr)
         self.player.on = self.on
+        self.player.gap = old_player.gap
         self.song = SongPlayer(sr, self.on)
         self._limiter = Limiter(threshold_db=-1.0, release_ms=100.0)
         self.buffer_ms = 2000.0 * self.block / sr
@@ -1004,6 +1455,7 @@ class LiveAudio:
         behind the write position) and the block ramp for crossfades."""
         bs, sr = self.block, self.sr
         self._stem_gain = {}                      # stem -> on/off gain reached
+        self._voice_gain = {}                     # voice -> the same
         self._gain_now = 0.0                      # fade in from silence
         # the round-trip test: a 4 ms 1 kHz burst at -10 dBFS, Hann-windowed
         n = int(0.004 * self.sr)
@@ -1019,6 +1471,34 @@ class LiveAudio:
         self._ab_now = float(self.ab)
         self._tw_now = self._tape_weight(self._ab_now)
 
+    def _midi_sync(self, mo, heard, sr):
+        """The MIDI clock's grid and the transport from this block: `heard`
+        is when the block's first frame is heard, less the lead, the time
+        base the notes leave in. The section's beat grid while one plays
+        (a break included), the live tempo otherwise; Start on a section's
+        downbeat from silence (or the next bar, entered late), Stop on a
+        clear."""
+        pl = self.player
+        bf = pl.beat_frames
+        if pl.playing and bf and pl.grid_i0 is not None:
+            beat_s = bf / sr
+            b = (pl.grid_i0 // bf) * bf               # the beat this block sits in
+            mo.grid(heard + (pl.grid_lead + b - pl.grid_i0) / sr, beat_s)
+        else:
+            beat_s = float(self.beat_s)
+            mo.grid(None, beat_s)
+        if pl.started is not None:
+            lead, pos = pl.started
+            pl.started = None
+            due = heard + (lead - pos) / sr
+            bar_s = 4 * beat_s
+            while due < heard - 0.001 and bar_s > 0:   # entered late: the next bar
+                due += bar_s
+            mo.start(due)
+        if pl.stopped:
+            pl.stopped = False
+            mo.stop()
+
     def _tape_weight(self, ab):
         """The tape's gain under the pedal: equal power against the section,
         or 1 while hold_tape keeps its sound whole."""
@@ -1027,6 +1507,17 @@ class LiveAudio:
     def _ring_read(self, delay):
         idx = (self._ar + self._wpos - self.block - delay) % self._ring_n
         return self._ring[:, idx]
+
+    @staticmethod
+    def _gate(cur, target, bs, off):
+        """A gain ramp over the block from `cur` to `target`, from frame
+        `off` on (None or 0: the whole block), 32 frames long at the least
+        so it never clicks."""
+        o = 0 if not off else min(int(off), bs)
+        o = min(o, max(0, bs - 32))
+        r = np.full(bs, cur, np.float32)
+        r[o:] = np.linspace(cur, target, bs - o, dtype=np.float32)
+        return r
 
     def _dsp_block(self, x, now):
         """One block (2, bs) in, one block out: analysis tap, the live rack,
@@ -1083,16 +1574,78 @@ class LiveAudio:
         if pg is not None:
             y = y * 0.0          # round-trip test: no input to the output, or the
                                  # cable feeds the burst back round and round
+        # the MIDI out's window: hits are listed this far ahead of the block,
+        # so a note can leave before the block it sits in is even rendered
+        mo = self.midi_out
+        midi = mo is not None and mo.is_open
+        out_lat = self.out_latency_ms / 1000.0
+        lead_s = self.midi_lead_ms / 1000.0
+        L = int(math.ceil(max(0.0, lead_s - out_lat) * sr)) if midi else 0
+        self.player.lookahead = self.song.lookahead = L
+        self.player.quant = self.quant
+        t_block = time.perf_counter()
         sec = self.player.block(bs, now, ramp)
         song = self.song.block(bs)
         sec_w = np.sqrt(a)
+        # the switches land on the grid line of this block, if any; the hits
+        # before it keep what was audible, those from it on take the new state
+        sw_off = self._land_switches(self.player.grid_off)
+        if midi:
+            self._midi_sync(mo, t_block + out_lat - lead_s, sr)
+        if midi and (self.player.hits or self.song.hits):
+            aud_after, aud_before = self._audible(), self._aud_before
+            base = t_block + out_lat - lead_s + L / sr        # >= t_block by the choice of L
+            gate = self.midi_gate_ms / 1000.0
+            ch, notes = int(self.midi_channel), self.midi_notes
+            chans = self.midi_channels or {}
+            w = float(np.sqrt(ab))                            # the section under the pedal
+            for hits, scale in ((self.player.hits, w), (self.song.hits, 1.0)):
+                if scale < 0.05:
+                    continue
+                for off, role, vel in hits:
+                    aud = aud_after if sw_off is None or off >= sw_off else aud_before
+                    note = notes.get(role, -1)
+                    if role not in aud or note is None or note < 0:
+                        continue
+                    mo.note(chans.get(role, ch), note, round(127 * vel * scale),
+                            base + off / sr, gate)
+                    self.midi_sent += 1
+        # the drum voices: each gated (mute, solo; the receiver's kit
+        # replacing ours leaves the sub) before its own rack, summed into
+        # the drums stem; a rack with a tail rings on after its mute
+        drums_only = midi and self.midi_drums_only
+        solo = self.voice_solo
+        bus = None
+        for v in VOICES:
+            blk = sec.get(v)
+            on = self.voice_on.get(v, True) and (not solo or v in solo)
+            if drums_only and v != "sub":
+                on = False
+            g = 1.0 if on else 0.0
+            cur = self._voice_gain.get(v, 1.0)        # every voice starts in
+            rack = self.racks[v]
+            if g != cur:
+                blk = np.zeros((2, bs), np.float32) if blk is None else blk * sec_w
+                blk = blk * self._gate(cur, g, bs, sw_off)
+                self._voice_gain[v] = g
+            elif blk is None or not g:
+                if rack.idle:
+                    continue
+                blk = np.zeros((2, bs), np.float32)
+            else:
+                blk = blk * sec_w
+            blk = rack.process(blk)
+            bus = blk if bus is None else bus + blk
         burst = sec.get("burst")                    # the bursts: into the events
         for stem in STEM_CHANNELS:                  # rack, but not under A/B
-            blk = sec.get(stem)
-            blk = None if blk is None else blk * sec_w
+            if stem == "drums":
+                blk = bus
+            else:
+                blk = sec.get(stem)
+                blk = None if blk is None else blk * sec_w
             if burst is not None and stem == "events":
                 blk = burst if blk is None else blk + burst
-            if song is not None and stem in song:
+            if song is not None and stem in song and not (stem == "drums" and drums_only):
                 blk = song[stem] if blk is None else blk + song[stem]
             if blk is None:
                 blk = np.zeros((2, bs), np.float32)     # tails keep ringing
@@ -1100,7 +1653,7 @@ class LiveAudio:
             on = 1.0 if self.on.get(stem, True) else 0.0
             cur = self._stem_gain.get(stem, on)
             if cur != on:                                # F1-F4: a ramp, no click
-                blk = blk * np.linspace(cur, on, bs, dtype=np.float32)
+                blk = blk * self._gate(cur, on, bs, sw_off)
                 self._stem_gain[stem] = on
             elif not on:
                 continue

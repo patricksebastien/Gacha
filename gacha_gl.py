@@ -344,8 +344,11 @@ class GLBackdrop(QOpenGLWidget):
         self.state_fn = None
         self.current = None
         self.input = None                # live capture device while video in is on
+        self._input_opts = None          # its capture mode
         self.source2 = None              # a second capture device (the webcam), kept open
         self.input2 = None               # its device string while it is on
+        self._input2_opts = None
+        self.enabled = True              # False: no decoding, no repaint, a black widget
         self.second_on_b = False         # the second input is the B layer, in place of the take frames
         self._src_error2 = None
         self.videos_fn, self.default_video = videos_fn, default_video
@@ -396,11 +399,17 @@ class GLBackdrop(QOpenGLWidget):
         `None` switches back."""
         if self.source is None:
             return
-        self.input = device
-        if device:
-            self.source.open(device, options=options)
+        self.input, self._input_opts = device, options
+        if self.enabled:
+            self._open_main(random_start=True)
+
+    def _open_main(self, random_start=False):
+        """The first source shows what is chosen: the capture device, else
+        the current clip."""
+        if self.input:
+            self.source.open(self.input, options=self._input_opts)
         elif self.current is not None:
-            self.source.open(self.current, random_start=True)
+            self.source.open(self.current, random_start)
 
     def set_second(self, device, options=None):
         """A second capture device (a webcam next to the VHS grabber) opened
@@ -408,14 +417,39 @@ class GLBackdrop(QOpenGLWidget):
         A/B pedal, where the section's take frames go otherwise, so the
         pedal dissolves the tape into the webcam. None closes it; the first
         input is untouched."""
-        self.input2 = device
+        self.input2, self._input2_opts = device, options
         if device:
             if self.source2 is None:
                 self.source2 = VideoSource(parent=self)
             self._src_error2 = None
-            self.source2.open(device, options=options)
+            if self.enabled:
+                self.source2.open(device, options=options)
         elif self.source2 is not None:
             self.source2.close()
+
+    def set_enabled(self, on):
+        """Video off: the decoders let their file or device go (a capture
+        device is free for other programs), the 60 fps repaint stops and
+        the widget paints black once; the effects, the shader layer and the
+        section's frames cost nothing until it is on again, when what was
+        chosen (the input, the clip, the second input) reopens as it was."""
+        on = bool(on)
+        if on == self.enabled:
+            return
+        self.enabled = on
+        if on:
+            if self.source is not None:
+                self._open_main(random_start=True)
+            if self.input2 and self.source2 is not None:
+                self.source2.open(self.input2, options=self._input2_opts)
+            self._timer.start(16)
+        else:
+            self._timer.stop()
+            for s in (self.source, self.source2):
+                if s is not None:
+                    s.close()
+            self._shown = self._shown_ov = None
+            self.update()                    # one paint: black
 
     def set_second_on_b(self, on):
         """On: the second input's picture is the B layer under the pedal
@@ -432,15 +466,17 @@ class GLBackdrop(QOpenGLWidget):
         return None
 
     def live_source(self):
-        """The capture device behind the A picture, or None when a clip is."""
+        """The capture device behind the A picture, or None when a clip is
+        (or the video is off: the device is closed then)."""
         src = self.source
-        return src if (self.input and src is not None and src.is_live) else None
+        return src if (self.enabled and self.input and src is not None and src.is_live) else None
 
     def set_video(self, path, random_start=False):
         if self.source is None or self.input:
             return None
         self.current = Path(path)
-        self.source.open(self.current, random_start)
+        if self.enabled:
+            self.source.open(self.current, random_start)
         return self.current
 
     def pick_random(self):
@@ -636,6 +672,11 @@ class GLBackdrop(QOpenGLWidget):
 
     def paintGL(self):
         if not self._gl_ok:
+            return
+        if not self.enabled:                 # video off: the background, nothing else
+            gl = self.gl
+            gl.glClearColor(16 / 255, 9 / 255, 7 / 255, 1.0)
+            gl.glClear(GL_COLOR_BUFFER_BIT)
             return
         t_start = time.perf_counter()
         self._paint()

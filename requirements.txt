@@ -17,3 +17,6 @@ aalink
 # static ffmpeg binary when none is on PATH (no ffprobe, so gacha_transcode.py
 # still wants the system one)
 imageio-ffmpeg
+# the Videos tab's Fetch button: clips from YouTube and friends (run as a
+# subprocess; when a site breaks it, pip install -U yt-dlp is the whole fix)
+yt-dlp

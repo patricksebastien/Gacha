@@ -393,6 +393,14 @@ class InsertChain:
             return False
         return self.items[k[0]].set_frac(k[1], x)
 
+    def knob_value(self, n):
+        """What MIDI slot n points at, as 0..1, or None when it points at
+        nothing (what an LFO on the slot reads as its centre)."""
+        k = self.knobs[n] if 0 <= n < KNOBS else None
+        if k is None or k[0] >= len(self.items):
+            return None
+        return self.items[k[0]].get_frac(k[1])
+
     def fingerprint(self):
         """The parameter names of the whole chain, for spotting a plugin
         that renamed or added parameters (plugdata when a [param] object

@@ -1207,9 +1207,10 @@ def compose(seed, duration, sample_files, intro_bars=None,
     k = (knobs or Knobs()).sanitized()
     events = []
 
-    def ev(t, src, off, dur, rate, role):
+    def ev(t, src, off, dur, rate, role, vel=1.0):
+        # the seventh field, the hit's velocity 0..1, is what the MIDI out sends
         events.append([round(t / SR, 4), src, round(max(0, off) / SR, 4),
-                       round(dur / SR, 4), round(rate, 4), role])
+                       round(dur / SR, 4), round(rate, 4), role, round(vel, 3)])
     if intro_bars is not None and intro_bars < 1:   # 0 bars = no intro at all
         intro_bars, intro_style = None, "none"
     rng = random.Random(seed)
@@ -1388,7 +1389,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                                            gains[role]))
                             ksrc, onset = kit_src[role][vi]
                             ev(max(0, pos), ksrc, onset, len(kit[role][vi][1]),
-                               1.0, role)
+                               1.0, role, vel)
                         if sgains[role] > 0 and synth:
                             layers.append((pick_layer(synth[role], vel),
                                            sgains[role]))
@@ -1419,14 +1420,15 @@ def compose(seed, duration, sample_files, intro_bars=None,
                     ramp = rng.choice([-1, 1])        # fade out or fade in
                     for i in range(n_rep):
                         t = i / max(1, n_rep - 1)
-                        g = g_hat * (1.0 - 0.7 * (t if ramp < 0 else 1 - t))
+                        gv = 1.0 - 0.7 * (t if ramp < 0 else 1 - t)
+                        g = g_hat * gv
                         h = hit
                         if pan_drums > 0:             # glitch sweeps the field
                             h = panned(hit, np.sin(t * np.pi * 2) * 0.7)
                         gpos = bar_start + int(s * step_len * SR) + i * spacing
                         put("drums", h, gpos, g)
                         if gsrc:
-                            ev(gpos, gsrc[0], gsrc[1], spacing, 1.0, "glitch")
+                            ev(gpos, gsrc[0], gsrc[1], spacing, 1.0, "glitch", gv)
 
         # ---- special intro content ----
         if intro_kind == "reverse-swell":

@@ -2,9 +2,9 @@
 """
 gacha.py — Qt front-end for the gacha_engine.py render engine.
 
-Left side: all generation parameters in tabs (General / Drums / Sections /
-Layers & FX / Video / Perform / Controls) and the live render log in a tab
-of its own.
+Left side: all generation parameters in tabs (General / Perform / Drums /
+Sections, the layers & effects on the same page / Video / Audio FX / Video FX /
+Controls) and the live render log in a tab of its own.
 Right side: the sample library (samples/, one subfolder per set, with
 checkboxes picking what a render may use), the video library (videos/,
 same tree, picking the backdrop clips), past renders
@@ -27,17 +27,17 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from PySide6.QtCore import (QEvent, QObject, QPoint, QSize, Qt, QRectF, QSettings,
+from PySide6.QtCore import (QEvent, QObject, QPoint, QPointF, QSize, Qt, QRectF, QSettings,
                             QThread, QTimer, QUrl, Signal)
-from PySide6.QtGui import (QColor, QImage, QKeySequence, QPainter,
-                           QRegularExpressionValidator, QShortcut)
+from PySide6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
+                           QPolygonF, QRegularExpressionValidator, QShortcut)
 from PySide6.QtCore import QRegularExpression
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PySide6.QtWidgets import (
-    QFileDialog,
+    QFileDialog, QFrame,
     QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFormLayout, QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QPlainTextEdit, QProgressBar, QProgressDialog, QPushButton, QSlider, QSpinBox,
     QStyle,
     QScrollArea, QSizePolicy, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
@@ -50,7 +50,7 @@ from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
 from gacha_link import INSTALL_HINT as LINK_INSTALL_HINT, LINK_AVAILABLE, LinkClock
-from gacha_audio import LiveAudio, audio_apis, audio_devices, audio_status
+from gacha_audio import LiveAudio, audio_apis, audio_devices, audio_status, PHRASE_BARS
 from gacha_takes import TakeStore
 from gacha_section import (Material, cut_burst, render_section, render_oneshot,
                            render_swell, KINDS, STEMS)
@@ -58,11 +58,16 @@ import gacha_engine as E
 from scipy.signal import resample_poly
 import threading
 from gacha_video import VideoSource, video_has_audio, video_input_modes, video_inputs
-from gacha_midi import (MIDI_AVAILABLE, MidiIn, format_binding, midi_inputs,
-                        parse_binding)
-from gacha_fx import AUDIO_FX, BIPOLAR, CHANNELS
+from gacha_fetch import (INSTALL_HINT as FETCH_INSTALL_HINT, FetchWorker,
+                         fetch_available, looks_like_url)
+from gacha_midi import (CYCLES_CHANNELS, CYCLES_ROOT, DRUM_LABELS, DRUM_NOTES, DRUM_ROLES,
+                        MIDI_AVAILABLE, MidiIn, MidiOut, format_binding, midi_inputs,
+                        midi_outputs, parse_binding)
+from gacha_fx import ALL_CHANNELS, AUDIO_FX, BIPOLAR, CHANNELS, VOICE_LABELS, VOICES
 from gacha_erae import ERAE_AVAILABLE, PORT as ERAE_PORT, EraeSurface
 from gacha_vst import KNOBS as VST_KNOBS, InsertChain, place_editor_window, scan_plugins
+from gacha_lfo import (LfoEngine, SHAPES as LFO_SHAPES, RATES as LFO_RATES,
+                       RATE_DEFAULT as LFO_RATE_DEFAULT, MODES as LFO_MODES, N_SLOTS as LFO_SLOTS)
 try:
     import psutil                    # cpu and memory for the stats HUD
 except ImportError:                  # pragma: no cover
@@ -114,6 +119,12 @@ QPushButton {
 }
 QPushButton:hover { background: rgba(212, 48, 30, 189); }
 QPushButton:disabled { color: rgba(242,233,229,72); }
+QPushButton:checked {
+    background: rgba(255, 120, 60, 215); border: 1px solid rgba(255, 210, 170, 240);
+    color: rgb(28, 11, 9); font-weight: bold;
+}
+QPushButton:checked:hover { background: rgba(255, 150, 90, 230); }
+QPushButton#solo { padding: 2px 2px; }
 QPushButton#generate {
     background: rgba(212, 48, 30, 198); border: 1px solid rgba(255, 120, 90, 240);
     font-weight: bold;
@@ -279,6 +290,7 @@ KEYMAP = [
     ("show", "blend_next", "", "next shader blend mode (mix, add, screen)"),
     ("section", "kind_next", "", "next section kind (random, groove, break, ...)"),
     ("clock", "link", "", "Ableton Link: tempo and start/stop shared with the network, off/on"),
+    ("clock", "link_play", "", "Ableton Link: play / stop sent to the session (the section follows)"),
     ("section", "picture_next", "", "picture while a section plays: follow, take, live"),
     ("section", "dissolve_next", "", "how the A/B pedal blends the two pictures: mix, add, screen"),
     ("mix", "volume", "", "main volume: the audio stream (songs, sections, live input)"),
@@ -325,26 +337,118 @@ KEYMAP += [("show", "video_prev", "", "previous ticked video, in list order"),
 KEYMAP += [("section", "burst", "B", "burst: a slice of the material from a random "
                                     "spot, now, its frame over the picture"),
            ("section", "burst_len", "", "burst length, 10 ms to 1 s (a knob, log scale)"),
-           ("section", "glitch", "G", "glitch: sixteenths of the bar thrown about from "
-                                      "the next beat, then the next section on the bar"),
-           ("section", "break", "Shift+G", "break: beat-repeat, gap and cymbal swell into "
-                                           "the drop, then the next section on the bar")]
+           ("section", "glitch", "G", "glitch: on the 4-bar phrase's last bar, sixteenths "
+                                      "of it thrown about, then the next section on the one"),
+           ("section", "break", "Shift+G", "break: on the 4-bar phrase's last bar, beat-repeat, "
+                                           "gap and cymbal swell into the drop, then the next "
+                                           "section on the one")]
 # the second video input: a webcam next to the VHS grabber, both kept open,
 # a cut between them (last in the table so the stock MIDI notes above stay put)
 KEYMAP += [("show", "video_second", "W", "second video input (the webcam) on the B side "
                                          "of the pedal, in place of the take frames, off/on")]
+# the drum hits as MIDI notes to another program (the Controls tab's MIDI out panel)
+KEYMAP += [("section", "midi_out", "", "MIDI out: the drum hits of the section and the "
+                                       "song as notes to the chosen port, off/on")]
+# the whole picture off: no decoding, no effects, no GPU, for a sound-only night
+KEYMAP += [("show", "video_off", "V", "video off: no picture, no decoding, no GPU work "
+                                      "(the sound runs as usual), off/on")]
+# the drum voices of a section (gacha_fx.VOICES): each in or out and soloed,
+# all back in, the grid the switches, events and bursts land on, and a rack
+# per voice (ten effects and a volume, like the five channels above) with
+# its focus button
+KEYMAP += [("voices", f"voice_{_v}", f"Shift+F{_i}",
+            f"{VOICE_LABELS[_v]} in/out, on the quantize grid; its MIDI notes follow")
+           for _i, _v in enumerate(VOICES, 1)]
+KEYMAP += [("voices", f"solo_{_v}", f"Ctrl+F{_i}",
+            f"{VOICE_LABELS[_v]} solo off/on: the other voices out while any is soloed")
+           for _i, _v in enumerate(VOICES, 1)]
+KEYMAP += [("voices", "voices_reset", "Shift+F8", "every voice back in, no solo, the voice "
+                                                  "racks' effects off and their volumes at 1"),
+           ("voices", "quant_next", "", "next quantize grid: off, 1/16, 1/8, 1/4, 1/2, bar")]
+for _v in VOICES:
+    KEYMAP += [(f"rack_{_v}", f"afx_{_v}_{k}", "", f"{VOICE_LABELS[_v]}: {lbl}")
+               for k, lbl, _d, _t in AUDIO_FX]
+    KEYMAP += [(f"rack_{_v}", f"avol_{_v}", "", f"{VOICE_LABELS[_v]}: volume")]
+KEYMAP += [("audio_focus", f"focus_{_v}", "",
+            f"focus the {VOICE_LABELS[_v]} voice for the knobs above")
+           for _v in VOICES]
+# the repeat: a cell of the bar held over the running section (Perform tab)
+KEYMAP += [("section", "repeat", "H", "repeat (hold): the cell of the bar playing at the "
+                                     "press loops while the key or the note is down, at "
+                                     "the division next to it; the loop runs on underneath"),
+           ("section", "rep_finer", "-", "repeat division one finer: bar, 1/2, 1/4, 1/8, "
+                                        "1/16, 1/32, 1/64"),
+           ("section", "rep_coarser", "=", "repeat division one coarser"),
+           ("section", "rep_div", "", "repeat division as a knob: bar at the bottom, 1/64 "
+                                     "at the top"),
+           ("section", "rep_earlier", ",", "repeat position one cell earlier, round the loop"),
+           ("section", "rep_later", ".", "repeat position one cell later"),
+           ("section", "rep_pos", "", "repeat position as a knob: the captured cell in the "
+                                     "middle, 16 cells earlier to 16 later"),
+           ("section", "rep_rev", "/", "repeat backwards off/on")]
+# the LFOs (LFO tab): each slot in or out and its depth as a knob, every
+# trig and one-shot slot restarted, and the panic key
+KEYMAP += [row for _n in range(1, LFO_SLOTS + 1)
+           for row in (("lfo", f"lfo_{_n}", "", f"LFO {_n} off/on"),
+                       ("lfo", f"lfo_{_n}_depth", "", f"LFO {_n} depth, 0 to 100 % (the "
+                                                      "sign stays as set in the LFO tab)"))]
+KEYMAP += [("lfo", "lfo_trig", "", "retrigger: every trig and one-shot LFO restarts its "
+                                   "cycle now (a section start and a drop do this too)"),
+           ("lfo", "lfo_off", "Shift+L", "every LFO off, the knobs back where you set them")]
+# ids held rather than pressed: the key's or the note's release matters too
+# (no QShortcut, the event filter sees both; a CC's falling edge releases)
+HOLD = {"repeat"}
 # ids that take a value (0..1) instead of firing; only a CC can drive them
-CONTINUOUS = {"ab", "volume", "sync", "shader_mix", "shader_pick", "avol", "burst_len"} \
+CONTINUOUS = {"ab", "volume", "sync", "shader_mix", "shader_pick", "avol", "burst_len",
+              "rep_div", "rep_pos"} | {f"lfo_{_n}_depth" for _n in range(1, LFO_SLOTS + 1)} \
     | {f"grade_{k}" for k, *_ in VIDEO_GRADE} | {f"fx_{k}" for k, *_ in VIDEO_EFFECTS} \
     | {f"afx_{k}" for k, *_ in AUDIO_FX} \
-    | {f"afx_{_ch}_{k}" for _ch in CHANNELS for k, *_ in AUDIO_FX} \
-    | {f"avol_{_ch}" for _ch in CHANNELS} | {f"vst_{n}" for n in range(1, VST_KNOBS + 1)}
+    | {f"afx_{_ch}_{k}" for _ch in ALL_CHANNELS for k, *_ in AUDIO_FX} \
+    | {f"avol_{_ch}" for _ch in ALL_CHANNELS} | {f"vst_{n}" for n in range(1, VST_KNOBS + 1)}
 KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
                  "section": "section engine", "mix": "mix and shader",
                  "grade": "source grade", "fx": "video effects",
                  "audio_focus": "audio racks: focused channel",
                  "vst": "master inserts (VST3)", "vfx": "video fx: the pool",
-                 **{f"audio_{_ch}": f"audio rack: {_ch}" for _ch in CHANNELS}}
+                 "voices": "drum voices", "lfo": "LFOs",
+                 **{f"audio_{_ch}": f"audio rack: {_ch}" for _ch in CHANNELS},
+                 **{f"rack_{_v}": f"audio rack: {VOICE_LABELS[_v]} voice" for _v in VOICES}}
+VOICE_SHORT = {"kick": "kick", "snare": "snare", "hihat": "c.hat", "ohat": "o.hat",
+               "ride": "ride", "glitch": "stutter", "sub": "sub"}
+LFO_LABEL_FIX = {"ab": "A/B", "volume": "main volume", "sync": "audio sync delay",
+                 "shader_mix": "shader opacity", "shader_pick": "shader pick",
+                 "burst_len": "burst length", "rep_div": "repeat division",
+                 "rep_pos": "repeat position"}
+
+
+def _knob_label(group, ident, what):
+    """A short name for a knob in the LFO destination list."""
+    if ident in LFO_LABEL_FIX:
+        return LFO_LABEL_FIX[ident]
+    if group.startswith("audio_") or group.startswith("rack_"):
+        return f"rack {what}"                       # "drums: lowpass"
+    short = what
+    for cut in (",", " (", ":"):
+        i = short.find(cut)
+        if i > 0:
+            short = short[:i]
+    short = short.replace(" strength", "").strip()
+    return f"{ {'grade': 'grade', 'fx': 'fx', 'vst': 'vst'}.get(group, group)}: {short}"
+
+
+# the LFO destinations: (ident, label) for every knob, in table order
+LFO_DESTS = [(ident, _knob_label(group, ident, what)) for group, ident, _k, what in KEYMAP
+             if ident in CONTINUOUS and group not in ("audio_focus", "lfo")]
+# the quantize grid: what a switch, an event or a burst waits for while a
+# section plays, as a fraction of a bar (0 = at once)
+QUANT_GRIDS = [("off", 0.0), ("1/16", 1 / 16), ("1/8", 1 / 8), ("1/4", 1 / 4),
+               ("1/2", 1 / 2), ("bar", 1.0)]
+QUANT_DEFAULT = "1/8"
+# the repeat's cell: a division of the bar
+REPEAT_DIVS = [("bar", 1.0), ("1/2", 1 / 2), ("1/4", 1 / 4), ("1/8", 1 / 8),
+               ("1/16", 1 / 16), ("1/32", 1 / 32), ("1/64", 1 / 64)]
+REPEAT_DEFAULT = "bar"
+REPEAT_RANGE = 16                 # cells earlier or later the position knob reaches
 
 
 def default_midi_map():
@@ -353,24 +457,33 @@ def default_midi_map():
     pad or a keyboard sends; the knobs on CC 11 (expression) for A/B, then
     12, 13, ... in table order, channel 1. The audio racks live on MIDI
     channel 2: CC 1 upward for their knobs, notes from 36 for the focus
-    buttons. Any controller overwrites these by MIDI learn."""
-    out, note, cc = {}, 36, 11
-    a_note, a_cc = 36, 1                      # the audio racks: MIDI channel 2
+    buttons; the drum voices on channel 3 the same way, their switches as
+    notes from 36 and their racks' knobs on CC 1 upward. Channel 1's notes
+    ran out at 127 with the repeat's buttons: the buttons after that go on
+    channel 4 from note 36, and a channel's CCs past 127 the same way. Any
+    controller overwrites these by MIDI learn."""
+    out = {}
+    # (kind, channel) -> next number; a channel that runs past 127 spills
+    # into the one after the last in use, 4 at first
+    nxt = {("note", 1): 36, ("cc", 1): 11, ("note", 2): 36, ("cc", 2): 1,
+           ("note", 3): 36, ("cc", 3): 1}
+    spill = {}
+
+    def take(kind, ch):
+        while nxt[(kind, ch)] > 127:
+            if (kind, ch) not in spill:
+                new = max(c for _k, c in nxt) + 1
+                spill[(kind, ch)] = new
+                nxt[(kind, new)] = 36 if kind == "note" else 1
+            ch = spill[(kind, ch)]
+        n = nxt[(kind, ch)]
+        nxt[(kind, ch)] = n + 1
+        return format_binding(kind, ch, n)
     for group, ident, _k, _w in KEYMAP:
         audio = group.startswith("audio")
-        if ident in CONTINUOUS:
-            if audio:
-                out[ident] = format_binding("cc", 2, a_cc)
-                a_cc += 1
-            else:
-                out[ident] = format_binding("cc", 1, cc)
-                cc += 1
-        elif audio:
-            out[ident] = format_binding("note", 2, a_note)
-            a_note += 1
-        else:
-            out[ident] = format_binding("note", 1, note)
-            note += 1
+        voice = group == "voices" or group.startswith("rack_")
+        kind = "cc" if ident in CONTINUOUS else "note"
+        out[ident] = take(kind, 3 if voice else 2 if audio else 1)
     return out
 
 
@@ -414,7 +527,7 @@ class FollowPlan:
     def __init__(self, events, sources):
         self.lists = {g: ([], []) for g in ("drums", "hits", "chops", "textures")}
         ok = {}
-        for t, src, off, dur, rate, role in events:
+        for t, src, off, dur, rate, role, *_vel in events:
             video = sources.get(src)
             group = EVENT_GROUP.get(role)
             if video is None or group is None:
@@ -629,8 +742,11 @@ class VideoBackdrop(QWidget):
         self.frames = 0             # paints so far (the stats HUD reads the rate)
         self.current = None         # path of the video now looping
         self.input = None           # live capture device while video in is on
+        self._input_opts = None     # its capture mode
         self.source2 = None         # a second capture device (the webcam), kept open
         self.input2 = None          # its device string while it is on
+        self._input2_opts = None
+        self.enabled = True         # False: no decoding, no repaint, a black widget
         self.second_on_b = False    # the second input as the B layer (GL only shows it)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
@@ -648,16 +764,42 @@ class VideoBackdrop(QWidget):
         """A second capture device (a webcam next to the VHS grabber) opened
         alongside the first; the GL backdrop puts it on the B side of the
         pedal, this one only keeps it open. None closes it."""
-        self.input2 = device
+        self.input2, self._input2_opts = device, options
         if device:
             if self.source2 is None:
                 self.source2 = VideoSource(parent=self)
-            self.source2.open(device, options=options)
+            if self.enabled:
+                self.source2.open(device, options=options)
         elif self.source2 is not None:
             self.source2.close()
 
     def set_second_on_b(self, on):
         self.second_on_b = bool(on)     # the B layer is GL only, like the take frames
+
+    def set_enabled(self, on):
+        """Video off: decoders closed, no frames processed, a black widget;
+        on again reopens what was chosen (see GLBackdrop.set_enabled)."""
+        on = bool(on)
+        if on == self.enabled:
+            return
+        self.enabled = on
+        if on:
+            if self.source is not None:
+                self._open_main(random_start=True)
+            if self.input2 and self.source2 is not None:
+                self.source2.open(self.input2, options=self._input2_opts)
+        else:
+            for s in (self.source, self.source2):
+                if s is not None:
+                    s.close()
+            self._image = self._live = self._arr = None
+            self.update()
+
+    def _open_main(self, random_start=False):
+        if self.input:
+            self.source.open(self.input, options=self._input_opts)
+        elif self.current is not None:
+            self.source.open(self.current, random_start)
 
     def second_frame(self):
         if self.second_on_b and self.input2 and self.source2 is not None:
@@ -665,9 +807,10 @@ class VideoBackdrop(QWidget):
         return None
 
     def live_source(self):
-        """The capture device behind the picture, or None when a clip is."""
+        """The capture device behind the picture, or None when a clip is
+        (or the video is off: the device is closed then)."""
         src = self.source
-        return src if (self.input and src is not None and src.is_live) else None
+        return src if (self.enabled and self.input and src is not None and src.is_live) else None
 
     def set_input(self, device, options=None):
         """Live video in: show a capture device (see video_inputs()) instead
@@ -676,17 +819,16 @@ class VideoBackdrop(QWidget):
         `None` switches back."""
         if self.source is None:
             return
-        self.input = device
-        if device:
-            self.source.open(device, options=options)
-        elif self.current is not None:
-            self.source.open(self.current, random_start=True)
+        self.input, self._input_opts = device, options
+        if self.enabled:
+            self._open_main(random_start=True)
 
     def set_video(self, path, random_start=False):
         if self.source is None or self.input:
             return None
         self.current = Path(path)
-        self.source.open(self.current, random_start)
+        if self.enabled:
+            self.source.open(self.current, random_start)
         return self.current
 
     def pick_random(self):
@@ -702,6 +844,8 @@ class VideoBackdrop(QWidget):
         return self.set_video(random.choice(pool), random_start=True)
 
     def _on_frame(self):
+        if not self.enabled:
+            return
         src = self.source
         fr = src.latest() if src is not None else None
         if fr is None or fr is self._live:
@@ -1103,6 +1247,163 @@ class AppPlayer(QObject):
         return self.active.playbackState()
 
 
+class LfoBar(QWidget):
+    """An LFO's wave right now: a bar from the middle, right for positive,
+    left for negative, lit while the slot is on."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.value, self.on = 0.0, False
+        self.setFixedSize(64, 14)
+
+    def set_value(self, value, on):
+        value = max(-1.0, min(1.0, float(value)))
+        if (value, on) != (self.value, self.on):
+            self.value, self.on = value, on
+            self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(28, 11, 9, 117))
+        p.drawRoundedRect(QRectF(0, 0, w, h), 4, 4)
+        mid = w / 2
+        if self.on:
+            p.setBrush(QColor(255, 214, 80, 230))
+            x = mid * self.value
+            p.drawRect(QRectF(min(mid, mid + x), 2, abs(x), h - 4))
+        p.setBrush(QColor(242, 233, 229, 120))
+        p.drawRect(QRectF(mid - 0.5, 0, 1, h))
+
+
+class PerfMeter(QWidget):
+    """The section at a glance, big enough to read from the pedals: what
+    plays (kind, root, tempo) in large type, and the loop's bars as a row of
+    cells, the current one lit with a sweep running through it over the
+    bar, four beat dots under each, a mark after every phrase. A held
+    repeat draws its window over the cells in yellow, the cell's own
+    playhead inside it and a chevron for the direction, while the sweep
+    underneath goes on showing the transport the loop will come back to."""
+
+    ACCENT = QColor(212, 48, 30, 230)
+    REPEAT = QColor(255, 214, 80, 70)
+    REPEAT_EDGE = QColor(255, 214, 80, 240)
+    SWEEP = QColor(255, 130, 90, 170)
+    PASSED = QColor(134, 28, 20, 110)
+    IDLE = QColor(28, 11, 9, 117)
+    TEXT = QColor(242, 233, 229)
+    DIM = QColor(242, 233, 229, 110)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.title = "no section"
+        self.bars = 8
+        self.pos = None                  # bars into the loop (float), None = nothing plays
+        self.repeat = None               # (start, length, backwards, heard), in bars
+        self.setMinimumHeight(132)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_state(self, title, bars=None, pos=None, repeat=None):
+        """`title` the big line; `bars` the loop's length; `pos` the
+        position in bars (0 <= pos < bars), or None while nothing plays;
+        `repeat` a held repeat's window as (start, length, backwards,
+        heard), start and heard in bars into the loop, length in bars."""
+        bars = self.bars if bars is None else max(1, int(bars))
+        if (title, bars, pos, repeat) == (self.title, self.bars, self.pos, self.repeat):
+            return
+        self.title, self.bars, self.pos, self.repeat = title, bars, pos, repeat
+        self.update()
+
+    def _x(self, b, cw, gap, end=False):
+        """The x of bar position `b` (bars into the loop); `end` for the
+        end of a span, so a whole bar ends at its own cell's right edge."""
+        i = int(b)
+        f = b - i
+        if end and f == 0.0 and i > 0:
+            i, f = i - 1, 1.0
+        return i * (cw + gap) + cw * f
+
+    def _paint_repeat(self, p, cw, gap, top, ch):
+        """The repeat's window over the cells (two pieces round the loop's
+        end), the playhead in it, a chevron for the direction."""
+        start, length, rev, heard = self.repeat
+        n = self.bars
+        end = start + length
+        spans = [(start, min(end, n))]
+        if end > n:
+            spans.append((0.0, end - n))
+        p.setPen(QPen(self.REPEAT_EDGE, 2))
+        p.setBrush(self.REPEAT)
+        for a, b in spans:
+            x0, x1 = self._x(a, cw, gap), self._x(b, cw, gap, end=True)
+            p.drawRoundedRect(QRectF(x0, top - 4, max(4.0, x1 - x0), ch + 8), 5, 5)
+        # the chevron at the leading edge: where the cell runs towards
+        a, b = spans[0] if not rev else spans[-1]
+        x0, x1 = self._x(a, cw, gap), self._x(b, cw, gap, end=True)
+        s = min(10.0, max(4.0, (x1 - x0) / 3))
+        cy = top - 4 + s
+        xe = x1 - 3 if not rev else x0 + 3
+        d = -s if not rev else s
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.REPEAT_EDGE)
+        p.drawPolygon(QPolygonF([QPointF(xe, cy), QPointF(xe + d, cy - s),
+                                 QPointF(xe + d, cy + s)]))
+        if heard is not None:                      # the cell's own playhead, white
+            xh = self._x(heard % n, cw, gap)
+            p.setBrush(self.TEXT)
+            p.drawRect(QRectF(xh - 1.5, top - 4, 3, ch + 8))
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        f = p.font()
+        f.setPixelSize(28)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(self.TEXT if self.pos is not None else self.DIM)
+        p.drawText(QRectF(2, 0, w - 4, 40), Qt.AlignLeft | Qt.AlignVCenter, self.title)
+        n = self.bars
+        gap, top = 6.0, 48.0
+        ch = h - top - 6
+        cw = (w - gap * (n - 1)) / n
+        cur = None if self.pos is None else int(self.pos) % n
+        frac = 0.0 if self.pos is None else self.pos - int(self.pos)
+        num = QFont(f)
+        num.setPixelSize(max(12, int(ch * 0.5)))
+        for i in range(n):
+            x = i * (cw + gap)
+            r = QRectF(x, top, cw, ch)
+            p.setPen(Qt.NoPen)
+            if i == cur:
+                p.setBrush(self.ACCENT)
+            elif cur is not None and i < cur:
+                p.setBrush(self.PASSED)
+            else:
+                p.setBrush(self.IDLE)
+            p.drawRoundedRect(r, 8, 8)
+            if i == cur and frac > 0:                 # the sweep through the bar
+                p.setBrush(self.SWEEP)
+                p.drawRoundedRect(QRectF(x, top, max(8.0, cw * frac), ch), 8, 8)
+            p.setFont(num)
+            p.setPen(self.TEXT if i == cur else self.DIM)
+            p.drawText(QRectF(x, top, cw, ch - 10), Qt.AlignCenter, str(i + 1))
+            p.setPen(Qt.NoPen)
+            for b in range(4):                        # the beats of the bar
+                lit = i == cur and frac * 4 >= b
+                p.setBrush(self.TEXT if lit else QColor(242, 233, 229, 50))
+                cx = x + cw * (b + 0.5) / 4
+                p.drawEllipse(QRectF(cx - 3, top + ch - 10, 6, 6))
+            if (i + 1) % PHRASE_BARS == 0 and i + 1 < n:   # the phrase's end
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(255, 120, 90, 220))
+                p.drawRect(QRectF(x + cw + gap / 2 - 1, top - 6, 2, ch + 12))
+        if self.repeat is not None and self.pos is not None:
+            self._paint_repeat(p, cw, gap, top, ch)
+        p.end()
+
+
 class HoverTabs(QObject):
     """Switch a QTabWidget's page by hovering its tabs: after `delay` ms on
     one tab it becomes current, no click needed. Install with
@@ -1201,6 +1502,7 @@ class Main(QMainWindow):
         self._last_switch_ms = 0.0  # song position of the last clip switch
         self._video_deck = []       # video_random: the shuffled order left to deal
         self._video_deck_pool = []  # ...and the ticked videos it was dealt from
+        self._live_switch_t = time.monotonic()   # last automatic clip switch (live, sections)
         self._sections = []         # full section dicts of the playing file
         self._beat_ms = 500.0
         self._env = None            # loudness envelope, one value per 50 ms
@@ -1209,6 +1511,7 @@ class Main(QMainWindow):
         self._last_mouse = None
         self._cursor_hidden = False
         self._fullscreen = False                    # see toggle_fullscreen
+        self._was_maximized = False                 # ...and what to go back to
         self._look = {}             # per-section random multipliers per effect
         self._look_idx = None       # (section, 4-bar phrase) of the current look
         self._reverse_bar = None    # (section, bar) last rolled for a rewind
@@ -1262,6 +1565,8 @@ class Main(QMainWindow):
         self._perf_hold = None                      # the last take frame shown: held over gaps
         self._perf_drop_t = None                    # monotonic time a break dropped into a section
         self._perf_ready = None                     # (key, Section, stems48) pre-rendered
+        self._perf_key_last, self._perf_key_t = None, 0.0   # the knobs' last change, see _perf_refresh_ready
+        self._perf_poll_n = 0
         self._perf_busy = None                      # ("section"|"shot", key) rendering now
         self._perf_result = None                    # set by the render thread
         self._perf_want = False                     # play the next result as soon as it lands
@@ -1335,6 +1640,8 @@ class Main(QMainWindow):
             box.setSpacing(0)
             box.addWidget(tree, stretch=1)
             box.addWidget(status)
+            if tree is self.videos_tree:
+                box.addLayout(self._build_fetch_row())
             w = QWidget()
             w.setLayout(box)
             tabs.addTab(w, title)
@@ -1390,7 +1697,7 @@ class Main(QMainWindow):
         # parameters 60 %, the file lists 40 %; the ratio survives resizes
         # and follows the handle when it is dragged
         self.split = split
-        self._split_ratio = 0.60
+        self._split_ratio = 0.70            # the tabs' share of the width at launch
         split.splitterMoved.connect(self._split_dragged)
         self.setStyleSheet(STYLE)
         self.gl_mode = gl_available()
@@ -1401,6 +1708,8 @@ class Main(QMainWindow):
         self.backdrop.state_fn = self._video_state
         self.backdrop.shader_mix = self.shader_mix.value()
         self.backdrop.shader_blend = self.shader_blend.currentIndex()
+        if self.settings.value("video/off", False, type=bool):
+            self.video_off.setChecked(True)      # the backdrop exists now: it applies
         self.setCentralWidget(self.backdrop)
         # the stats HUD: a label over the picture, top right, above the interface
         self.hud = QLabel(self.backdrop)
@@ -1455,6 +1764,15 @@ class Main(QMainWindow):
             "glitch": lambda: self.perform_break("glitch"),
             "break": lambda: self.perform_break("break"),
             "burst_len": self._burst_len_frac,
+            "repeat": lambda: self._rep_hold("midi", True),
+            "rep_finer": lambda: self._rep_div_step(1),
+            "rep_coarser": lambda: self._rep_div_step(-1),
+            "rep_div": self._rep_div_frac,
+            "rep_earlier": lambda: self.rep_pos.setValue(self.rep_pos.value() - 1),
+            "rep_later": lambda: self.rep_pos.setValue(self.rep_pos.value() + 1),
+            "rep_pos": lambda x: self.rep_pos.setValue(
+                round((max(0.0, min(1.0, x)) - 0.5) * 2 * REPEAT_RANGE)),
+            "rep_rev": self.rep_rev.toggle,
             "ab_down": lambda: self.perf_ab.setValue(self.perf_ab.value() - 10),
             "ab_up": lambda: self.perf_ab.setValue(self.perf_ab.value() + 10),
             "ab": lambda x: self.perf_ab.setValue(round(x * 100)),
@@ -1463,6 +1781,11 @@ class Main(QMainWindow):
             self.actions[f"shader_{n}"] = lambda n=n: self.select_shader_key(n)
         for stem in STEMS:
             self.actions[f"stem_{stem}"] = self.perf_stems[stem].toggle
+        for v in VOICES:
+            self.actions[f"voice_{v}"] = self.perf_voices[v].toggle
+            self.actions[f"solo_{v}"] = self.perf_solos[v].toggle
+        self.actions["voices_reset"] = self._voices_reset
+        self.actions["quant_next"] = lambda: self._combo_next(self.perf_quant)
         # MIDI-only buttons
         self.actions.update({
             "randomize_fx": self._randomize_video,
@@ -1470,6 +1793,7 @@ class Main(QMainWindow):
             "blend_next": lambda: self._combo_next(self.shader_blend),
             "kind_next": lambda: self._combo_next(self.perf_kind),
             "link": self.link_on.toggle,
+            "link_play": self._link_press,
             "picture_next": lambda: self._combo_next(self.perf_picture),
             "dissolve_next": lambda: self._combo_next(self.perf_dissolve),
         })
@@ -1491,7 +1815,7 @@ class Main(QMainWindow):
         for k, *_ in AUDIO_FX:
             self.actions[f"afx_{k}"] = self._afx_focused(k)
         self.actions["avol"] = self._afx_focused("vol")
-        for ch in CHANNELS:
+        for ch in ALL_CHANNELS:
             self.actions[f"focus_{ch}"] = lambda ch=ch: self.afx_focus.setCurrentText(ch)
         self.actions["inserts"] = self.vst_bypass.toggle
         for k, cb in self.vfx_on.items():
@@ -1502,13 +1826,37 @@ class Main(QMainWindow):
         self.actions["video_next"] = lambda: self._video_step(1)
         self.actions["video_random"] = self._video_random
         self.actions["video_second"] = self.video_second.toggle
+        self.actions["midi_out"] = self.midi_out_on.toggle
+        self.actions["video_off"] = self.video_off.toggle
         for n in range(1, VST_KNOBS + 1):
             self.actions[f"vst_{n}"] = lambda x, n=n: self.inserts.knob(n - 1, x)
+        # the LFOs: each slot's switch and depth, the trigger, the panic
+        for n in range(1, LFO_SLOTS + 1):
+            self.actions[f"lfo_{n}"] = self.lfo_rows[n - 1]["on"].toggle
+            self.actions[f"lfo_{n}_depth"] = lambda x, n=n: self._lfo_depth_frac(n - 1, x)
+        self.actions["lfo_trig"] = lambda: self.lfo.trigger(time.monotonic())
+        self.actions["lfo_off"] = self._lfo_all_off
+        # the knobs the LFOs read: every widget-backed one by its id (the
+        # rest, shader pick, burst length, the repeat division and the VST
+        # knobs, are read by _lfo_get on their own terms)
+        self.knob_widgets = {"volume": self.vol, "sync": self.through_sync,
+                             "shader_mix": self.shader_mix, "ab": self.perf_ab,
+                             "rep_pos": self.rep_pos}
+        self.knob_widgets.update({f"grade_{k}": sp for k, sp in self.grade.items()})
+        self.knob_widgets.update({f"fx_{k}": sp for k, sp in self.vfx.items()})
+        self.knob_widgets.update({(f"avol_{ch}" if key == "vol" else f"afx_{ch}_{key}"): sp
+                                  for (ch, key), sp in self.afx.items()})
+        # the holds: a release handler next to the press, and the keys the
+        # event filter watches (a shortcut would fire on the press alone)
+        self.releases = {"repeat": lambda: self._rep_hold("midi", False)}
+        self.holds = {"repeat": self._rep_hold}
+        self._hold_keys = {QKeySequence(key).toString(): ident
+                           for _g, ident, key, _w in KEYMAP if key and ident in HOLD}
         missing = [ident for _g, ident, _k, _w in KEYMAP if ident not in self.actions]
         assert not missing, f"actions without a handler: {missing}"
         self.shortcuts = []
         for _g, ident, key, _w in KEYMAP:
-            if not key or ident in CONTINUOUS:
+            if not key or ident in CONTINUOUS or ident in HOLD:
                 continue
             sc = QShortcut(QKeySequence(key), self)
             sc.setContext(Qt.ApplicationShortcut)
@@ -1516,6 +1864,10 @@ class Main(QMainWindow):
             self.shortcuts.append(sc)
         self._midi_setup()
         self._update_afx_status()
+        self._lfo_timer = QTimer(self)
+        self._lfo_timer.setTimerType(Qt.PreciseTimer)
+        self._lfo_timer.timeout.connect(self._lfo_tick)
+        self._lfo_timer.start(10)
         # every combo's list is a window of its own, and Windows does not
         # keep it above a fullscreen window: in F11 the list opened out of
         # sight, behind the picture. Stay-on-top puts it in the band above.
@@ -1641,14 +1993,21 @@ class Main(QMainWindow):
     # ---------- parameter tabs ----------
     def _build_params(self):
         tabs = QTabWidget()
-        tabs.addTab(self._tab_general(), "General")
-        tabs.addTab(self._tab_drums(), "Drums")
-        tabs.addTab(self._tab_sections(), "Sections")
-        tabs.addTab(self._tab_layers(), "Layers && FX")
-        tabs.addTab(self._tab_video(), "Video")
-        tabs.addTab(self._tab_perform(), "Perform")
+        # built in this order: the Perform tab makes the voice switches the
+        # Audio FX tab's column heads link to, and the Video tab the widgets
+        # the Perform tab reads
+        general = self._tab_general()
+        drums, sections = self._tab_drums(), self._tab_sections_layers()
+        video = self._tab_video()
+        perform = self._tab_perform()
+        tabs.addTab(general, "General")
+        tabs.addTab(perform, "Perform")
+        tabs.addTab(drums, "Drums")
+        tabs.addTab(sections, "Sections")
+        tabs.addTab(video, "Video")
         tabs.addTab(self._tab_audio_fx(), "Audio FX")
         tabs.addTab(self._tab_video_fx(), "Video FX")
+        tabs.addTab(self._tab_lfo(), "LFO")
         tabs.addTab(self._tab_controls(), "Controls")
         tabs.addTab(self._tab_log(), "Log")
         HoverTabs(tabs)                  # hover a tab to open it, no click
@@ -1751,6 +2110,11 @@ class Main(QMainWindow):
         self.midi_last = QLabel("no MIDI yet" if MIDI_AVAILABLE else
                                 "MIDI off: pip install mido python-rtmidi")
         self.midi_last.setProperty("role", "sub")
+        # two columns: the MIDI inputs on the left, the Erae 2 on the right
+        left = QVBoxLayout()
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(4)
+        left.addWidget(QLabel("MIDI inputs"))
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.addWidget(self.midi_ports, stretch=1)
@@ -1758,13 +2122,11 @@ class Main(QMainWindow):
         side.addWidget(rescan)
         side.addStretch(1)
         top.addLayout(side)
-        outer.addWidget(QLabel("MIDI inputs"))
-        outer.addLayout(top)
-        outer.addWidget(self.midi_last)
+        left.addLayout(top)
+        left.addWidget(self.midi_last)
         # the Erae 2's API zones as a drawn control surface (gacha_erae.py);
         # on, this owns the Erae's port and forwards its pads' notes and CCs
-        self.erae_on = QCheckBox("Erae 2 surface: the layout's API zones become "
-                                 "faders, pads and X/Y pads, lit with the app's state")
+        self.erae_on = QCheckBox("Erae 2 surface")
         self.erae_on.setToolTip(
             "Needs an Erae 2 with API zones in its layout (Erae Lab), and Erae "
             "Lab closed. The zones are taken in id order: main volume, A/B, "
@@ -1775,11 +2137,28 @@ class Main(QMainWindow):
             "below as plain MIDI. Remembered.")
         self.erae_status = QLabel("")
         self.erae_status.setProperty("role", "sub")
-        outer.addWidget(self.erae_on)
-        outer.addWidget(self.erae_status)
+        self.erae_status.setWordWrap(True)
         if not ERAE_AVAILABLE:
             self.erae_on.setEnabled(False)
             self.erae_status.setText("python-rtmidi missing")
+        erae_hint = QLabel("the layout's API zones become faders, pads and X/Y pads, "
+                           "lit with the app's state")
+        erae_hint.setProperty("role", "sub")
+        erae_hint.setWordWrap(True)
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(4)
+        right.addWidget(self.erae_on)
+        right.addWidget(erae_hint)
+        right.addWidget(self.erae_status)
+        right.addStretch(1)
+        cols = QHBoxLayout()
+        cols.setContentsMargins(0, 0, 0, 0)
+        cols.setSpacing(12)
+        cols.addLayout(left, stretch=9)      # the inputs: a bit under half the width
+        cols.addLayout(right, stretch=11)
+        outer.addLayout(cols)
+        outer.addWidget(self._midi_out_panel())
 
         tree = QTreeWidget()
         tree.setColumnCount(4)
@@ -1802,8 +2181,15 @@ class Main(QMainWindow):
             groups[group].addChild(item)
             self.midi_items[ident] = item
         tree.expandAll()
+        # the panel is short of room: rows 20 % lower than the style gives
+        # them, with the font down by as much (15 -> 12 px) so it still fits
+        row_h = tree.sizeHintForRow(0)           # what the style would give a row
+        if row_h > 0:                            # (the app's stylesheet ignores item hints)
+            tree.setStyleSheet(f"QTreeWidget {{ font-size: 12px; }} "
+                               f"QTreeWidget::item {{ height: {max(13, round(row_h * 0.8))}px; }}")
         for group in groups:                     # long knob lists: folded at first
-            if group in ("grade", "fx", "vfx") or group.startswith("audio_") and group != "audio_focus":
+            if group in ("grade", "fx", "vfx", "lfo") or group.startswith("rack_") \
+                    or group.startswith("audio_") and group != "audio_focus":
                 groups[group].setExpanded(False)
         for c in range(3):
             tree.resizeColumnToContents(c)
@@ -1814,19 +2200,21 @@ class Main(QMainWindow):
             sc.activated.connect(self._midi_clear_selected)
         self.controls_tree = tree
         tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        tree.setMinimumHeight(240)          # the tab area gives it the rest
+        tree.setMinimumHeight(160)          # the page gives it the rest, and scrolls
         outer.addWidget(tree, stretch=1)
         clear_btn = QPushButton("clear binding")
         clear_btn.setToolTip("Forget the MIDI binding of the selected row")
         clear_btn.clicked.connect(self._midi_clear_selected)
         defaults_btn = QPushButton("defaults")
         defaults_btn.setToolTip("Back to the stock map: notes from C1 up, "
-                                "one per button, CC 11 for A/B, channel 1")
+                                "one per button, CC 11 for A/B, channel 1; the "
+                                "audio racks on channel 2, the drum voices on 3")
         defaults_btn.clicked.connect(self._midi_defaults)
         hint = QLabel("none of these bring the hidden interface back; a button "
                       "fires on note on, program change or a CC going above 63; "
                       "a knob row takes a CC over the widget's whole range")
         hint.setProperty("role", "sub")
+        hint.setWordWrap(True)              # else its one line sets the page's width
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(hint, stretch=1)
@@ -1835,9 +2223,313 @@ class Main(QMainWindow):
         outer.addLayout(row)
         w = QWidget()
         w.setLayout(outer)
+        # the page scrolls, vertically only, when the pane is shorter than
+        # the ports, the MIDI out panel and the table together, instead of
+        # pushing the bottom out of sight
+        area = self._scrolling(w)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return area
+
+    def _midi_out_panel(self):
+        """The drum hits of the section and the song as notes on one output
+        port, for a drum machine elsewhere (Bitwig over a loopMIDI cable) to
+        play them; see the module note of gacha_audio.py."""
+        # a plain widget with its title as a label, like the VST section of
+        # the Audio FX tab (a QGroupBox draws its title over the first row
+        # under the app's stylesheet)
+        box = QVBoxLayout()
+        box.setContentsMargins(0, 4, 0, 0)
+        box.setSpacing(2)
+        box.addWidget(QLabel("MIDI out: the drum hits as notes"))
+        form = QFormLayout()
+        form.setContentsMargins(8, 2, 8, 4)
+        form.setVerticalSpacing(2)
+        self.midi_out_on = QPushButton("off")
+        self.midi_out_on.setCheckable(True)
+        self.midi_out_on.setFixedWidth(52)              # "on" / "off", no more
+        self.midi_out_on.setToolTip(
+            "Send every drum hit of the playing section and song as a MIDI "
+            "note on the port to the right, as it sounds (or ahead of it, see "
+            "lead). Also a MIDI button, midi_out in the section engine group. "
+            "Remembered.")
+        self.midi_out_port = QComboBox()
+        self.midi_out_port.setSizeAdjustPolicy(QComboBox.AdjustToContents)   # as wide as its names
+        self.midi_out_port.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        self.midi_out_port.setToolTip(
+            "The MIDI output the notes go to. Windows has no virtual MIDI port "
+            "of its own: install loopMIDI (free), make a port, pick it here and "
+            "as an input in Bitwig. Rescanned every 2 s with the inputs.")
+        self.midi_out_status = QLabel("off")
+        self.midi_out_status.setProperty("role", "sub")
+        # takes what is left of the row; a long status never widens the tab
+        self.midi_out_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        form.addRow("send", self._row([("", self.midi_out_on), ("port", self.midi_out_port),
+                                       ("", self.midi_out_status)]))
+        self.midi_out_channel = QSpinBox(minimum=1, maximum=16, value=10)
+        self.midi_out_channel.setToolTip("MIDI channel of the notes; 10 is the GM drum channel")
+        self.midi_out_cycles = QCheckBox("Model:Cycles")
+        self.midi_out_cycles.setToolTip(
+            "The receiver is an Elektron Model:Cycles: each drum goes out on its "
+            "own track channel instead of the one channel, kick 1, snare 2, closed "
+            "hat 3, open hat 4, ride 5, hat stutter 6 (the box's default T1-6 IN "
+            "channels; RCV NOTE must be on). A note on a track channel plays that "
+            "track chromatically, so the map below is the pitch of each: M:C puts "
+            "the root (C4, 60) everywhere, which leaves the track's own tuning alone.")
+        self.midi_out_lead = QSpinBox(minimum=-100, maximum=500, value=0, suffix=" ms")
+        self.midi_out_lead.setToolTip(
+            "How early each note leaves, in ms, counted from the moment our "
+            "own hit is heard. The hits are known ahead, so any lead works: "
+            "set it to the receiver's output latency (Bitwig shows it in its "
+            "audio settings) and its drums land on ours; negative sends late.")
+        self.midi_out_gate = QSpinBox(minimum=5, maximum=1000, value=50, suffix=" ms")
+        self.midi_out_gate.setToolTip("Note on to note off; drum samplers usually ignore it")
+        self.midi_out_only = QCheckBox("silence own drums")
+        self.midi_out_only.setToolTip(
+            "While sending, our six drum voices are silent so the receiver's "
+            "drums replace them instead of doubling them; the sub bass stays. "
+            "F1 still switches everything out.")
+        self.midi_out_follow = QCheckBox("follow mutes")
+        self.midi_out_follow.setToolTip(
+            "Ticked, F1 and the Perform tab's voice switches and solos take the "
+            "notes out with the sound. Off (the default) every hit goes out "
+            "whatever is muted or soloed here: the receiver mutes its own tracks. "
+            "Remembered.")
+        form.addRow("notes", self._row([("channel", self.midi_out_channel),
+                                        ("", self.midi_out_cycles),
+                                        ("lead", self.midi_out_lead),
+                                        ("gate", self.midi_out_gate),
+                                        ("", self.midi_out_only),
+                                        ("", self.midi_out_follow)]))
+        self.midi_out_notes = {}
+        pairs = []
+        for role in DRUM_ROLES:
+            sp = QSpinBox(minimum=-1, maximum=127, value=DRUM_NOTES[role])
+            sp.setSpecialValueText("off")
+            sp.setToolTip(f"The note the {DRUM_LABELS[role]} goes out as (General MIDI: "
+                          f"{DRUM_NOTES[role]}); off sends none")
+            self.midi_out_notes[role] = sp
+            pairs.append((DRUM_LABELS[role], sp))
+        gm = QPushButton("GM")
+        gm.setToolTip("The General MIDI drum notes back: kick 36, snare 38, closed hat 42, "
+                      "open hat 46, ride 51, hat stutter 44 (pedal hat)")
+        gm.clicked.connect(self._midi_out_gm)
+        pairs.append(("", gm))
+        mc = QPushButton("M:C")
+        mc.setToolTip(f"Every drum at the Model:Cycles root note {CYCLES_ROOT}: each track "
+                      "plays at its own tuning. Move one up or down to pitch that track.")
+        mc.clicked.connect(self._midi_out_cycles_root)
+        pairs.append(("", mc))
+        form.addRow("map", self._row(pairs))
+        self.midi_out_clock = QCheckBox("MIDI clock")
+        self.midi_out_clock.setToolTip(
+            "Send MIDI clock (24 ticks a beat) on the port at all times: at the "
+            "live tempo while nothing plays, and on the playing section's own beat "
+            "grid, under the same lead as the notes, so a receiver's beat sits on "
+            "our hits. The Model:Cycles needs CLK IN on and follows the tempo from "
+            "the ticks alone. Remembered.")
+        self.midi_out_transport = QCheckBox("start / stop")
+        self.midi_out_transport.setToolTip(
+            "Send Start when a section starts from silence (just before the tick "
+            "on its downbeat, so the receiver's step 1 is our bar 1; entered late "
+            "on a Link bar, on the next bar) and Stop when the sections stop or "
+            "the port closes. Only with the clock: a receiver that gets Start "
+            "without ticks stands still. Remembered.")
+        self.midi_out_sync_status = QLabel("")
+        self.midi_out_sync_status.setProperty("role", "sub")
+        self.midi_out_sync_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        form.addRow("sync", self._row([("", self.midi_out_clock), ("", self.midi_out_transport),
+                                       ("", self.midi_out_sync_status)]))
+        box.addLayout(form)
+        w = QWidget()
+        w.setLayout(box)
+        if not MIDI_AVAILABLE:
+            w.setEnabled(False)
         return w
 
     # ---------- MIDI ----------
+    def _midi_out_setup(self):
+        """The output port and its settings back from the last launch; the
+        widgets drive the stream's MidiOut from here on."""
+        self.midi_out = MidiOut()
+        self._midi_out_want = self.settings.value("midi/out_port", "") or ""
+        self._midi_out_present = []
+        self.midi_out_channel.setValue(self.settings.value("midi/out_channel", 10, type=int))
+        self.midi_out_lead.setValue(self.settings.value("midi/out_lead", 0, type=int))
+        self.midi_out_gate.setValue(self.settings.value("midi/out_gate", 50, type=int))
+        self.midi_out_only.setChecked(self.settings.value("midi/out_only", False, type=bool))
+        self.midi_out_follow.setChecked(self.settings.value("midi/out_follow", False, type=bool))
+        self.midi_out_cycles.setChecked(self.settings.value("midi/out_cycles", False, type=bool))
+        self.midi_out_channel.setEnabled(not self.midi_out_cycles.isChecked())
+        self.midi_out_clock.setChecked(self.settings.value("midi/out_clock", False, type=bool))
+        self.midi_out_transport.setChecked(
+            self.settings.value("midi/out_transport", False, type=bool))
+        saved = self.settings.value("midi/out_notes", "")
+        if saved:
+            try:
+                for role, note in json.loads(saved).items():
+                    if role in self.midi_out_notes and -1 <= int(note) <= 127:
+                        self.midi_out_notes[role].setValue(int(note))
+            except (ValueError, AttributeError, TypeError):
+                pass
+        # a map left at the first Model:Cycles root (36, every drum) moves to the real one
+        if self.midi_out_cycles.isChecked()                 and all(sp.value() == 36 for sp in self.midi_out_notes.values()):
+            for sp in self.midi_out_notes.values():
+                sp.setValue(CYCLES_ROOT)
+        for sp in (self.midi_out_channel, self.midi_out_lead, self.midi_out_gate):
+            sp.valueChanged.connect(self._midi_out_apply)
+        self.midi_out_only.toggled.connect(self._midi_out_apply)
+        self.midi_out_follow.toggled.connect(self._midi_out_apply)
+        self.midi_out_cycles.toggled.connect(self._midi_out_cycles_toggled)
+        self.midi_out_clock.toggled.connect(self._midi_out_apply)
+        self.midi_out_transport.toggled.connect(self._midi_out_apply)
+        for sp in self.midi_out_notes.values():
+            sp.valueChanged.connect(self._midi_out_apply)
+        self.midi_out_port.currentIndexChanged.connect(self._midi_out_port_changed)
+        self.midi_out_on.toggled.connect(self._midi_out_toggled)
+        self._midi_out_refresh_ports()
+        if MIDI_AVAILABLE and self.settings.value("midi/out_on", False, type=bool):
+            self.midi_out_on.setChecked(True)
+
+    def _midi_out_refresh_ports(self):
+        """The outputs list, the remembered one kept (greyed when absent)."""
+        if not MIDI_AVAILABLE:
+            return
+        ports = midi_outputs()
+        present = [lab for lab, _ in ports]
+        self._midi_out_present = ports
+        labels = list(present)
+        if self._midi_out_want and self._midi_out_want not in labels:
+            labels.append(self._midi_out_want)
+        shown = [self.midi_out_port.itemData(i) for i in range(self.midi_out_port.count())]
+        if shown != labels:
+            self.midi_out_port.blockSignals(True)
+            self.midi_out_port.clear()
+            for lab in labels:
+                text = lab if lab in present else f"{lab} (not plugged in)"
+                self.midi_out_port.addItem(text, lab)
+            idx = labels.index(self._midi_out_want) if self._midi_out_want in labels else -1
+            self.midi_out_port.setCurrentIndex(idx)
+            self.midi_out_port.blockSignals(False)
+        if self.midi_out_on.isChecked():
+            want = self._midi_out_want
+            if want and not self.midi_out.is_open and want in present:
+                self._midi_out_open()               # plugged in since: opens by itself
+            elif self.midi_out.is_open and want not in present:
+                self.midi_out.close_port()
+                self.midi_out_status.setText(f"{want} vanished; waiting for it")
+                self.log.appendPlainText(f"midi out: {want} vanished")
+            elif self.midi_out.is_open:
+                self.midi_out_status.setText(
+                    f"{want}: {self.midi_out.sent} notes sent, {self._midi_out_channels_text()}, "
+                    f"late {self.midi_out.late_ms:.1f} ms")
+        self._midi_out_sync_text()
+
+    def _midi_out_port_changed(self, idx):
+        lab = self.midi_out_port.itemData(idx) if idx >= 0 else ""
+        self._midi_out_want = lab or ""
+        self.settings.setValue("midi/out_port", self._midi_out_want)
+        if self.midi_out_on.isChecked():
+            self._midi_out_open()
+
+    def _midi_out_open(self):
+        want = self._midi_out_want
+        if not want:
+            self.midi_out.close_port()
+            self.midi_out_status.setText("no port chosen")
+            return
+        err = self.midi_out.open(want, self._midi_out_present)
+        if err:
+            self.midi_out_status.setText(err)
+            self.log.appendPlainText(f"midi out: cannot open {want}: {err}")
+        else:
+            self.midi_out_status.setText(f"{want}: open, {self._midi_out_channels_text()}")
+            self.log.appendPlainText(f"midi out: {want}, {self._midi_out_channels_text()}, "
+                                     f"lead {self.midi_out_lead.value()} ms")
+        self._midi_out_apply()
+
+    def _midi_out_toggled(self, on):
+        self.settings.setValue("midi/out_on", on)
+        self.midi_out_on.setText("on" if on else "off")
+        if on:
+            self._midi_out_refresh_ports()      # opens the port when it is there
+            if not self.midi_out.is_open:
+                self._midi_out_open()           # else say why not
+        else:
+            self.midi_out.close_port()              # note offs for what sounds
+            self.midi_out_status.setText("off")
+            self.log.appendPlainText("midi out: off")
+        self._midi_out_apply()
+
+    def _midi_out_gm(self):
+        for role, sp in self.midi_out_notes.items():
+            sp.setValue(DRUM_NOTES[role])
+
+    def _midi_out_cycles_root(self):
+        for sp in self.midi_out_notes.values():
+            sp.setValue(CYCLES_ROOT)
+
+    def _midi_out_sync_text(self):
+        """What the clock and the transport are doing, on the sync row."""
+        mo = self.midi_out
+        if not mo.is_open or not (self.midi_out_clock.isChecked()
+                                  or self.midi_out_transport.isChecked()):
+            text = ""
+        else:
+            parts = []
+            if self.midi_out_clock.isChecked():
+                parts.append(f"clock {mo.bpm:.1f} bpm, {mo.ticks} ticks")
+            if self.midi_out_transport.isChecked():
+                parts.append("running" if mo.running else "stopped")
+            text = ", ".join(parts)
+        self.midi_out_sync_status.setText(text)
+
+    def _midi_out_channels_text(self):
+        if self.midi_out_cycles.isChecked():
+            return "Model:Cycles channels 1-6"
+        return f"channel {self.midi_out_channel.value()}"
+
+    def _midi_out_cycles_toggled(self, on):
+        """A Model:Cycles at the other end: the channel box gives way to the
+        box's track channels; the notes of a fresh tick go to the root, the
+        GM ones would pitch every track up."""
+        self.midi_out_channel.setEnabled(not on)
+        if on and all(sp.value() == DRUM_NOTES[r] for r, sp in self.midi_out_notes.items()):
+            self._midi_out_cycles_root()        # applies through the spinboxes
+        self._midi_out_apply()
+        if self.midi_out.is_open:
+            self.midi_out_status.setText(f"{self._midi_out_want}: open, "
+                                         f"{self._midi_out_channels_text()}")
+
+    def _midi_out_apply(self, *_a):
+        """The panel's values to the settings and the stream."""
+        notes = {role: sp.value() for role, sp in self.midi_out_notes.items()}
+        self.settings.setValue("midi/out_channel", self.midi_out_channel.value())
+        self.settings.setValue("midi/out_lead", self.midi_out_lead.value())
+        self.settings.setValue("midi/out_gate", self.midi_out_gate.value())
+        self.settings.setValue("midi/out_only", self.midi_out_only.isChecked())
+        self.settings.setValue("midi/out_cycles", self.midi_out_cycles.isChecked())
+        self.settings.setValue("midi/out_follow", self.midi_out_follow.isChecked())
+        self.settings.setValue("midi/out_clock", self.midi_out_clock.isChecked())
+        self.settings.setValue("midi/out_transport", self.midi_out_transport.isChecked())
+        self.settings.setValue("midi/out_notes", json.dumps(notes))
+        if self.midi_out.clock_on != self.midi_out_clock.isChecked():
+            self.midi_out.clock_on = self.midi_out_clock.isChecked()
+        self.midi_out.transport_on = self.midi_out_transport.isChecked()
+        if not self.midi_out.transport_on:
+            self.midi_out.stop()                    # a Start out there is taken back
+        self._midi_out_sync_text()
+        la = self.through
+        if la is None:
+            return
+        la.midi_out = self.midi_out
+        la.midi_channel = self.midi_out_channel.value()
+        la.midi_channels = dict(CYCLES_CHANNELS) if self.midi_out_cycles.isChecked() else None
+        la.midi_lead_ms = float(self.midi_out_lead.value())
+        la.midi_gate_ms = float(self.midi_out_gate.value())
+        la.midi_notes = notes
+        la.midi_drums_only = self.midi_out_only.isChecked()
+        la.midi_follow_mutes = self.midi_out_follow.isChecked()
+
     def _midi_setup(self):
         """Load the map and the ticked ports, open them, start watching for
         controllers plugged in later. Called once the actions exist."""
@@ -1862,8 +2554,10 @@ class Main(QMainWindow):
         if ERAE_AVAILABLE and self.settings.value("erae/on", False, type=bool):
             self.erae_on.setChecked(True)       # before the MIDI ports open: the port is the surface's
         self._midi_refresh_ports()
+        self._midi_out_setup()
         self._midi_timer = QTimer(self)
         self._midi_timer.timeout.connect(self._midi_refresh_ports)
+        self._midi_timer.timeout.connect(self._midi_out_refresh_ports)
         self._midi_timer.start(2000)
 
     @staticmethod
@@ -2047,6 +2741,12 @@ class Main(QMainWindow):
         if ident.startswith("stem_"):
             cb = self.perf_stems.get(ident[5:])
             return None if cb is None else cb.isChecked()
+        if ident.startswith("voice_"):
+            cb = self.perf_voices.get(ident[6:])
+            return None if cb is None else cb.isChecked()
+        if ident.startswith("solo_"):
+            b = self.perf_solos.get(ident[5:])
+            return None if b is None else b.isChecked()
         if ident.startswith("focus_"):
             return self.afx_focus.currentText() == ident[6:]
         if ident == "record":
@@ -2059,6 +2759,10 @@ class Main(QMainWindow):
             return self.through_on.isChecked()
         if ident == "link":
             return self.link_on.isChecked()
+        if ident == "midi_out":
+            return self.midi_out_on.isChecked()
+        if ident == "video_off":
+            return self.video_off.isChecked()
         if ident == "beat":
             la = self.through
             if la is not None and la.running and la.player.playing:
@@ -2074,6 +2778,8 @@ class Main(QMainWindow):
             ident = self._midi_learn
             if ident in CONTINUOUS and kind != "cc":
                 return                          # a pedal, not a switch
+            if kind == "note" and val == 0:
+                return                          # a release, not a press
             other = self._midi_rev.get((kind, ch, num))
             if other and other != ident:
                 self.midi_map[other] = ""       # one control, one action
@@ -2096,23 +2802,32 @@ class Main(QMainWindow):
         if kind == "cc":                        # a switch on a CC: rising edge only
             prev = self._midi_cc_last.get((ch, num), 0)
             self._midi_cc_last[(ch, num)] = val
+            if ident in HOLD:                   # and the falling edge lets go
+                if val >= 64 and prev < 64:
+                    self.actions[ident]()
+                elif val < 64 and prev >= 64:
+                    self.releases[ident]()
+                return
             if not (val >= 64 and prev < 64):
                 return
+        elif kind == "note":
+            if ident in HOLD:                   # the note off is the release
+                (self.actions if val else self.releases)[ident]()
+                return
+            if val == 0:
+                return                          # a note off: nothing for a press
         self.actions[ident]()
 
-    def _tab_audio_fx(self):
-        """The five racks as a grid: a column per channel (the live input
-        and the four stems), a row per effect plus the volume. Every cell is
-        a knob the MIDI map reaches; all effects start off."""
+    def _afx_grid(self, channels, header):
+        """A grid of knobs: a column per channel of `channels` headed by
+        `header(ch)`, a row per effect plus the volume. Every cell is a knob
+        the MIDI map reaches, kept in self.afx; all effects start off."""
         grid = QGridLayout()
         grid.setContentsMargins(8, 8, 8, 8)
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(4)
-        self.afx = {}
-        for c, ch in enumerate(CHANNELS):
-            hdr = QLabel(ch)
-            hdr.setAlignment(Qt.AlignCenter)
-            grid.addWidget(hdr, 0, c + 1)
+        for c, ch in enumerate(channels):
+            grid.addWidget(header(ch), 0, c + 1)
         rows = list(AUDIO_FX) + [("vol", "volume", 1.0, "Level of this channel, unity at 1; "
                                                         "a gentle taper below")]
         for r, (key, label, default, tip) in enumerate(rows, start=1):
@@ -2120,7 +2835,7 @@ class Main(QMainWindow):
             lbl.setProperty("role", "sub")
             lbl.setToolTip(tip)
             grid.addWidget(lbl, r, 0)
-            for c, ch in enumerate(CHANNELS):
+            for c, ch in enumerate(channels):
                 lo = -1.0 if key in BIPOLAR else 0.0
                 sp = QDoubleSpinBox(minimum=lo, maximum=1.0, singleStep=0.05, decimals=2)
                 sp.setValue(default)
@@ -2130,13 +2845,46 @@ class Main(QMainWindow):
                 self.afx[(ch, key)] = sp
                 grid.addWidget(sp, r, c + 1)
         grid.setColumnStretch(0, 0)
-        for c in range(len(CHANNELS)):
+        for c in range(len(channels)):
             grid.setColumnStretch(c + 1, 1)
+        return grid
+
+    def _voice_header(self, v):
+        """A voice's column head in the Audio FX grid: the same switch as
+        the Perform tab's, lit while the voice is in."""
+        b = QPushButton(VOICE_SHORT[v])
+        b.setCheckable(True)
+        b.setChecked(True)
+        cb = self.perf_voices[v]
+        b.toggled.connect(cb.setChecked)
+        cb.toggled.connect(b.setChecked)
+        b.setToolTip(f"{VOICE_LABELS[v]}: in or out, the Perform tab's switch; the knobs "
+                     "below are this voice's own rack, before the drums rack (the bus)")
+        return b
+
+    def _tab_audio_fx(self):
+        """The racks as grids: a column per channel (the live input and the
+        four stems), then one per drum voice, a row per effect plus the
+        volume."""
+        self.afx = {}
+
+        def plain(ch):
+            hdr = QLabel(ch)
+            hdr.setAlignment(Qt.AlignCenter)
+            return hdr
         outer = QVBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addLayout(grid)
+        outer.addLayout(self._afx_grid(CHANNELS, plain))
+        voices_lbl = QLabel("drum voices: each through its own rack, gated by its switch "
+                            "before it (a delay rings out after the mute), then summed into "
+                            "the drums channel above, its rack and F1")
+        voices_lbl.setProperty("role", "sub")
+        voices_lbl.setWordWrap(True)
+        voices_lbl.setContentsMargins(8, 4, 8, 0)
+        outer.addWidget(voices_lbl)
+        outer.addLayout(self._afx_grid(VOICES, self._voice_header))
         self.afx_focus = QComboBox()
-        self.afx_focus.addItems(list(CHANNELS))
+        self.afx_focus.addItems(list(ALL_CHANNELS))
         self.afx_focus.setToolTip("The channel the focused knob rows of the Controls tab "
                                   "act on; the focus buttons switch it from a controller")
         off_btn = QPushButton("all effects off")
@@ -2145,7 +2893,9 @@ class Main(QMainWindow):
         hint = QLabel("0 = bypassed, small = a little on top of the dry sound, 1 = fully "
                       "wet; pitch is off in the middle. The live rack takes the live "
                       "input, the four stem racks take the section engine and any song "
-                      "played (the stream opens at launch on the chosen output).")
+                      "played (the stream opens at launch on the chosen output); the "
+                      "voice racks take the section's drums, one voice each (a song's "
+                      "drums go straight to the drums rack).")
         hint.setProperty("role", "sub")
         hint.setWordWrap(True)
         row = QHBoxLayout()
@@ -2509,8 +3259,10 @@ class Main(QMainWindow):
                                      "ticked samples"])
         self.perf_material.setToolTip(
             "What the sections are built from. The takes recorded during the "
-            "show are the point; the ticked sample sets stand in for rehearsal "
-            "when there are none (nothing ticked = every sample).")
+            "show are the point; the ticked samples stand in for rehearsal "
+            "when there are none. The ticked videos' soundtracks join them "
+            "with Video audio on (Video tab), and are the material on their "
+            "own when no sample is ticked. Nothing ticked anywhere: nothing.")
         self.perf_kind = QComboBox()
         self.perf_kind.addItems(["random"] + list(KINDS))
         self.perf_kind.setToolTip(
@@ -2538,21 +3290,81 @@ class Main(QMainWindow):
         form.addRow("Section", self._row([("", next_btn), ("", stop_btn), ("", event_btn)]))
         glitch_btn = QPushButton("glitch (G)")
         glitch_btn.setToolTip(
-            "A glitch break, in time: from the next beat to the end of the bar "
-            "(at least two beats) sixteenths of the bar are thrown about, some "
-            "backwards, a stutter roll, a sixteenth of silence, and the next "
-            "section drops in on the bar. With no section playing: plain next.")
+            "A glitch break, on the phrase: it waits for the last bar of the "
+            "4-bar phrase (bar 4 or 8 of the loop), then sixteenths of the bar "
+            "are thrown about, some backwards, a "
+            "stutter roll, a sixteenth of silence, and the next section drops "
+            "in on the one. Pressed inside the last bar it runs from the next "
+            "beat. With no section playing: plain next.")
         glitch_btn.clicked.connect(lambda: self.perform_break("glitch"))
         break_btn = QPushButton("break (Shift+G)")
         break_btn.setToolTip(
-            "The song's break, in time: from the next beat to the end of the bar "
-            "(at least two beats) the bar's first slice is beat-repeated, "
-            "accelerating, steady or halving, a reverse cymbal swell rises under "
-            "it and the picture with it to white, silence right before the drop, "
-            "then the next section on the bar, with the flash. With no section "
-            "playing: plain next. Video FX flash sets the picture's share.")
+            "The song's break, on the phrase: it waits for the last bar of the "
+            "4-bar phrase (bar 4 or 8 of the loop), then the bar's first slice "
+            "is beat-repeated, accelerating, steady "
+            "or halving, a reverse cymbal swell rises under it and the picture "
+            "with it to white, silence right before the drop, then the next "
+            "section on the one, with the flash. Pressed inside the last bar it "
+            "runs from the next beat. With no section playing: plain next. "
+            "Video FX flash sets the picture's share.")
         break_btn.clicked.connect(lambda: self.perform_break("break"))
-        form.addRow("Break", self._row([("", glitch_btn), ("", break_btn)]))
+        self.perf_gap = QCheckBox("gap before the drop")
+        self.perf_gap.setToolTip(
+            "The silence right before the one: a sixteenth after the glitch's "
+            "roll, half a beat or a beat after the break's repeat, as in the "
+            "generated songs. Off, the roll and the repeat run straight into "
+            "the drop. Remembered; takes effect from the next break.")
+        self.perf_gap.setChecked(self.settings.value("perform/gap", False, type=bool))
+        self.perf_gap.toggled.connect(self._perf_gap_changed)
+        form.addRow("Break", self._row([("", glitch_btn), ("", break_btn), ("", self.perf_gap)]))
+        # the repeat: held from a key, a note or this latching button
+        self._rep_sources = set()
+        self.rep_btn = QPushButton("repeat (H)")
+        self.rep_btn.setCheckable(True)
+        self.rep_btn.setToolTip(
+            "Hold H (or the MIDI note): the cell of the bar playing at the press, "
+            "the division next to it long, loops for as long as it is held; the "
+            "section runs on underneath, so letting go lands where the loop would "
+            "have been, on the bar. The cells sit on the bar's grid, so a change "
+            "of division or position is in time at once. This button latches it "
+            "for the mouse. A glitch or a break wins over it; a stop ends it.")
+        self.rep_btn.toggled.connect(lambda on: self._rep_hold("ui", on))
+        self.rep_div = QComboBox()
+        self.rep_div.addItems([name for name, _f in REPEAT_DIVS])
+        self.rep_div.setToolTip(
+            "The cell the repeat loops: the bar down to a 1/64 note (a pitched "
+            "buzz by then). Finer while held tightens the roll from the same "
+            "one; coarser widens it. - and = step it, a MIDI knob sweeps it. "
+            "Remembered.")
+        d = self.settings.value("perform/rep_div", REPEAT_DEFAULT)
+        if self.rep_div.findText(str(d)) >= 0:
+            self.rep_div.setCurrentText(str(d))
+        self.rep_div.currentTextChanged.connect(self._rep_div_changed)
+        self.rep_pos = QSlider(Qt.Horizontal)
+        self.rep_pos.setRange(-REPEAT_RANGE, REPEAT_RANGE)
+        self.rep_pos.setValue(0)
+        self.rep_pos.setTickPosition(QSlider.TicksBelow)
+        self.rep_pos.setTickInterval(4)
+        self.rep_pos.setToolTip(
+            "Where the repeat reads: 0 is the cell captured at the press, each "
+            "step one cell of the current division earlier (left) or later "
+            "(right), round the loop's ends. , and . step it, a MIDI knob sweeps "
+            "it with the captured cell in the middle.")
+        self.rep_pos.valueChanged.connect(self._rep_pos_changed)
+        self.rep_pos_lbl = QLabel("0")
+        self.rep_pos_lbl.setProperty("role", "sub")
+        self.rep_pos_lbl.setFixedWidth(28)
+        self.rep_pos_lbl.setAlignment(Qt.AlignCenter)
+        zero_btn = QPushButton("0")
+        zero_btn.setFixedWidth(24)
+        zero_btn.setToolTip("The position back to the captured cell")
+        zero_btn.clicked.connect(lambda: self.rep_pos.setValue(0))
+        self.rep_rev = QCheckBox("reverse (/)")
+        self.rep_rev.setToolTip("The repeated cell played backwards; / switches it")
+        self.rep_rev.toggled.connect(lambda _on: self._rep_apply())
+        form.addRow("Repeat", self._row([("", self.rep_btn), ("", self.rep_div),
+                                         ("position", self.rep_pos), ("", self.rep_pos_lbl),
+                                         ("", zero_btn), ("", self.rep_rev)]))
         burst_btn = QPushButton("burst (B)")
         burst_btn.setToolTip(
             "A slice of the material from a random spot, right now, at the "
@@ -2577,6 +3389,45 @@ class Main(QMainWindow):
             self.perf_stems[stem] = cb
             pairs.append(("", cb))
         form.addRow("Stems", self._row(pairs))
+        # the drum voices: in or out and soloed, landing on the quantize grid
+        self.perf_voices, self.perf_solos = {}, {}
+        pairs = []
+        for i, v in enumerate(VOICES, 1):
+            cb = QCheckBox(VOICE_SHORT[v])
+            cb.setChecked(True)
+            cb.setToolTip(f"{VOICE_LABELS[v]} in or out (Shift+F{i}), on the quantize grid "
+                          "while a section plays; its MIDI notes stop with it only with "
+                          "'follow mutes' ticked in the MIDI out panel. A delay "
+                          "or a reverb on its rack (Audio FX tab) rings out after the "
+                          "mute. Every voice starts in at launch.")
+            cb.toggled.connect(lambda on, v=v: self._perf_voice(v, on))
+            so = QPushButton("S")
+            so.setObjectName("solo")
+            so.setCheckable(True)
+            so.setFixedWidth(24)
+            so.setToolTip(f"solo the {VOICE_LABELS[v]} (Ctrl+F{i}): every voice not soloed "
+                          "is out while any is, on the quantize grid")
+            so.toggled.connect(lambda on, v=v: self._perf_solo(v, on))
+            self.perf_voices[v], self.perf_solos[v] = cb, so
+            pairs.append(("", self._pair(cb, so)))
+        form.addRow("Drums", self._row(pairs))
+        self.perf_quant = QComboBox()
+        self.perf_quant.addItems([name for name, _f in QUANT_GRIDS])
+        self.perf_quant.setToolTip(
+            "Where a voice, solo or stem switch, an event (E) and a burst (B) "
+            "land while a section plays: at once, or on the loop's next "
+            "sixteenth, eighth, beat, half bar or bar. With no section playing "
+            "everything is at once. Remembered; quant_next in the Controls tab "
+            "steps through it.")
+        q = self.settings.value("perform/quant", QUANT_DEFAULT)
+        if self.perf_quant.findText(str(q)) >= 0:
+            self.perf_quant.setCurrentText(str(q))
+        self.perf_quant.currentTextChanged.connect(self._quant_changed)
+        reset_btn = QPushButton("all voices in (Shift+F8)")
+        reset_btn.setToolTip("Every drum voice back in, no solo, the voice racks' effects "
+                             "off and their volumes at 1")
+        reset_btn.clicked.connect(self._voices_reset)
+        form.addRow("Quantize", self._row([("", self.perf_quant), ("", reset_btn)]))
         self.perf_ab = QSlider(Qt.Horizontal)
         self.perf_ab.setRange(0, 100)
         self.perf_ab.setValue(0)
@@ -2587,9 +3438,11 @@ class Main(QMainWindow):
                                 "whole and only the section comes in, since the "
                                 "webcam is silent. Keys [ and ] "
                                 "step by 10; a MIDI expression pedal drives it "
-                                "through the Controls tab.")
+                                "through the Controls tab. Goes to full B on its "
+                                "own when the video input (Video tab) is off.")
         self.perf_ab.valueChanged.connect(self._perf_ab_changed)
         self.perf_ab_lbl = QLabel("A 100 %  ·  B 0 %")
+        self.perf_ab.setValue(100)                    # video in starts off: full B
         self.perf_ab_lbl.setProperty("role", "sub")
         form.addRow("A/B", self._row([("", self.perf_ab), ("", self.perf_ab_lbl)]))
         self.perf_picture = QComboBox()
@@ -2614,6 +3467,16 @@ class Main(QMainWindow):
             lambda i: setattr(self.backdrop, "override_blend", i))
         form.addRow("Picture", self._row([("", self.perf_picture),
                                           ("dissolve", self.perf_dissolve)]))
+        # the section big, for the eyes on stage: what plays and the bar
+        self.perf_meter = PerfMeter()
+        self.perf_meter.setToolTip("What plays and where the loop is: the current bar lit, "
+                                   "a sweep through it over the bar, a dot per beat, a mark "
+                                   "after each 4-bar phrase (where a break lands). A held "
+                                   "repeat draws its window in yellow over the cells, with "
+                                   "its own playhead and a chevron for the direction; the "
+                                   "sweep underneath is the loop running on, where letting "
+                                   "go lands.")
+        form.addRow(self.perf_meter)
         self.perf_status = QLabel("no section")
         self.perf_status.setProperty("role", "sub")
         self.perf_status.setWordWrap(True)
@@ -2646,7 +3509,7 @@ class Main(QMainWindow):
             "render, so drums, textures and chops are cut out of the film's "
             "own sound. Works with no samples ticked at all. Videos without "
             "an audio track are skipped. Ticking this sets Random start "
-            "(Layers & FX) to 'all' if it was off, so cuts land anywhere in "
+            "(Sections page) to 'all' if it was off, so cuts land anywhere in "
             "the film rather than at its first seconds.")
         self.video_audio.toggled.connect(self._video_audio_toggled)
         form.addRow("Video audio", self.video_audio)
@@ -2798,6 +3661,17 @@ class Main(QMainWindow):
             "picture still follows the song (sample timeline, section jumps, "
             "clip switches, rewinds, the outro fade). Key C toggles it.")
         form.addRow("", self.video_plain)
+        self.video_off = QCheckBox("video off: no picture, no decoding, no GPU work (V)")
+        self.video_off.setToolTip(
+            "For a night of sound only, or a weak machine: the clip and the "
+            "capture devices are closed (free for other programs), the "
+            "repaint stops, the effects, the shader layer and the section's "
+            "frames cost nothing; the window shows its background. Songs, "
+            "the live input, sections and the MIDI out run as usual; a take "
+            "recorded meanwhile has sound only. Ticking it off brings back "
+            "what was chosen. Remembered.")
+        self.video_off.toggled.connect(self._toggle_video_off)
+        form.addRow("", self.video_off)
 
         self.vfx = {}
         for key, label, default, tip in VIDEO_EFFECTS:
@@ -2823,6 +3697,203 @@ class Main(QMainWindow):
         hint.setProperty("role", "sub")
         form.addRow("", hint)
         return self._wrap(form, self._randomize_video)
+
+    def _tab_lfo(self):
+        """Eight LFOs, every slot a row: on, destination (any knob of the
+        Controls tab), shape, rate (a cycle length in bars, on the live
+        clock), depth, phase, polarity, mode, and its wave right now. The
+        rows are remembered as the stage setup, on states included."""
+        self.lfo = LfoEngine(LFO_SLOTS, self._lfo_get, self._lfo_set,
+                             lambda: (self.tempo.bpm, self.tempo.anchor))
+        self.lfo_rows = []
+        grid = QGridLayout()
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        heads = ["", "on", "destination", "shape", "rate", "depth", "phase", "pol.", "mode", ""]
+        for c, head in enumerate(heads):
+            lbl = QLabel(head)
+            lbl.setProperty("role", "sub")
+            grid.addWidget(lbl, 0, c)
+        saved = self._lfo_saved()
+        for i in range(LFO_SLOTS):
+            r = i + 1
+            st = saved[i] if i < len(saved) else {}
+            num = QLabel(str(r))
+            num.setProperty("role", "sub")
+            on = QPushButton("on")
+            on.setCheckable(True)
+            on.setFixedWidth(36)
+            on.setToolTip(f"LFO {r} in or out; out, its knob goes back where you set it. "
+                          "Remembered. A MIDI button in the Controls tab's LFOs group.")
+            dest = QComboBox()
+            dest.addItem("(none)", "")
+            for ident, label in LFO_DESTS:
+                dest.addItem(label, ident)
+            dest.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            dest.setMinimumContentsLength(20)
+            dest.setToolTip("The knob this LFO moves: any knob of the Controls tab. The "
+                            "knob's own value is the centre; turn it, or its CC, while the "
+                            "LFO runs and that is the new centre.")
+            shape = QComboBox()
+            shape.addItems(LFO_SHAPES)
+            shape.setToolTip("sine, triangle, saw up, saw down, square; random step (a new "
+                             "value each cycle, held), random smooth (the same, glided), "
+                             "random walk (a drift, each cycle a step from the last)")
+            rate = QComboBox()
+            rate.addItems([name for name, _b in LFO_RATES])
+            rate.setToolTip("One cycle this long, on the live clock (a playing section's "
+                            "bars, Link, the taps): every LFO is locked to the bar and in "
+                            "phase with the others")
+            depth = QSpinBox(minimum=-100, maximum=100, singleStep=5, suffix=" %")
+            depth.setToolTip("How far the knob moves: ± half its range at 100 % (a centred "
+                             "knob sweeps the whole range), the whole range upward in + "
+                             "polarity; negative flips the wave. A MIDI knob in the LFOs "
+                             "group sets 0 to 100 %, keeping the sign.")
+            phase = QSpinBox(minimum=0, maximum=359, singleStep=45, suffix="°")
+            phase.setToolTip("Where in the cycle the one lands: 180° puts two LFOs on "
+                             "two knobs in opposition")
+            pol = QComboBox()
+            pol.addItems(["±", "+"])
+            pol.setToolTip("± moves the knob either way around its value; + moves it from "
+                           "its value upward only (a filter opening from where it sits)")
+            mode = QComboBox()
+            mode.addItems(LFO_MODES)
+            mode.setToolTip("cycle: free on the clock. trig: restarts at a section start, "
+                            "a drop or the retrigger button. one-shot: runs one cycle from "
+                            "the trigger and holds its end, an envelope (its start before "
+                            "any trigger).")
+            bar = LfoBar()
+            row = {"on": on, "dest": dest, "shape": shape, "rate": rate, "depth": depth,
+                   "phase": phase, "pol": pol, "mode": mode, "bar": bar}
+            self.lfo_rows.append(row)
+            # the saved row, before the signals: nothing is written yet
+            j = dest.findData(st.get("dest", ""))
+            dest.setCurrentIndex(max(0, j))
+            if st.get("shape") in LFO_SHAPES:
+                shape.setCurrentText(st["shape"])
+            rate.setCurrentText(st.get("rate", LFO_RATE_DEFAULT)
+                                if rate.findText(str(st.get("rate", ""))) >= 0 else LFO_RATE_DEFAULT)
+            depth.setValue(int(round(100 * float(st.get("depth", 0.5)))))
+            phase.setValue(int(round(360 * float(st.get("phase", 0.0)))) % 360)
+            pol.setCurrentIndex(1 if st.get("unipolar") else 0)
+            if st.get("mode") in LFO_MODES:
+                mode.setCurrentText(st["mode"])
+            on.setChecked(bool(st.get("on", False)))
+            self._lfo_push(i, save=False)
+            on.toggled.connect(lambda _v, i=i: self._lfo_push(i))
+            dest.currentIndexChanged.connect(lambda _v, i=i: self._lfo_push(i))
+            for cb in (shape, rate, pol, mode):
+                cb.currentTextChanged.connect(lambda _v, i=i: self._lfo_push(i))
+            for sp in (depth, phase):
+                sp.valueChanged.connect(lambda _v, i=i: self._lfo_push(i))
+            for c, wdg in enumerate((num, on, dest, shape, rate, depth, phase, pol, mode, bar)):
+                grid.addWidget(wdg, r, c)
+        grid.setColumnStretch(2, 2)
+        grid.setColumnStretch(3, 1)
+        hint = QLabel("An LFO moves a knob around where you set it, on the live clock, so "
+                      "every LFO sits on the bar and in step with the others. The knob "
+                      "wiggles on screen; its consumers (a rack, the picture, the A/B mix) "
+                      "follow. Off writes the knob back. The depth knobs and the on "
+                      "buttons are MIDI rows (Controls tab, LFOs group); Shift+L is the "
+                      "panic: every LFO off.")
+        hint.setProperty("role", "sub")
+        hint.setWordWrap(True)
+        off_btn = QPushButton("all off (Shift+L)")
+        off_btn.setToolTip("Every LFO off, the knobs back where you set them")
+        off_btn.clicked.connect(self._lfo_all_off)
+        trig_btn = QPushButton("retrigger")
+        trig_btn.setToolTip("Every trig and one-shot LFO restarts its cycle now")
+        trig_btn.clicked.connect(lambda: self.lfo.trigger(time.monotonic()))
+        self.lfo_status = QLabel("")
+        self.lfo_status.setProperty("role", "sub")
+        row = QHBoxLayout()
+        row.setContentsMargins(8, 0, 8, 8)
+        row.addWidget(self.lfo_status, stretch=1)
+        row.addWidget(trig_btn)
+        row.addWidget(off_btn)
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addLayout(grid)
+        outer.addWidget(hint)
+        outer.addLayout(row)
+        outer.addStretch(1)
+        page = QWidget()
+        page.setLayout(outer)
+        self._lfo_ticks = 0
+        return self._scrolling(page)
+
+    def _lfo_saved(self):
+        try:
+            rows = json.loads(self.settings.value("lfo/slots", "[]"))
+            return rows if isinstance(rows, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    def _lfo_row_settings(self, i):
+        r = self.lfo_rows[i]
+        return {"on": r["on"].isChecked(), "dest": r["dest"].currentData() or "",
+                "shape": r["shape"].currentText(), "rate": r["rate"].currentText(),
+                "depth": r["depth"].value() / 100.0, "phase": r["phase"].value() / 360.0,
+                "unipolar": r["pol"].currentIndex() == 1, "mode": r["mode"].currentText()}
+
+    def _lfo_push(self, i, save=True):
+        """Row i's widgets into the engine; the rows into the settings."""
+        self.lfo.configure(i, **self._lfo_row_settings(i))
+        if save:
+            self.settings.setValue("lfo/slots", json.dumps(
+                [self._lfo_row_settings(j) for j in range(LFO_SLOTS)]))
+
+    def _lfo_all_off(self):
+        for r in self.lfo_rows:
+            r["on"].setChecked(False)
+
+    def _lfo_depth_frac(self, i, x):
+        """A CC on a slot's depth: 0 to 100 %, the sign as set."""
+        sp = self.lfo_rows[i]["depth"]
+        sign = -1 if sp.value() < 0 else 1
+        sp.setValue(sign * round(100 * max(0.0, min(1.0, x))))
+
+    def _lfo_get(self, ident):
+        """A knob as 0..1 of its range, or None when there is nothing there."""
+        w = self.knob_widgets.get(ident)
+        if w is not None:
+            lo, hi = w.minimum(), w.maximum()
+            return (w.value() - lo) / (hi - lo) if hi > lo else None
+        if ident == "shader_pick":
+            files = self._shader_pool()
+            n = len(files) + 1
+            name = self.shader.currentText()
+            idx = next((k + 1 for k, f in enumerate(files) if f.stem == name), 0)
+            return (idx + 0.5) / n
+        if ident == "burst_len":
+            lo, hi = self.burst_len.minimum(), self.burst_len.maximum()
+            return math.log(self.burst_len.value() / lo) / math.log(hi / lo)
+        if ident == "rep_div":
+            n = self.rep_div.count()
+            return (self.rep_div.currentIndex() + 0.5) / n
+        if ident.startswith("vst_"):
+            return self.inserts.knob_value(int(ident[4:]) - 1)
+        return None
+
+    def _lfo_set(self, ident, x):
+        act = self.actions.get(ident)
+        if act is not None:
+            act(x)
+
+    def _lfo_tick(self):
+        """The engine, 100 times a second; the bars and the status a third
+        of that."""
+        self.lfo.tick(time.monotonic())
+        self._lfo_ticks += 1
+        if self._lfo_ticks % 3:
+            return
+        on = []
+        for i, (s, r) in enumerate(zip(self.lfo.slots, self.lfo_rows)):
+            r["bar"].set_value(s.value if s.on else 0.0, s.on and s.out is not None)
+            if s.on and s.dest:
+                on.append(str(i + 1))
+        self.lfo_status.setText("LFOs on: " + ", ".join(on) if on else "no LFO on")
 
     def _tab_video_fx(self):
         """The pool: which video effects and which shaders are in the show at
@@ -3071,10 +4142,13 @@ class Main(QMainWindow):
             self._fullscreen_size(0)    # exact again, and once Qt has seen
             QApplication.processEvents()  # that it is fullscreen in its own
             self.showNormal()           # eyes again, it restores the frame
+            if self._was_maximized:     # back to the maximized window it came from
+                self.showMaximized()
             self._show_ui()             # back to the desktop: interface back
             self._arm_hide()
         else:
             self._fullscreen = True
+            self._was_maximized = self.isMaximized()
             self.showFullScreen()
             self._fullscreen_size(1)
             self._hide_ui(force=True)   # straight to the picture
@@ -3352,7 +4426,8 @@ class Main(QMainWindow):
             "The tempo: of the visuals, the racks' delays and the section "
             "engine whenever no song plays, and of the next generated song "
             "unless random is ticked. Type it, tap it (T), or share it with "
-            "Ableton Link below; a song that starts playing sets it to its own.")
+            "Ableton Link (the button next to it); a song that starts playing "
+            "sets it to its own.")
         self.live_bpm.valueChanged.connect(self._live_bpm_edited)
         self.bpm_random = QCheckBox("random")
         self.bpm_random.setChecked(True)
@@ -3370,9 +4445,9 @@ class Main(QMainWindow):
             "bar count (the 8-bar sections, the shaders' iBar, the tint's walk) "
             "lines up with the music. Not sent over Link.")
         down_btn.clicked.connect(self.live_downbeat)
-        form.addRow("BPM", self._row([("", self.live_bpm), ("", self.bpm_random),
-                                      ("", tap_btn), ("", down_btn)]))
-        self.link_on = QPushButton("off")
+        # one row for the clock: the bpm, random, Link on/off, tap, downbeat
+        # and Link's status, small buttons so it all fits
+        self.link_on = QPushButton("Link off")
         self.link_on.setCheckable(True)
         self.link_on.setToolTip(
             "Ableton Link: on, the live clock joins the Link session on the "
@@ -3385,12 +4460,33 @@ class Main(QMainWindow):
             "session's bar (the beat and meter here show it); alone in the "
             "session, the bar is ours. Remembered.")
         self.link_on.toggled.connect(self._link_toggled)
+        self.link_play = QPushButton("▶")      # shows what a press sends
+        self.link_play.setToolTip(
+            "Play or stop, sent to the Link session: ▶ when the session is "
+            "stopped, Live and the other peers start from their bar and, as "
+            "for any peer's play, the current section starts again here (none "
+            "yet: the log says so); ■ while it plays, the peers stop and the "
+            "section here stops on the bar as with Shift+N. Needs Link on.")
+        self.link_play.clicked.connect(self._link_press)
+        self.link_play.setFixedWidth(28)              # just the icon
+        self.link_play.setStyleSheet("padding: 2px 0px;")
         self.link_status = QLabel("off")
         self.link_status.setProperty("role", "sub")
-        form.addRow("Ableton Link", self._row([("", self.link_on), ("", self.link_status)]))
+        # the status takes what is left of the row and never widens the pane
+        self.link_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        # (the peers come first in its text, so a narrow screen loses the
+        # transport glyph at the end, never the peers; the beat itself shows
+        # on the Link button while it is on)
+        for b in (self.link_on, self.link_play, tap_btn, down_btn):
+            b.setObjectName("small")
+        form.addRow("BPM", self._row([("", self.live_bpm), ("", self.bpm_random),
+                                      ("", self.link_on), ("", self.link_play),
+                                      ("", tap_btn), ("", down_btn), ("", self.link_status)]))
         if self.link is None:
             self.link_on.setEnabled(False)
-            self.link_status.setText(f"aalink not installed ({LINK_INSTALL_HINT})")
+            self.link_play.setEnabled(False)
+            self.link_status.setText("no aalink")
+            self.link_status.setToolTip(f"aalink not installed ({LINK_INSTALL_HINT})")
         else:
             self.link_on.setChecked(self.settings.value("clock/link", False, type=bool))
 
@@ -3593,7 +4689,35 @@ class Main(QMainWindow):
         hint2 = QLabel("chance per drop, 0 = off")
         hint2.setProperty("role", "sub")
         form.addRow("", hint2)
-        return self._wrap(form, self._randomize_sections)
+        return form
+
+    def _tab_sections_layers(self):
+        """The sections and the layers & effects on one page, a rule between
+        them, one Randomize for both."""
+        top, bottom = self._tab_sections(), self._tab_layers()
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 8, 8)
+        for i, form in enumerate((top, bottom)):
+            form.setContentsMargins(8, 8, 8, 8)
+            form.setVerticalSpacing(6)
+            if i:
+                hr = QFrame()
+                hr.setFrameShape(QFrame.HLine)
+                hr.setStyleSheet("color: rgba(255, 255, 255, 50);")
+                outer.addWidget(hr)
+            outer.addLayout(form)
+        outer.addStretch(1)
+        btn = QPushButton("Randomize")
+        btn.setToolTip("Random value for every control on this page, within its range")
+        btn.clicked.connect(self._randomize_sections)
+        btn.clicked.connect(self._randomize_layers)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(btn)
+        outer.addLayout(row)
+        w = QWidget()
+        w.setLayout(outer)
+        return w
 
     def _randomize_sections(self):
         self._shuffle(self.intro_style, self.intro_bars, self.cymbal_chance,
@@ -3667,7 +4791,7 @@ class Main(QMainWindow):
         form.addRow("Pan", self._row([("drums", self.pan_drums),
                                       ("layers", self.pan_layers),
                                       ("events", self.pan_events)]))
-        return self._wrap(form, self._randomize_layers)
+        return form
 
     def _randomize_layers(self):
         self._shuffle(self.layers_min, self.layers_max,
@@ -4086,6 +5210,68 @@ class Main(QMainWindow):
         self.videos_status.setText(
             f"{n} / {self.videos_tree.total} videos selected, {how}")
 
+    def _build_fetch_row(self):
+        """Under the Videos tree: a URL and a Fetch button. yt-dlp pulls
+        the clip into videos/web/ and gacha_transcode.py makes it seek
+        fast, both on a worker thread (see gacha_fetch.py)."""
+        self.fetch_worker = None
+        self.fetch_url = QLineEdit()
+        self.fetch_url.setPlaceholderText("paste a video URL (YouTube, Vimeo, ...)")
+        self.fetch_url.setClearButtonEnabled(True)
+        self.fetch_url.returnPressed.connect(self._fetch_video)
+        self.fetch_btn = QPushButton("Fetch")
+        self.fetch_btn.setObjectName("small")
+        self.fetch_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.fetch_btn.clicked.connect(self._fetch_video)
+        tip = ("Download the video at this URL with yt-dlp into videos/web/ "
+               "(best picture up to 1080p, one video, never a whole playlist), "
+               "then transcode it for instant seeking when ffprobe is installed. "
+               "Progress in the Log tab; the clip shows up here when done")
+        if not fetch_available():
+            tip += f"  (yt-dlp is not installed: {FETCH_INSTALL_HINT})"
+            self.fetch_url.setPlaceholderText(f"yt-dlp missing: {FETCH_INSTALL_HINT}")
+            self.fetch_url.setEnabled(False)
+            self.fetch_btn.setEnabled(False)
+        self.fetch_url.setToolTip(tip)
+        self.fetch_btn.setToolTip(tip)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 4, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(self.fetch_url, stretch=1)
+        row.addWidget(self.fetch_btn)
+        return row
+
+    def _fetch_video(self):
+        url = self.fetch_url.text().strip()
+        if self.fetch_worker is not None and self.fetch_worker.isRunning():
+            return
+        if not looks_like_url(url):
+            self.videos_status.setText("that is not a http(s) URL")
+            return
+        self.fetch_btn.setEnabled(False)
+        self.fetch_btn.setText("Fetching…")
+        self.videos_status.setText("fetching…")
+        self.fetch_worker = FetchWorker(url)
+        self.fetch_worker.line.connect(self.log.appendPlainText)
+        self.fetch_worker.progress.connect(self._fetch_progress)
+        self.fetch_worker.done.connect(self._fetch_done)
+        self.fetch_worker.start()
+
+    def _fetch_progress(self, pct):
+        self.videos_status.setText(f"fetching {pct:.0f} %" if pct >= 0
+                                   else "downloaded, transcoding…")
+
+    def _fetch_done(self, ok, path):
+        self.fetch_btn.setEnabled(True)
+        self.fetch_btn.setText("Fetch")
+        if ok:
+            self.fetch_url.clear()
+            self.videos_tree.refresh()
+            self.log.appendPlainText(f"✔ in the Videos tab: {self.videos_tree.name(path)}")
+        else:
+            self.log.appendPlainText("✗ fetch failed, see the lines above")
+        self._on_videos_changed()
+
     def _show_video(self, path):
         """Double-click in the Videos tab: loop that clip right now."""
         self.backdrop.set_video(Path(path))
@@ -4179,6 +5365,10 @@ class Main(QMainWindow):
         modes.setEnabled(bool(dev))
         if apply is not None:
             apply(dev, modes.currentData())
+        if not second and not dev and hasattr(self, "perf_ab")                 and self.perf_ab.value() != 100:
+            self.perf_ab.setValue(100)                # no live picture: full B
+            if hasattr(self, "log"):
+                self.log.appendPlainText(f"{name}: off, A/B to full B")
         if second and hasattr(self, "through"):
             self._sync_hold_tape()
         if second and hasattr(self, "log"):
@@ -4215,6 +5405,18 @@ class Main(QMainWindow):
                                      "the B side of the pedal (W back to the take frames)")
         else:
             self.log.appendPlainText("video input: B is the take frames again")
+
+    def _toggle_video_off(self, on):
+        """V / the tick / a pad: the whole picture off (decoders closed, no
+        repaint) or back on as it was."""
+        self.settings.setValue("video/off", on)
+        if not hasattr(self, "backdrop"):
+            return
+        self.backdrop.set_enabled(not on)
+        if on:
+            self.log.appendPlainText("video: off, decoders closed, no GPU work (V brings it back)")
+        else:
+            self.log.appendPlainText("video: on again")
 
     def _webcam_b(self):
         """The second video input stands in for the take frames on B."""
@@ -4276,9 +5478,14 @@ class Main(QMainWindow):
             return ("takes", take_ids)
         if mode == 1:
             return None
-        files = tuple(str(p) for p in self.samples_tree.checked()) or \
-            tuple(sorted(str(p) for p in SAMPLES_DIR.rglob("*") if p.suffix.lower() in AUDIO_EXTS))
-        return ("samples", files) if files else None
+        # only what is ticked: the samples, and the ticked videos' soundtracks
+        # when Video audio (Video tab) says so or no sample is ticked, as for
+        # a song; nothing ticked anywhere is no material, never the whole folder
+        files = tuple(str(p) for p in self.samples_tree.checked())
+        videos = ()
+        if self.video_audio.isChecked() or not files:
+            videos = tuple(str(p) for p in self.videos_tree.checked())
+        return ("samples", files, videos) if files or videos else None
 
     def _perf_bank(self, key):
         """Material for `key`, built if needed (call on the render thread)."""
@@ -4288,15 +5495,44 @@ class Main(QMainWindow):
             bank = self.takes.bank()
         else:
             import contextlib, io
+            files = list(key[1])
             with contextlib.redirect_stdout(io.StringIO()):
-                bank = E.load_samples(list(key[1]))
+                if key[2]:                       # the videos' soundtracks, extracted
+                    tracks = E.extract_video_audio(key[2])   # once and cached (ffmpeg)
+                    files += [E.VIDEO_AUDIO_DIR / n for n in tracks]
+                bank = E.load_samples(files)
         mat = Material(bank, seed=random.randrange(1 << 30))
         self._perf_material = (key, mat)
         return mat
 
     def _perf_key(self):
+        """What a section is rendered from: the material, the kind, the
+        tempo, and the Generate tab's knobs as of now, so a section rendered
+        ahead with other knobs (a sub chance turned down, say) is stale and
+        gets rendered again rather than played."""
         kind = self.perf_kind.currentText()
-        return (self._perf_material_key(), kind, round(self.tempo.bpm, 1))
+        stamp = (tuple(sorted(self._knobs_dict().items())),
+                 tuple(sorted(self._section_kw().items())))
+        return (self._perf_material_key(), kind, round(self.tempo.bpm, 1), stamp)
+
+    PERF_RESTAMP_S = 0.5       # knobs quiet this long before the next section is redone
+
+    def _perf_refresh_ready(self):
+        """Every so often from the poll: the section rendered ahead no longer
+        matches the knobs (or the kind, the tempo, the material) and the
+        knobs have settled: render it again, so N still lands at once."""
+        now = time.monotonic()
+        key = self._perf_key()
+        if key != self._perf_key_last:
+            self._perf_key_last, self._perf_key_t = key, now
+            return
+        if (self._perf_ready is not None and self._perf_ready[0] != key
+                and self._perf_busy is None and key[0] is not None
+                and now - self._perf_key_t >= self.PERF_RESTAMP_S
+                and self.through is not None and self.through.running):
+            if self._perf_start("section", key):
+                self.log.appendPlainText("perform: settings changed, the next section "
+                                         "is rendered again")
 
     def _perf_render(self, key, kind_choice, knobs=None, kw=None):
         """Render thread: a section for `key`, stems resampled to the audio
@@ -4309,7 +5545,7 @@ class Main(QMainWindow):
                 mat.k = knobs                         # carving is cached, the knobs are live
             if not mat.ok:
                 self._perf_result = ("error", "no material with sound (record a take, "
-                                              "or tick some samples)")
+                                              "or tick samples or videos with sound)")
                 return
             kind = random.choice(KINDS) if kind_choice == "random" else kind_choice
             sec = render_section(mat, seed=random.randrange(1 << 30), bpm=key[2],
@@ -4371,7 +5607,7 @@ class Main(QMainWindow):
             return
         key = self._perf_key()
         if key[0] is None:
-            self.log.appendPlainText("perform: no material (record a take or tick samples)")
+            self.log.appendPlainText("perform: no material (record a take, or tick samples or videos)")
             return
         if self._perf_ready is not None and self._perf_ready[0] == key:
             self._perf_play(*self._perf_ready[1:])
@@ -4386,6 +5622,9 @@ class Main(QMainWindow):
     def _perf_play(self, sec, stems):
         pl = self.through.player
         bar_t0 = self._link_bar_t0() if not pl.playing else None   # from silence: Link's bar
+        if not pl.playing:                  # from silence: a new song for the picture too,
+            self._pick_song_video()         # a ticked video instead of whatever was on
+            self._live_switch_t = time.monotonic()
         pl.queue(stems, sec.events, sec.bpm, sec.bars, bar_t0)
         self._perf_playing = sec
         self._perf_current = (sec, stems, self.through.sr)   # what a start brings back
@@ -4451,7 +5690,7 @@ class Main(QMainWindow):
         return True
 
     def perform_event(self):
-        """E: a one-shot from the material, on the next beat."""
+        """E: a one-shot from the material, on the quantize grid."""
         if self.through is None or not self.through.running:
             self.log.appendPlainText("perform: the audio output is not open (General tab)")
             return
@@ -4461,8 +5700,8 @@ class Main(QMainWindow):
         self._perf_start("shot", key)
 
     def perform_break(self, kind="glitch"):
-        """G / Shift+G: a break of `kind` from the next beat to the bar, then
-        the next section on the bar (the pre-rendered one when it fits)."""
+        """G / Shift+G: a break of `kind` on the 4-bar phrase's last bar, then
+        the next section on the one (the pre-rendered one when it fits)."""
         if self.through is None or not self.through.running:
             self.log.appendPlainText("perform: the audio output is not open (General tab)")
             return
@@ -4470,7 +5709,7 @@ class Main(QMainWindow):
         if pl.playing and not pl.filling:
             swell = getattr(self._perf_playing, "swell", None) if kind == "break" else None
             pl.fill(kind, swell)
-            self.log.appendPlainText(f"{kind}: from the next beat to the bar, then next"
+            self.log.appendPlainText(f"{kind}: on the phrase's last bar, then next"
                                      + ("" if kind != "break" or swell is not None
                                         else " (no swell for this section)"))
         self.perform_next()                            # queued: lands when the break ends
@@ -4478,14 +5717,15 @@ class Main(QMainWindow):
     BURST_MIN_SHOW = 0.08          # s: a 10 ms burst still flashes two screen frames
 
     def perform_burst(self):
-        """B: `burst_len` ms of the material from a random spot, now, over
-        the tape; the frame it was cut from takes the picture meanwhile."""
+        """B: `burst_len` ms of the material from a random spot, on the
+        quantize grid, over the tape; the frame it was cut from takes the
+        picture while it sounds."""
         if self.through is None or not self.through.running:
             self.log.appendPlainText("perform: the audio output is not open (General tab)")
             return
         key = self._perf_key()
         if key[0] is None:
-            self.log.appendPlainText("perform: no material (record a take or tick samples)")
+            self.log.appendPlainText("perform: no material (record a take, or tick samples or videos)")
             return
         length = self.burst_len.value() / 1000.0
         take = None
@@ -4504,10 +5744,9 @@ class Main(QMainWindow):
             audio = mat.bank[src]
         off = random.uniform(0.0, max(0.0, len(audio) / E.SR - length))
         clip = cut_burst(audio, E.SR, off, length, self.through.sr)
-        self.through.player.fire(clip, now=True)
+        num = self.through.player.fire(clip, now=True)
         frame = take is not None and bool(take.frames)
-        now = time.monotonic()
-        self._burst = (now, now + max(length, self.BURST_MIN_SHOW), take, off) if frame else None
+        self._burst = (num, max(length, self.BURST_MIN_SHOW), take, off) if frame else None
         self.log.appendPlainText(f"burst <- {src} @ {off:.1f} s, {length * 1000:.0f} ms"
                                  + ("" if frame else " (no picture)"))
 
@@ -4518,19 +5757,119 @@ class Main(QMainWindow):
 
     def _burst_frame(self):
         """The burst's picture while it sounds: the take's frames running
-        from the cut point, in step with the sound. None once it is over."""
+        from the cut point, in step with the sound, from the moment the
+        player started it (on the grid). None before and once it is over."""
         if self._burst is not None:
-            t0, until, take, off = self._burst
+            num, show, take, off = self._burst
+            la = self.through
+            fired = la.player.burst_fired if la is not None else None
+            if fired is None or fired[0] < num:
+                return None                        # waiting for the grid
+            t0 = fired[1]
             now = time.monotonic()
-            if now < until:
-                return take.frame_at(off + (now - t0))
+            if now < t0 + show:
+                return take.frame_at(off + max(0.0, now - t0))
             self._burst = None
         return None
 
     def _perf_stem(self, stem, on):
-        """F1-F4: a stem in or out, for the section and a song alike."""
+        """F1-F4: a stem in or out, for the section and a song alike, on
+        the quantize grid."""
         if self.through is not None:
-            self.through.on[stem] = on
+            self.through.switch("stem", stem, on)
+
+    def _perf_voice(self, v, on):
+        """A drum voice in or out, on the grid; its MIDI notes with it."""
+        if self.through is not None:
+            self.through.switch("voice", v, on)
+
+    def _perf_solo(self, v, on):
+        if self.through is not None:
+            self.through.switch("solo", v, on)
+
+    def _voices_reset(self):
+        """Shift+F8: every voice in, no solo, the voice racks clean."""
+        for v in VOICES:
+            self.perf_solos[v].setChecked(False)
+            self.perf_voices[v].setChecked(True)
+            for key, *_ in AUDIO_FX:
+                self.afx[(v, key)].setValue(0.0)
+            self.afx[(v, "vol")].setValue(1.0)
+
+    def _perf_gap_changed(self, on):
+        self.settings.setValue("perform/gap", bool(on))
+        if self.through is not None:
+            self.through.player.gap = bool(on)
+
+    # ---- the repeat
+    def _rep_hold(self, source, on):
+        """The repeat held (`on`) or let go by `source`: "key", "midi" or
+        "ui" (the latching button). It sounds while any of them holds it."""
+        if on:
+            self._rep_sources.add(source)
+        else:
+            self._rep_sources.discard(source)
+        self._rep_apply()
+
+    def _rep_apply(self):
+        """Push the repeat (division, position, direction) to the player
+        while it is held, or let it go; the button shows the hold."""
+        held = bool(self._rep_sources)
+        if self.rep_btn.isChecked() != held:
+            self.rep_btn.blockSignals(True)
+            self.rep_btn.setChecked(held)
+            self.rep_btn.blockSignals(False)
+        la = self.through
+        if la is None or not la.running:
+            return
+        pl = la.player
+        if held and pl.playing:
+            pl.set_repeat(dict(REPEAT_DIVS).get(self.rep_div.currentText(), 1.0),
+                          self.rep_pos.value(), self.rep_rev.isChecked())
+        else:
+            pl.clear_repeat()
+
+    def _rep_div_changed(self, name):
+        self.settings.setValue("perform/rep_div", name)
+        self._rep_apply()
+
+    def _rep_div_step(self, d):
+        """- and =: the division one finer (d = 1) or coarser, no wrap."""
+        i = self.rep_div.currentIndex() + d
+        self.rep_div.setCurrentIndex(max(0, min(self.rep_div.count() - 1, i)))
+
+    def _rep_div_frac(self, x):
+        """A knob over the divisions: the bar at the bottom, 1/64 at the top."""
+        n = self.rep_div.count()
+        self.rep_div.setCurrentIndex(min(n - 1, int(max(0.0, min(1.0, x)) * n)))
+
+    def _rep_pos_changed(self, v):
+        self.rep_pos_lbl.setText(f"{v:+d}" if v else "0")
+        self._rep_apply()
+
+    def _quant_frac(self):
+        """The quantize grid as a fraction of a bar, 0 = at once."""
+        return dict(QUANT_GRIDS).get(self.perf_quant.currentText(), 0.0)
+
+    def _quant_changed(self, name):
+        self.settings.setValue("perform/quant", name)
+        if self.through is not None:
+            self.through.quant = self._quant_frac()
+
+    def _voices_audible(self):
+        """The drum voices in, as the switches ask (the sound follows on
+        the grid): in, and not soloed out."""
+        solo = {v for v, b in self.perf_solos.items() if b.isChecked()}
+        return {v for v, cb in self.perf_voices.items()
+                if cb.isChecked() and (not solo or v in solo)}
+
+    def _push_voices(self, la):
+        """The voices' switches, the solos and the grid into a fresh stream."""
+        for v, cb in self.perf_voices.items():
+            la.voice_on[v] = cb.isChecked()
+        la.voice_solo = {v for v, b in self.perf_solos.items() if b.isChecked()}
+        la.quant = self._quant_frac()
+        la.player.gap = self.perf_gap.isChecked()
 
     def _perf_ab_changed(self, v):
         self.perf_ab_lbl.setText(f"A {100 - v} %  ·  B {v} %")
@@ -4541,6 +5880,9 @@ class Main(QMainWindow):
         """20 ms: collect render results, keep the live clock on the section,
         and put the take's frames on screen for the sound that plays."""
         r, self._perf_result = self._perf_result, None
+        self._perf_poll_n += 1
+        if self._perf_poll_n % 10 == 0:                # 5 times a second: the knobs
+            self._perf_refresh_ready()
         if r is not None:
             what = r[0]
             self._perf_busy = None
@@ -4569,6 +5911,8 @@ class Main(QMainWindow):
             if self._perf_sounding:                    # our section just stopped (on the bar,
                 self._perf_sounding = False            # or the output closed): the peers stop
                 self._link_transport(False)            # with it; idling alone sends nothing
+                if "ui" in self._rep_sources:          # the latched repeat ends with it
+                    self._rep_hold("ui", False)
             if self.backdrop.override is not None and burst is None:
                 self.backdrop.override = None
             if burst is None and self._webcam_b():     # webcam on B: the pedal works
@@ -4580,12 +5924,19 @@ class Main(QMainWindow):
             if wait is not None:                       # a timed start: Link's bar
                 self.perf_status.setText(
                     f"starts on the Link bar in {max(0.0, wait - time.monotonic()):.1f} s...")
+                self.perf_meter.set_state("waiting for the Link bar...")
             elif self._perf_busy:
                 self.perf_status.setText("rendering...")
+                self.perf_meter.set_state("rendering...")
+            else:
+                self.perf_meter.set_state("no section")
             return
         self._perf_sounding = True
         if pl.swapped:                                 # the live clock follows the loop
             pl.swapped = False
+            if self._rep_sources:                      # still held: on the new section too
+                self._rep_apply()
+            self.lfo.trigger(time.monotonic())         # trig and one-shot LFOs restart
             self.tempo.set_bpm(pl.bpm)
             self.tempo.anchor = pl.loop_t0 if pl.loop_t0 else time.monotonic()
             self._show_live_bpm()
@@ -4594,20 +5945,43 @@ class Main(QMainWindow):
         if pl.dropped:                                 # a break ended here: the drop
             pl.dropped = False
             self._perf_drop_t = time.monotonic()
+            self.lfo.trigger(self._perf_drop_t)
             if self._live_active():
                 self._live_drop(self._perf_drop_t)     # flash, iDrop, maybe a new clip
+            else:
+                self._drop_clip(self._perf_drop_t)     # the clock is the loop's: clip only
         sec = self._perf_playing
         pos = pl.pos_s()
-        bar = int(pos * pl.bpm / 60.0 / 4) + 1
+        bar_pos = pos * pl.bpm / 60.0 / 4                # bars into the loop
+        bar = int(bar_pos) + 1
         ready = "next ready" if self._perf_ready else ("rendering next..." if self._perf_busy else "")
         if sec is None:                                # stop asked: it lands on the bar
             self.perf_status.setText("stopping on the bar...")
-        elif pl.filling or pl.fill_armed:
-            self.perf_status.setText(f"break...  ·  {ready}")
+            big = "stopping on the bar..."
+        elif pl.filling:
+            self.perf_status.setText(f"{pl.fill_state()['kind']}...  ·  {ready}")
+            big = f"{pl.fill_state()['kind']}..."
+        elif pl.fill_armed:                            # waiting for the phrase's last bar
+            on = min(pl.bars, ((bar - 1) // PHRASE_BARS + 1) * PHRASE_BARS)
+            self.perf_status.setText(
+                f"{pl.fill_armed[0]} on bar {on}  ·  bar {bar}/{pl.bars}  ·  {ready}")
+            big = f"{pl.fill_armed[0]} on bar {on}"
+        elif pl.repeat is not None:                    # a held repeat over the loop
+            _div, off, rev = pl.repeat
+            big = (f"repeat {self.rep_div.currentText()}" + (f" {off:+d}" if off else "")
+                   + (" reversed" if rev else ""))
+            self.perf_status.setText(f"{big}  ·  bar {bar}/{pl.bars}  ·  {ready}")
         else:
             root = f" in {sec.root}" if getattr(sec, "root", None) else ""
             self.perf_status.setText(
                 f"playing {sec.kind}{root} {pl.bpm:.0f} bpm  ·  bar {bar}/{pl.bars}  ·  {ready}")
+            big = f"{sec.kind}{root}  ·  {pl.bpm:.0f} bpm"
+        win = pl.repeat_window()
+        if win is not None:                            # the window, in bars
+            bar_frames = 4 * pl.beat_frames
+            win = (win[0] / bar_frames, win[1] / bar_frames, win[2],
+                   pl.heard_s() * pl.bpm / 60.0 / 4)
+        self.perf_meter.set_state(big, pl.bars, bar_pos, win)
         # picture: the frame the sounding sample was cut from, dissolved into
         # the live picture by the A/B pedal (follow), or pinned to either side
         mode = self.perf_picture.currentText()
@@ -4619,11 +5993,12 @@ class Main(QMainWindow):
             self.backdrop.override = None
             self.backdrop.override_ab = ab
             return
-        fr = self._perf_frame(pos) if (ab > 0.0 and sec is not None) else None
+        heard = pl.heard_s()                           # a repeat: its cell's frame
+        fr = self._perf_frame(heard) if (ab > 0.0 and sec is not None) else None
         if fr is not None:
             self._perf_hold = fr
         elif ab > 0.0 and sec is not None:            # a gap between events, the
-            fr = self._perf_hold or self._perf_any_frame(pos)   # loop's seam: hold, no tape
+            fr = self._perf_hold or self._perf_any_frame(heard)   # loop's seam: hold, no tape
         else:
             self._perf_hold = None
         self.backdrop.override = fr
@@ -4636,8 +6011,11 @@ class Main(QMainWindow):
         takes = {t.name: t for t in self.takes.takes}
         order = {"kick": 0, "snare": 0, "hihat": 0, "ohat": 0, "ride": 0, "glitch": 0,
                  "chop": 1, "oneshot": 1, "texture": 2}
+        aud = self._voices_audible()                 # a voice out does not cut the picture
         best = None
-        for t, src, off, dur, rate, role in sec.events:
+        for t, src, off, dur, rate, role, *_vel in sec.events:
+            if role in VOICE_LABELS and role not in aud:
+                continue
             if t <= pos < t + dur and src in takes and takes[src].frames:
                 pri = order.get(role, 3)
                 if best is None or pri < best[0]:
@@ -4929,8 +6307,10 @@ class Main(QMainWindow):
         self.through.hold_tape = self._webcam_b()
         for stem, cb in self.perf_stems.items():
             self.through.on[stem] = cb.isChecked()
+        self._push_voices(self.through)
         self._push_afx()
         self.through.inserts = self.inserts
+        self._midi_out_apply()
         self.through.start()
         self.through_status.setText("opening...")
         self._through_ticks = 0
@@ -5025,6 +6405,12 @@ class Main(QMainWindow):
         so the look and the shader roll again."""
         self._live_drop_t = t
         self.tempo.downbeat(t)
+        self._drop_clip(t)
+        self.lfo.trigger(t)
+
+    def _drop_clip(self, t):
+        """The picture's part of a drop at monotonic time t: a new clip once
+        4 bars have passed since the last switch, else a jump."""
         bars_since = (t - self._live_switch_t) / (4 * self.tempo.beat_ms / 1000)
         if self.video_switch.isChecked() and len(self._song_videos()) > 1 \
                 and bars_since >= 4:
@@ -5068,6 +6454,18 @@ class Main(QMainWindow):
     def _link_active(self):
         return self.link is not None and self.link_on.isChecked()
 
+    def _link_press(self, *_):
+        """The BPM row's play / stop button (and its MIDI row): the session's
+        transport is flipped, and the poll then treats it exactly as a
+        peer's press, so the section here follows the same way."""
+        if not self._link_active():
+            self.log.appendPlainText("link: off, switch it on first (the Link button)")
+            return
+        on = not self.link.playing
+        self.link.playing = on
+        self.link_play.setText("■" if on else "▶")
+        self.log.appendPlainText(f"link: {'play' if on else 'stop'} sent to the session")
+
     def _link_toggled(self, on):
         """The General tab's Link button: join or leave the Link session. Alone
         our tempo is the session's; joining peers, theirs comes in (Link's
@@ -5076,7 +6474,7 @@ class Main(QMainWindow):
         if self.link is None:
             return
         self.settings.setValue("clock/link", on)
-        self.link_on.setText("on" if on else "off")
+        self.link_on.setText("Link on" if on else "Link off")
         if on:
             self.link.tempo = self.tempo.bpm
             self.link.enabled = True
@@ -5089,6 +6487,7 @@ class Main(QMainWindow):
             self._link_timer.stop()
             self.link.enabled = False
             self.link_status.setText("off")
+            self.link_play.setText("▶")
             self.log.appendPlainText("link: off")
 
     def _link_push(self, bpm):
@@ -5135,13 +6534,15 @@ class Main(QMainWindow):
                 self._link_peers = peers
                 self.log.appendPlainText(f"link: {peers} peer{'s' if peers != 1 else ''}, {bpm:.1f} bpm")
         peers = max(0, self._link_peers)
-        who = "no peers, the session is ours" if peers == 0 \
-            else f"{peers} peer{'s' if peers != 1 else ''}"
+        who = "no peers" if peers == 0 else f"{peers} peer{'s' if peers != 1 else ''}"
         # the session's bar, every poll: the beat 1..4 and a 4-cell meter (a
         # label's text, 20 times a second: nothing the machine notices)
         b = min(4, int(_phase) + 1)
-        self.link_status.setText(f"{who}  ·  {bpm:.1f} bpm  ·  "
-                                 f"{'▶' if playing else '■'} beat {b}  {'●' * b}{'○' * (4 - b)}")
+        self.link_on.setText(f"Link {b}")               # the session's beat, on the button
+        self.link_status.setText(f"{who} · {bpm:.1f} bpm · {'▶' if playing else '■'}")
+        self.link_status.setToolTip(f"{who} in the Link session · {bpm:.1f} bpm · "
+                                    f"{'playing' if playing else 'stopped'} · beat {b}")
+        self.link_play.setText("■" if playing else "▶")   # what a press would send
 
     def _on_live_section(self, idx, pos):
         """The live clock crossed into pseudo-section idx: swap the clip
@@ -5311,8 +6712,12 @@ class Main(QMainWindow):
         self._follow = self._follow_cur = self._follow_key = None
         self._song_visuals_pending = True    # clip pick + shader: when the sound starts
         self._outro = None
+        if self.through is not None:
+            self.through.song.set_events([])
         try:
             meta = json.loads(Path(wav).with_suffix(".json").read_text())
+            if self.through is not None:     # its drum hits, for the MIDI out
+                self.through.song.set_events(meta.get("events") or [])
             self._sections = meta["sections"]
             self._sec_bounds = [int(s["start_sec"] * 1000)
                                 for s in self._sections]
@@ -5423,10 +6828,14 @@ class Main(QMainWindow):
         song's, or in live mode the tap-tempo clock with the input's loudness.
         With nothing playing (idle) the ticked effects of the Video FX tab
         still run, on the tap-tempo clock at a steady mid loudness: no random
-        look, so what is ticked is what shows, and the clip is left alone."""
+        look, so what is ticked is what shows, and the clip is left alone.
+        A perform section sounding without the live input counts like live
+        for the clip: it swaps on the 8-bar pseudo sections the way a song
+        does on quiet boundaries."""
         live = self._live_active()
         idle = not live and self.player.playbackState() != QMediaPlayer.PlayingState
-        if idle and not any(cb.isChecked() for cb in self.vfx_on.values()):
+        section = idle and self._perf_sounding
+        if idle and not section and not any(cb.isChecked() for cb in self.vfx_on.values()):
             return None                         # the clip as it is
         if live or idle:
             now = time.monotonic()
@@ -5458,7 +6867,7 @@ class Main(QMainWindow):
             sec_start_ms = idx * sec_len
             if idx != self._sec_idx:
                 self._sec_idx = idx
-                if live:                        # idle: the clip is yours
+                if live or section:             # idle: the clip is yours
                     self._on_live_section(idx, pos)
         elif self._sections and self._sec_bounds:
             idx = max(0, bisect.bisect_right(self._sec_bounds, pos) - 1)
@@ -5574,6 +6983,10 @@ class Main(QMainWindow):
                 if fs["swell"] > 0.0:
                     st["swell"] = fs["swell"]
                     st["zoom"] = st.get("zoom", 0.0) + 0.25 * fs["swell"]
+            else:
+                rs = pl.repeat_state() if pl is not None else None
+                if rs is not None:                  # a held repeat: the same stutter
+                    st["repeat"] = (rs["k"], rs["frac"])
             if self._perf_drop_t is not None \
                     and (now - self._perf_drop_t) * 1000.0 < 120 * v["flash"]:
                 st["invert"] = True                 # the drop hits
@@ -5747,10 +7160,28 @@ class Main(QMainWindow):
             if t == QEvent.KeyPress and event.key() == Qt.Key_Escape \
                     and self._fullscreen and not event.isAutoRepeat():
                 self.toggle_fullscreen()
+            if t == QEvent.KeyPress:
+                self._hold_key(event, True)
             if not self.ui.isVisible():
                 self._show_ui()
             self._arm_hide()
+        elif t == QEvent.KeyRelease and isinstance(obj, QWidget):
+            self._hold_key(event, False)
         return super().eventFilter(obj, event)
+
+    def _hold_key(self, event, down):
+        """A held action's key (HOLD) going down or up: the press and the
+        release both reach its handler, auto-repeats and typing in a text
+        field (where the shortcuts do not fire either) do not."""
+        if event.isAutoRepeat() or not self._hold_keys:
+            return
+        ident = self._hold_keys.get(QKeySequence(event.keyCombination().toCombined()).toString())
+        if ident is None:
+            return
+        if down and isinstance(QApplication.focusWidget(),
+                               (QLineEdit, QAbstractSpinBox, QPlainTextEdit)):
+            return
+        self.holds[ident]("key", down)
 
     def _on_media_status(self, status):
         # seek to the slice start once the file is actually loaded
@@ -5784,6 +7215,8 @@ class Main(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
+        self._lfo_timer.stop()
+        self.lfo.restore_all()                  # the knobs as you set them, into the settings
         self._vst_editor_close.set()            # a plugin editor still open goes too
         self._show_ui()                         # never leave the cursor hidden
         self.player.stop()
@@ -5797,6 +7230,8 @@ class Main(QMainWindow):
         self._vst_watch_stop.set()
         if getattr(self, "midi", None) is not None:
             self.midi.close_all()
+        if getattr(self, "midi_out", None) is not None:
+            self.midi_out.close()
         if getattr(self, "erae", None) is not None:
             self.erae.close()
         if self.link is not None:
@@ -5807,11 +7242,13 @@ class Main(QMainWindow):
                 src.stop()
         if self.worker and self.worker.isRunning():
             self.worker.wait(2000)
+        if getattr(self, "fetch_worker", None) is not None:
+            self.fetch_worker.stop()
         event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = Main()
-    win.show()
+    win.showMaximized()                         # the whole screen from the start
     sys.exit(app.exec())

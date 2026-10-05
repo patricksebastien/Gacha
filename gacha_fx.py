@@ -4,8 +4,11 @@ gacha_fx.py — the realtime audio racks, one per channel of the live mix.
 
 Five channels: the live input through and the four generated stems (drums, layers,
 chops, events; a section from the section engine and a generated song both
-come as these stems). Each channel has ten effects and a volume, every one a
-knob from 0 to 1 (a MIDI CC 0..127 spread over it):
+come as these stems), plus one per drum voice of a section (VOICES: kick,
+snare, closed and open hat, ride, hat stutter, sub bass), summed into the
+drums channel after their racks, so the drums channel is the kit's bus.
+Each channel has ten effects and a volume, every one a knob from 0 to 1 (a
+MIDI CC 0..127 spread over it):
 
     0          bypassed, no CPU spent
     small      a little of the effect on top of the dry sound
@@ -60,6 +63,13 @@ AUDIO_FX = [
 BIPOLAR = {"pitch"}                      # -1..1 knobs, off at 0 in the middle
 CHANNELS = ("live", "drums", "layers", "chops", "events")   # live = the input through
 STEM_CHANNELS = CHANNELS[1:]
+# the drum voices of a section, each a stem of its own with its own rack,
+# summed into the drums channel (the bus) above; the first six are the MIDI
+# out's roles (gacha_midi.DRUM_ROLES), the sub bass has no note
+VOICES = ("kick", "snare", "hihat", "ohat", "ride", "glitch", "sub")
+VOICE_LABELS = {"kick": "kick", "snare": "snare", "hihat": "closed hat", "ohat": "open hat",
+                "ride": "ride", "glitch": "hat stutter", "sub": "sub bass"}
+ALL_CHANNELS = CHANNELS + VOICES         # every rack there is
 PITCH_DEAD = 0.04                        # |pitch| below this = off (knob centre)
 
 
@@ -165,6 +175,12 @@ class Rack:
         self._plug = {}                                       # lazily built plugins
         self._fifo = {}                                       # key -> (2, n) pending output
         self._delay_s = None
+
+    @property
+    def idle(self):
+        """No effect on and none fading out: zeros in would be zeros out,
+        so a silent channel can skip the rack."""
+        return not any(self._now.values()) and not any(self.amounts.values())
 
     # ---- plugins, built on first use ----
     def _get(self, key):
