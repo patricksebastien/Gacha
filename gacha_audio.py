@@ -114,6 +114,7 @@ except (ImportError, OSError) as e:        # no package, or no libportaudio
     sd = None
     SD_ERROR = str(e)
 
+from gacha_frag import Fragments
 from gacha_fx import ALL_CHANNELS, Rack, STEM_CHANNELS, VOICES
 from gacha_midi import DRUM_NOTES, DRUM_ROLES
 
@@ -240,6 +241,11 @@ def table_hits(table, lo, hi, shift, out):
 
 
 PHRASE_BARS = 4        # a live break lands on these bars' one (the loop's end too)
+RATE_MIN, RATE_MAX = 0.25, 4.0    # the transport's rate: a quarter to four times as rendered
+GRAIN, HOP = 1024, 512            # the stretch: grain length and spacing in output frames
+SEARCH = 256                      # WSOLA: how far a grain may move to line up with the last
+OLA_N = 8192                      # its overlap-add ring (longer than a grain plus a block)
+WIN = np.hanning(GRAIN).astype(np.float32)   # at half overlap the Hanns sum to 1
 
 
 class SectionPlayer:
@@ -269,7 +275,45 @@ class SectionPlayer:
     section are untouched and letting go lands where the loop would have
     been; the cell edges sit on the bar's own grid, so a change of division
     or offset is in time at once. A break wins over it; a stop ends it.
-    `heard_s()` and `repeat_state()` tell the picture what sounds."""
+    `heard_s()` and `repeat_state()` tell the picture what sounds.
+
+    The speed, three layers over the transport, set from the GUI:
+
+    `rate` is the transport's own speed, transport frames per output
+    frame: the live tempo over the section's (a section rendered at 120
+    follows the clock to 126 without a new render) times a nudge (a few
+    percent while held, to line up with something on its own clock). The
+    bar, the grid, the MIDI clock and a queued section all run at it; the
+    picture's clock follows through `loop_t0`, kept per block.
+
+    The head is what is read: the transport itself, or, with `speed` set
+    to "half" or "double" (on the quantize grid), the transport's bar (or
+    `speed_sync` bars, or the loop) run at that gear from the bar's start
+    and resynced there, Gross Beat's way, so the bar and the clock never
+    move; or, while `brake` is held, a tape stop: from where it caught
+    the transport the head decelerates to a stop over `brake_bars` and,
+    let go, spins back up over the same slope, then the transport, which
+    ran on underneath, is heard again (a 2 ms fade, like a repeat let
+    go), on the grid. A brake wins over a gear, a break over both; the
+    repeat composes with all of them (a roll at half speed). The hits
+    for the MIDI out and `heard_s()` follow the head, the clock does not.
+
+    With `locked` off the read is varispeed, linear between frames: half
+    time is an octave down, double an octave up, a tempo follow a few
+    percent sharp or flat, the Looper's way. With `locked` on the rate
+    and the gear keep the pitch: grains of GRAIN frames are cut from the
+    head every HOP output frames and overlap-added (a Hann at half
+    overlap sums to 1, so at rate 1 the sound passes untouched, and the
+    stretch can stay on). A brake is always varispeed, the drop in pitch
+    is the point; a break too, its slices are too short to stretch.
+    `head_state()` tells the picture the head's gear and speed.
+
+    The fragments (`frag`, a gacha_frag.Fragments): the bar playing sliced
+    into equal pieces and a slice held sounding as grains, Bitwig's
+    Sampler way, in place of the section (ducked by the voice's envelope,
+    the transport running on underneath), through the same stems, after
+    everything above; the hits stay in while the duck is under half.
+    `frag_state()` tells the picture and the status what sounds."""
 
     def __init__(self, sr):
         self.sr = sr
@@ -319,6 +363,26 @@ class SectionPlayer:
         self._heard = None                   # loop frame sounding at the block's end, or None
         self._rep_info = (0, 0.0)            # (cell count, 0..1 into the cell)
         self._resume = False                 # fade the transport back in after a repeat
+        # the speed (class note): the transport's rate, the head over it,
+        # the stretch that keeps the pitch
+        self.rate = 1.0                      # transport frames per output frame
+        self.locked = False                  # the stretch keeps the pitch (else varispeed)
+        self.speed = None                    # "half", "double" or None: the head's gear
+        self.speed_sync = 1.0                # bars the gear resyncs on; 0 = the loop
+        self._speed_req = None               # (gear,) waiting for the grid
+        self.brake = False                   # held: the head slows to a stop; let go: spins up
+        self.brake_bars = 1.0                # bars from full speed to the stop, and back
+        self._brake = None                   # audio thread: {"r", "head", "up"}
+        self._tfrac = 0.0                    # the transport's fraction of a frame (pos is whole)
+        self._head_mode = None               # None, "half", "double" or "brake"
+        self._head_rate = 1.0                # the head's speed over the transport
+        self._hcov = None                    # head frame the hits are listed up to
+        self._ola = {}                       # the stretch: stem -> (2, OLA_N) overlap-add ring
+        self._ola_o = 0                      # output frames through the stretch so far
+        self._ola_on = False                 # the stretch rendered the last block
+        self._ola_prev = None                # where the last grain was cut (WSOLA)
+        self._L = 0                          # the lookahead in transport frames this block
+        self.frag = Fragments(sr)            # the fragments (class note), after the render
 
     @property
     def playing(self):
@@ -367,6 +431,34 @@ class SectionPlayer:
         """Let go: the transport, which ran on underneath, is heard again."""
         self.repeat = None
 
+    # ---- the speed (GUI thread)
+    def set_rate(self, r):
+        """The transport's rate: the live tempo over the section's, times
+        a nudge; 1 = as rendered. The pitch follows unless `locked`."""
+        self.rate = max(RATE_MIN, min(RATE_MAX, float(r)))
+
+    def set_speed(self, gear):
+        """Half time ("half"), double time ("double") or neither (None),
+        from the next line of the quantize grid: the head runs the bar
+        at that gear from its start, resynced every `speed_sync` bars."""
+        self._speed_req = (gear if gear in ("half", "double") else None,)
+
+    def set_brake(self, on):
+        """Hold: the head decelerates to a stop over `brake_bars`; let go:
+        it spins back up, then the transport is heard again."""
+        self.brake = bool(on)
+
+    def frag_state(self):
+        """What the fragments do, for the picture and the status (see
+        gacha_frag.Fragments.state), or None while none sounds."""
+        return self.frag.state()
+
+    def head_state(self):
+        """What the head does, for the picture and the status: {mode,
+        rate}, mode None, "half", "double" or "brake", rate the head's
+        speed over the transport (0 = stopped)."""
+        return {"mode": self._head_mode, "rate": self._head_rate}
+
     def heard_s(self):
         """Seconds into the loop of what sounds now: the transport, or the
         repeated cell's frame while a repeat is held (a break has `pos`
@@ -411,24 +503,240 @@ class SectionPlayer:
             self._rep_anchor = (i0 // bar_f) * bar_f + (i0 % bar_f // ln) * ln
         return self._rep_geom(self._rep_anchor, rep)
 
-    def _repeat_idx(self, i0, m, rep):
-        """The loop frames read for transport frames [i0, i0+m) under the
-        repeat, and a gain with 2 ms fades at the cell edges (None when
-        the cells are too short for one). The phase inside the cell is the
-        transport's own, within its bar, so the hits land on the grid."""
-        ln, start, rev = self._rep_cells(i0, rep)
+    def _rep_map(self, t, rep):
+        """The loop frames read for whole transport frames `t` (an int
+        array, any frames) under the repeat, a gain with 2 ms fades at the
+        cell edges (None when the cells are too short for one), and (cell
+        count, 0..1 into the cell) at the last frame. The phase inside the
+        cell is the transport's own, within its bar, so the hits land on
+        the grid."""
+        ln, start, rev = self._rep_cells(int(t[0]), rep)
         bar_f, n = 4 * self.beat_frames, self.n
-        t = np.arange(i0, i0 + m)
         ph = (t % bar_f) % ln
         src = start + (ln - 1 - ph if rev else ph)
-        idx = src % n
         f = int(0.002 * self.sr)
         g = None
         if 0 < f <= ln // 2:
             g = np.minimum(np.minimum(ph, ln - 1 - ph) / f, 1.0).astype(np.float32)
-        self._heard = int(idx[-1])
-        self._rep_info = (int(t[-1] // ln), float(ph[-1]) / ln)
-        return idx, g
+        return src % n, g, (int(t[-1] // ln), float(ph[-1]) / ln)
+
+    def _map(self, t, rep):
+        """Loop frames for whole transport frames `t` (any ints, the loop
+        wrapping) and a gain or None: the loop itself, or the repeat's
+        cells."""
+        if rep is not None:
+            idx, g, _info = self._rep_map(t, rep)
+            return idx, g
+        return t % self.n, None
+
+    # ---- the head and the read (audio thread)
+    def _head(self, tj, r):
+        """The head's position for each output sample of this block, over
+        the transport frames `tj` (float), or None when the head is the
+        transport itself; and a gain or None. A brake runs from where it
+        caught the transport at a rate falling to 0 over `brake_bars`
+        (of the transport's own time), then rising back; at 1 again the
+        transport is heard, faded in. A gear runs the bar (or `speed_sync`
+        bars, or the loop) at its speed from the bar's start."""
+        bar_f = 4 * self.beat_frames
+        b = self._brake
+        if self.brake or b is not None:
+            T = max(1.0, self.brake_bars * bar_f)
+            if b is None:
+                b = self._brake = {"r": 1.0, "head": float(tj[0]), "up": False}
+            b["up"] = not self.brake
+            step = (1.0 if b["up"] else -1.0) * r / T
+            rates = np.clip(b["r"] + step * np.arange(1, len(tj) + 1), 0.0, 1.0)
+            H = b["head"] + np.cumsum(rates * r)
+            b["r"], b["head"] = float(rates[-1]), float(H[-1])
+            self._head_mode, self._head_rate = "brake", b["r"]
+            if b["up"] and b["r"] >= 1.0:
+                self._brake = None
+                self._resume = True
+            # a stopped tape is silent, not a held sample (a DC step)
+            return H, np.minimum(rates / 0.01, 1.0).astype(np.float32)
+        gear = self.speed
+        if gear is None or not bar_f:
+            self._head_mode, self._head_rate = None, 1.0
+            return None, None
+        k = 0.5 if gear == "half" else 2.0
+        S = self.n if self.speed_sync <= 0 else max(1, int(round(self.speed_sync * bar_f)))
+        base = np.floor(tj / S) * S
+        self._head_mode, self._head_rate = gear, k
+        return base + (tj - base) * k, None
+
+    def _plan(self, P, rep):
+        """How output samples at transport positions `P` (float) are read
+        through the map: (idx, idx1, frac, gain), the whole frame either
+        side and the fraction between them (idx1 None when every position
+        is whole: the plain read)."""
+        lo = np.floor(P).astype(np.int64)
+        fr = (P - lo).astype(np.float32)
+        if not fr.any():
+            idx, g = self._map(lo, rep)
+            return idx, None, None, g
+        i0, g0 = self._map(lo, rep)
+        i1, g1 = self._map(lo + 1, rep)
+        g = None if g0 is None else g0 * (1.0 - fr) + g1 * fr
+        return i0, i1, fr, g
+
+    @staticmethod
+    def _read(data, plan):
+        idx, i1, fr, g = plan
+        blk = data[:, idx]
+        if i1 is not None:
+            blk = blk * (1.0 - fr) + data[:, i1] * fr
+        if g is not None:
+            blk = blk * g
+        return blk
+
+    def _grains(self, P, o0, rep, fresh):
+        """The stretch's grains for this block: [(output frame, loop
+        frames, gain)] for every grain starting in [o0, o0 + len(P)), one
+        every HOP; `fresh` adds the one before, so the first block has
+        both halves of its overlap. Each grain is cut near the head, up
+        to SEARCH frames either way, where it best continues the grain
+        before (WSOLA: the mix of the stems correlated against what would
+        have followed that grain at speed 1), so the overlaps add in
+        phase instead of smearing."""
+        n_out = len(P)
+        first = -(-o0 // HOP) * HOP
+        starts = list(range(first, o0 + n_out, HOP))
+        if fresh and starts:
+            starts.insert(0, starts[0] - HOP)
+            self._ola_prev = None
+        hr = float(P[1] - P[0]) if n_out > 1 else 1.0
+        out = []
+        for o in starts:
+            j = o - o0
+            p = float(P[j]) if j >= 0 else float(P[0]) + j * hr
+            s = int(math.floor(p))
+            prev = self._ola_prev
+            if prev is not None and s != prev + HOP:
+                span_idx, _g = self._map(s - SEARCH + np.arange(HOP + 2 * SEARCH), rep)
+                want_idx, _g = self._map(prev + HOP + np.arange(HOP), rep)
+                span = np.zeros(HOP + 2 * SEARCH, np.float32)
+                want = np.zeros(HOP, np.float32)
+                for data in self.stems.values():
+                    span += data[0, span_idx]
+                    want += data[0, want_idx]
+                c = np.correlate(span, want, "valid")
+                s += int(np.argmax(c)) - SEARCH
+            self._ola_prev = s
+            idx, g = self._map(s + np.arange(GRAIN), rep)
+            out.append((o, idx, g))
+        return out
+
+    def _stretch(self, name, data, grains, o0, n_out):
+        """`data` through the stretch: the grains overlap-added into the
+        stem's ring, the block read out of it."""
+        ring = self._ola.get(name)
+        if ring is None:
+            ring = self._ola[name] = np.zeros((2, OLA_N), np.float32)
+        for o, idx, g in grains:
+            grain = data[:, idx] * WIN
+            if g is not None:
+                grain = grain * g
+            a = o % OLA_N
+            if o < o0:                                   # the grain before the first
+                cut = o0 - o
+                grain, a = grain[:, cut:], (o0 % OLA_N)
+            b = a + grain.shape[1]
+            if b <= OLA_N:
+                ring[:, a:b] += grain
+            else:
+                ring[:, a:] += grain[:, :OLA_N - a]
+                ring[:, :b - OLA_N] += grain[:, OLA_N - a:]
+        a = o0 % OLA_N
+        b = a + n_out
+        if b <= OLA_N:
+            out = ring[:, a:b].copy()
+            ring[:, a:b] = 0.0
+        else:
+            out = np.concatenate([ring[:, a:], ring[:, :b - OLA_N]], axis=1)
+            ring[:, a:] = 0.0
+            ring[:, :b - OLA_N] = 0.0
+        return out
+
+    def _render(self, out, P, rep, lead, gain):
+        """Every stem read at the head positions `P` into `out`, after
+        `lead` frames of silence: varispeed, or the stretch with `locked`
+        on and no brake; a change of renderer crossfades over the block,
+        and `gain` (a fade, the brake's) goes over everything."""
+        n_out = len(P)
+        use = self.locked and self._head_mode != "brake"
+        was = self._ola_on
+        o0 = self._ola_o
+        plan = self._plan(P, rep) if (not use or was != use) else None
+        grains = self._grains(P, o0, rep, not was) if use else None
+        xf = np.linspace(0.0, 1.0, n_out, dtype=np.float32) if was != use else None
+        for name, data in self.stems.items():
+            if use:
+                blk = self._stretch(name, data, grains, o0, n_out)
+                if xf is not None:                       # varispeed fading out under it
+                    blk = blk * xf + self._read(data, plan) * (1.0 - xf)
+            else:
+                blk = self._read(data, plan)
+                if xf is not None and name in self._ola:   # the stretch's tail fading out
+                    tail = self._stretch(name, data, [], o0, n_out)
+                    blk = blk * xf + tail * (1.0 - xf)
+            if gain is not None:
+                blk = blk * gain
+            if lead:
+                blk = np.concatenate([np.zeros((2, lead), np.float32), blk], axis=1)
+            out[name] = blk
+        if use:
+            self._ola_o = o0 + n_out
+        elif was:
+            self._ola = {}
+        self._ola_on = use
+
+    # ---- the hits under the head and the rate
+    def _table_range(self, lo, hi, out):
+        """The hits of head frames [lo, hi), past the loop's end as many
+        times as needed, in the head's own frames."""
+        n = self.n
+        while lo < hi and n:
+            base = (lo // n) * n
+            h2 = min(hi - base, n)
+            table_hits(self._ev, lo - base, h2, base, out)
+            lo = base + h2
+
+    def _head_hits(self, H, lead):
+        """The MIDI window under the head: the frames it crosses this
+        block and `lookahead` output frames beyond at its last speed,
+        each hit at the output frame the head reaches it; a resync (the
+        head jumping back) starts a new run; what was listed before is
+        not listed again."""
+        L = self.lookahead
+        if L and len(H) > 1:
+            Hx = np.concatenate([H, H[-1] + float(H[-1] - H[-2]) * np.arange(1, L + 1)])
+        else:
+            Hx = H
+        starts = [0] + (np.flatnonzero(np.diff(Hx) < 0) + 1).tolist()
+        cov = self._hcov
+        for s_i, s in enumerate(starts):
+            e = starts[s_i + 1] if s_i + 1 < len(starts) else len(Hx)
+            a, b = float(Hx[s]), float(Hx[e - 1])
+            if s_i == 0 and cov is not None and cov > a:
+                a = cov
+            tmp = []
+            self._table_range(int(math.ceil(a)), int(math.ceil(b)), tmp)
+            seg = Hx[s:e]
+            for fr, role, v in tmp:
+                j = s + int(np.searchsorted(seg, fr, "left"))
+                self.hits.append((lead + j - L, role, v))
+        self._hcov = float(Hx[-1])
+
+    def _scale_hits(self, lead, f0, r):
+        """The hits listed in transport frames to output frames: the
+        window was `_L` transport frames ahead for `lookahead` output
+        frames."""
+        if r == 1.0 and f0 == 0.0:
+            return
+        L, Lt = self.lookahead, self._L
+        self.hits = [(lead + int(round((off - lead + Lt - f0) / r)) - L, role, v)
+                     for off, role, v in self.hits]
 
     def _src_hits(self, lo, cnt, off, rev):
         """The hits of loop frames [lo, lo+cnt) (round the loop's end) to
@@ -451,7 +759,7 @@ class SectionPlayer:
         """The MIDI out's window under a repeat: cell by cell, the repeated
         slice's hits where they sound (backwards when reversed)."""
         ln, start, rev = self._rep_cells(i0, rep)
-        bar_f, n, L = 4 * self.beat_frames, self.n, self.lookahead
+        bar_f, n, L = 4 * self.beat_frames, self.n, self._L
         a0, end = i0 + L, i0 + L + m
         t = max(i0, min(a0, self._covered))
         while t < end:
@@ -563,7 +871,7 @@ class SectionPlayer:
                 swell = swell[:, swell.shape[1] - len(idx):]
             k0 = len(idx) - swell.shape[1]
         self._fill = {"idx": idx, "gain": gain, "retrig": retrig, "frac": frac, "k": 0,
-                      "end": end, "kind": kind, "swell": swell, "swell_k0": k0,
+                      "end": end, "kind": kind, "swell": swell, "swell_k0": k0, "ko": 0,
                       "covered": 0, "after": 0}     # the MIDI out's window, see _fill_hits
         self.fill_armed = None
 
@@ -620,8 +928,14 @@ class SectionPlayer:
             self.stems, self.events, self.n, self.pos = None, [], 0, 0
             self._ev = None
             self.repeat, self._rep_anchor, self._heard = None, None, None
+            self._brake, self._tfrac, self._hcov = None, 0.0, None
+            self._head_mode, self._head_rate = None, 1.0
+            self._ola, self._ola_on = {}, False
+            self.frag.voices = []
             return
         stems, events, bpm, bars, bar_t0, table = p
+        self._tfrac, self._hcov = 0.0, None
+        self.frag.voices = []
         from_silence = self.stems is None
         self.stems, self.events, self.bpm, self.bars = stems, events, bpm, bars
         self._ev = table
@@ -665,7 +979,7 @@ class SectionPlayer:
         frames listed now, late by the lead at worst); a pending section
         starts at the first block after the next bar (as the swap does), so
         its first hits are listed from there."""
-        L, n = self.lookahead, self.n
+        L, n = self._L, self.n
         a0, end = i0 + L, i0 + L + m
         a = max(i0, min(a0, self._covered))
         cut = None
@@ -689,7 +1003,7 @@ class SectionPlayer:
         drop: the pending section from 0, or the loop on from the bar."""
         f = self._fill
         idx, retrig, end = f["idx"], f["retrig"], f["end"]
-        L = self.lookahead
+        L = self._L
         a0, b = k + L, k + L + bs
         a = max(k, min(a0, f["covered"]))
         f["covered"] = b
@@ -742,44 +1056,68 @@ class SectionPlayer:
         elif self.stems is not None:
             lead = min(self._lead, bs)                # a timed start: silence up to it
             self._lead -= lead
-            m = bs - lead
-            i0 = self.pos
+            n_out = bs - lead
+            r = self.rate
+            i0, f0 = self.pos, self._tfrac
+            tot = f0 + n_out * r
+            m = int(tot)                              # transport frames this block
+            self._tfrac = tot - m
+            self._L = int(math.ceil(self.lookahead * r))
             self.grid_i0, self.grid_lead = i0, lead
-            self.grid_off = self._grid_offset(i0, m, lead)
+            go = self._grid_offset(i0, m, 0)
+            self.grid_off = None if go is None else lead + int(round(max(0.0, go - f0) / r))
+            if self._speed_req is not None and self.grid_off is not None:
+                self.speed = self._speed_req[0]       # a gear lands on the grid
+                self._speed_req = None
             rep = self.repeat
-            if rep is not None:                       # a hold: the cell, not the transport
-                idx, g = self._repeat_idx(i0, m, rep)
+            tj = i0 + f0 + np.arange(n_out) * r       # the transport under each output frame
+            H, gain = self._head(tj, r)
+            P = tj if H is None else H
+            if rep is not None:                       # a hold: the cells, not the transport
                 self._resume = True
             else:
-                idx, g = (np.arange(m) + i0) % self.n, None
                 self._rep_anchor = None
-                if self._resume:                      # just let go: no click on the way back
-                    self._resume = False
-                    f = min(m, int(0.002 * self.sr))
-                    if f > 1:
-                        g = np.ones(m, np.float32)
-                        g[:f] = np.linspace(0.0, 1.0, f, dtype=np.float32)
-                self._heard = None
-            for name, data in self.stems.items():
-                blk = data[:, idx]
-                if g is not None:
-                    blk = blk * g
-                if lead:
-                    blk = np.concatenate([np.zeros((2, lead), np.float32), blk], axis=1)
-                out[name] = blk
+            if H is None and rep is None and self._resume and n_out > 1:
+                self._resume = False                  # just let go: no click on the way back
+                f = min(n_out, int(0.002 * self.sr))
+                if f > 1:
+                    gain = np.ones(n_out, np.float32)
+                    gain[:f] = np.linspace(0.0, 1.0, f, dtype=np.float32)
+            self._render(out, P, rep, lead, gain)
+            last = int(math.floor(P[-1])) if n_out else i0
+            if rep is not None:
+                idx, _g, self._rep_info = self._rep_map(np.array([last]), rep)
+                self._heard = int(idx[0])
+            else:
+                self._heard = last % self.n if H is not None else None
             if self._ev is not None:
-                if rep is not None:
-                    self._repeat_hits(i0, m, lead, rep)
+                if H is not None:
+                    self._head_hits(H, lead)
+                    self._covered = i0 + m + self._L - (self.n if i0 + m >= self.n else 0)
                 else:
-                    self._loop_hits(i0, m, lead, breaking, bar_f)
+                    if rep is not None:
+                        self._repeat_hits(i0, m, lead, rep)
+                    else:
+                        self._loop_hits(i0, m, lead, breaking, bar_f)
+                    self._scale_hits(lead, f0, r)
+            if H is None:
+                self._hcov = None
+            if self.frag.sounding or self.frag._req:
+                duck = self.frag.block(self.stems, self.n, 4 * self.beat_frames, i0 + f0, r,
+                                       self.locked, out, bs)   # the bar after a swap
+                if duck > 0.5:
+                    self.hits = []
             self.pos = (i0 + m) % self.n
+            # the loop's start on the clock, from this block: the picture's
+            # bar follows the transport, a nudge included
+            self.loop_t0 = now + lead / self.sr - (i0 + f0) / (self.sr * r)
             if i0 + m >= self.n:                      # wrapped inside this block
-                self.loop_t0 = now + (self.n - i0 + lead) / self.sr
+                self.loop_t0 += self.n / (self.sr * r)
             # a bar boundary inside this block: a pending section comes in
             # at the next block (5 ms off at most), its position on the bar
             if self.pending is not None and bar_f and not breaking \
                     and (i0 // bar_f) != ((i0 + m) // bar_f):
-                self.pos = 0                          # so the swap lands on the bar
+                self.pos, self._tfrac = 0, 0.0        # so the swap lands on the bar
             on_beat = (i0 // self.beat_frames) != ((i0 + m) // self.beat_frames) \
                 if self.beat_frames else True
             # an armed break waits for the phrase's last bar, then starts on
@@ -809,33 +1147,62 @@ class SectionPlayer:
     def _fill_block(self, out, bs):
         """One block of the break into `out`; `pos` follows the slice that
         sounds, so the picture glitches with it. At the end: the pending
-        section, or the loop on from the bar. Returns whether a beat passed."""
+        section, or the loop on from the bar. Returns whether a beat passed.
+        The break runs at the transport's rate (varispeed, its slices are
+        too short for the stretch); no head over it."""
         f = self._fill
         idx, gain, k, end = f["idx"], f["gain"], f["k"], f["end"]
+        r, f0 = self.rate, self._tfrac
+        tot = f0 + bs * r
+        m = int(tot)                              # transport frames this block
+        self._tfrac = tot - m
+        self._L = int(math.ceil(self.lookahead * r))
+        self._head_mode, self._head_rate, self._hcov = None, 1.0, None
         self.grid_i0 = end - (len(idx) - k)       # the break keeps the bar's grid
         if self._ev is not None:
-            self._fill_hits(k, bs)
-        m = min(bs, len(idx) - k)
-        self.grid_off = self._grid_offset(self.grid_i0, m, 0)
-        sl, g = idx[k:k + m], gain[k:k + m]
+            self._fill_hits(k, m)
+            self._scale_hits(0, f0, r)
+        mt = min(m, len(idx) - k)
+        go = self._grid_offset(self.grid_i0, mt, 0)
+        self.grid_off = None if go is None else int(round(max(0.0, go - f0) / r))
+        P = k + f0 + np.arange(bs) * r
+        mo = int(np.count_nonzero(P < len(idx)))  # output frames before the fill's end
+        if mo:
+            lo = np.floor(P[:mo]).astype(np.int64)
+            fr = (P[:mo] - lo).astype(np.float32)
+            hi = np.minimum(lo + 1, len(idx) - 1)
+            g_lo, g_hi = gain[lo] * (1.0 - fr), gain[hi] * fr
+            sl, sh = idx[lo], idx[hi]
         for name, data in self.stems.items():
             blk = np.zeros((2, bs), np.float32)
-            blk[:, :m] = data[:, sl] * g
+            if mo:
+                blk[:, :mo] = data[:, sl] * g_lo + data[:, sh] * g_hi
             out[name] = blk
+        if self.frag.sounding or self.frag._req:  # the fragments over the break too
+            duck = self.frag.block(self.stems, self.n, 4 * self.beat_frames, self.grid_i0 + f0,
+                                   r, False, out, bs)
+            if duck > 0.5:
+                self.hits = []
+        if self._ola:                             # the stretch, if it was on, starts over after
+            self._ola, self._ola_on = {}, False
         swell = f["swell"]
-        if swell is not None and k + m > f["swell_k0"]:   # the swell, under A/B
-            a = max(0, k - f["swell_k0"])                  # like the stems
-            b = min(swell.shape[1], k + m - f["swell_k0"])
+        ko = f["ko"]                              # output frames into the break
+        sk0 = int(round(f["swell_k0"] / r))       # the swell's start, in output frames
+        if swell is not None and ko + bs > sk0:   # the swell, under A/B like the stems
+            a = max(0, ko - sk0)
+            b = min(swell.shape[1], ko + bs - sk0)
             if b > a:
                 ev = out.get("events")
                 ev = np.zeros((2, bs), np.float32) if ev is None else ev
-                o = max(0, f["swell_k0"] - k)
+                o = max(0, sk0 - ko)
                 ev[:, o:o + b - a] += swell[:, a:b]
                 out["events"] = ev
-        on_beat = (k // self.beat_frames) != ((k + m) // self.beat_frames)
+        f["ko"] = ko + bs
+        on_beat = (k // self.beat_frames) != ((k + mt) // self.beat_frames)
         if k + m < len(idx):
             f["k"] = k + m
-            self.pos = int(sl[-1]) if g[-1] > 0 else self.pos
+            if mo:
+                self.pos = int(sl[-1]) if g_lo[-1] + g_hi[-1] > 0 else self.pos
         else:                                         # done: the drop
             self._fill = None
             self.pos = end % self.n
@@ -1481,9 +1848,10 @@ class LiveAudio:
         pl = self.player
         bf = pl.beat_frames
         if pl.playing and bf and pl.grid_i0 is not None:
-            beat_s = bf / sr
+            r = pl.rate                               # the transport's rate: its beat
+            beat_s = bf / (sr * r)
             b = (pl.grid_i0 // bf) * bf               # the beat this block sits in
-            mo.grid(heard + (pl.grid_lead + b - pl.grid_i0) / sr, beat_s)
+            mo.grid(heard + pl.grid_lead / sr + (b - pl.grid_i0) / (sr * r), beat_s)
         else:
             beat_s = float(self.beat_s)
             mo.grid(None, beat_s)

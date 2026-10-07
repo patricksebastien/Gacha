@@ -7,7 +7,7 @@ chops, events; a section from the section engine and a generated song both
 come as these stems), plus one per drum voice of a section (VOICES: kick,
 snare, closed and open hat, ride, hat stutter, sub bass), summed into the
 drums channel after their racks, so the drums channel is the kit's bus.
-Each channel has ten effects and a volume, every one a knob from 0 to 1 (a
+Each channel has eleven effects and a volume, every one a knob from 0 to 1 (a
 MIDI CC 0..127 spread over it):
 
     0          bypassed, no CPU spent
@@ -24,7 +24,9 @@ takes a second to start producing sound in streaming mode; this one is a
 tape-style shifter with 25 ms of latency and a little warble), and a phone
 codec imitation (pedalboard's GSM codec needs 40 ms blocks to produce any
 sound when streamed: a 3.4 kHz lowpass, 8 kHz sample-and-hold and 8-bit
-mu-law give the same flavour at zero latency). A plugin handing back blocks
+mu-law give the same flavour at zero latency), and a reverse delay of our
+own (ReverseDelay below: the typical pedal, a beat at a time backwards,
+its echo fed back). A plugin handing back blocks
 of varying length goes through a FIFO. Every amount is ramped over the
 block it changes in, so knobs never zip. Delay time follows the beat
 (`Rack.beat_s`, set from the song or the live clock): a dotted eighth, the
@@ -58,6 +60,12 @@ AUDIO_FX = [
                             "in over the first semitones"),
     ("delay", "delay", 0.0, "Tempo-synced delay, a dotted eighth, feedback rising "
                             "with the knob; only repeats at full"),
+    ("reverse", "reverse delay", 0.0, "Reverse delay: the time's worth of sound played "
+                                      "backwards, that much late, the reversed echo fed back "
+                                      "so the repeats come backwards, forwards, backwards; "
+                                      "the time and the feedback are the Perform tab's "
+                                      "Reverse delay row, this knob the wet mix, only "
+                                      "echoes at full"),
     ("reverb", "reverb", 0.0, "Reverb, the room growing with the knob; a wash at full"),
 ]
 BIPOLAR = {"pitch"}                      # -1..1 knobs, off at 0 in the middle
@@ -162,6 +170,85 @@ class PitchShifter:
         return out
 
 
+# the reverse delay's time and feedback, one setting for every channel
+# (the Perform tab's Reverse delay row): set from the GUI thread, read per block
+REVERSE = {"time": 0.25,         # the chunk, as a fraction of the bar (a beat)
+           "feedback": 0.5}      # the echo's share fed back, 0..0.95
+REV_TIMES = [("1/64", 1 / 64), ("1/32", 1 / 32), ("1/16", 1 / 16), ("1/8", 1 / 8),
+             ("1/4", 1 / 4), ("1/2", 1 / 2), ("1 bar", 1.0)]
+
+
+class ReverseDelay:
+    """The typical reverse delay: the input is cut into chunks a delay
+    time D long (REVERSE["time"] of the bar, a beat by default, following
+    the tempo) and each chunk is played
+    back backwards during the next D, so what went in during a beat is
+    heard a beat later, reversed, its tail first (a 10 ms fade at each
+    chunk's ends keeps the seam clean). The wet output is fed back into
+    the line, so the second echo is the reversed echo reversed again,
+    forwards, two beats late, the third backwards once more, the pedal's
+    alternating repeats; the fed-back share (REVERSE["feedback"]) is
+    soft-clipped so it cannot run away. A change of D (a tempo change, the
+    row) crossfades over the block it lands in."""
+
+    def __init__(self, sr):
+        self.sr = int(sr)
+        self.n = 1 << int(8.5 * sr).bit_length()             # ring, > 2 x 4 s + a block
+        self.ring = np.zeros((2, self.n), np.float32)
+        self.t = 0                                             # frames written in all
+        self._D = None                                         # the chunk, frames
+        self._fb = 0.0
+
+    def reset(self):
+        self.ring[:] = 0.0
+        self._D = None
+
+    def _read(self, t0, bs, D):
+        """The reversed read for frames t0..t0+bs at chunk length D: each
+        frame plays the previous chunk of the D grid backwards, faded at
+        the chunk's ends."""
+        t = t0 + np.arange(bs)
+        c = t // D                                             # the window's chunk
+        p = t - c * D                                          # 0..D-1 into it
+        src = (2 * c * D - 1 - t) % self.n                     # the chunk before, backwards
+        f = max(1, min(int(0.01 * self.sr), D // 8))
+        g = (np.minimum(np.minimum(p, D - 1 - p), f) / f).astype(np.float32)
+        return self.ring[:, src] * g
+
+    def process(self, x, a, beat_s):
+        """(2, bs) in, the fully wet echoes (2, bs) out (the amount `a` is
+        the rack's mix), the chunk REVERSE["time"] of a bar of `beat_s`."""
+        bs = x.shape[1]
+        secs = float(REVERSE.get("time", 0.25)) * 4.0 * float(beat_s)
+        D = int(round(max(0.01, min(4.0, secs)) * self.sr))   # 10 ms: a buzz, up to a bar
+        t0 = self.t
+        idx = (t0 + np.arange(bs)) % self.n
+        self.ring[:, idx] = x                                  # written first: the seam reads
+        if self._D is None:                                    # this block's own frames
+            self._D = D
+        D0 = self._D
+        fb = max(0.0, min(0.95, float(REVERSE.get("feedback", 0.5))))
+        xf = np.linspace(0.0, 1.0, bs, dtype=np.float32) if D != D0 else None
+        # a chunk boundary inside the block: the frames after it read the
+        # frames before it (the seam), so those get their echo written
+        # first; the block goes in pieces at every boundary of either grid
+        cuts = sorted({c for DD in {D0, D}
+                       for c in range(-(-t0 // DD) * DD, t0 + bs, DD) if t0 < c < t0 + bs})
+        y = np.empty((2, bs), np.float32)
+        a0 = 0
+        for cut in cuts + [t0 + bs]:
+            a1 = cut - t0
+            seg = self._read(t0 + a0, a1 - a0, D0)
+            if xf is not None:
+                seg = seg * (1.0 - xf[a0:a1]) + self._read(t0 + a0, a1 - a0, D) * xf[a0:a1]
+            y[:, a0:a1] = seg
+            self.ring[:, idx[a0:a1]] += np.tanh(seg * fb).astype(np.float32)   # the echo's echo
+            a0 = a1
+        self._D = D
+        self.t = t0 + bs
+        return y
+
+
 class Rack:
     """One channel's effects and volume, streamed block by block."""
 
@@ -207,6 +294,8 @@ class Rack:
             elif key == "delay":
                 p = Delay(delay_seconds=0.75 * self.beat_s, feedback=0.3, mix=1.0)
                 self._delay_s = 0.75 * self.beat_s
+            elif key == "reverse":
+                p = ReverseDelay(sr)
             elif key == "reverb":
                 p = Reverb(room_size=0.6, damping=0.5, wet_level=1.0, dry_level=0.0, width=1.0)
             self._plug[key] = p
@@ -248,6 +337,8 @@ class Rack:
                 self._delay_s = want
             p.feedback = 0.2 + 0.55 * a
             return p.process(x, sr, reset=False)
+        if key == "reverse":
+            return p.process(x, a, self.beat_s)
         if key == "reverb":
             p.room_size = 0.3 + 0.65 * a
             p.damping = 0.6 - 0.3 * a
@@ -322,4 +413,4 @@ if __name__ == "__main__":                       # cost check from a terminal
     for _ in range(200):
         rack.process(x)
     ms = (time.perf_counter() - t) / 200 * 1000
-    print(f"all ten on: {ms:.2f} ms per {bs}-frame block ({1000 * bs / sr:.1f} ms of audio)")
+    print(f"all eleven on: {ms:.2f} ms per {bs}-frame block ({1000 * bs / sr:.1f} ms of audio)")

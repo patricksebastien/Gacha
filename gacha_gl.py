@@ -107,6 +107,9 @@ uniform float uBrightness, uSaturation, uHue, uTintHue, uTintAmt, uInvert;
 uniform float uBits, uDither, uMonoTones, uMonoThr, uSolar, uEdges, uScan;
 uniform float uGrain, uVign, uPixel, uRgbShift, uGlitch, uGlitchMode, uTrails, uZoom;
 uniform float uKaleido, uRepeat, uRepeatK, uRepeatFrac, uSwell;
+uniform float uGran;           // the granular picture: strength, and its bands
+uniform int uGranN;            // (left edge, width, playhead x, lit), fractions of the width
+uniform vec4 uGranHeads[16];
 // source grade (colour correction of the picture itself, before any effect)
 uniform float uGExposure, uGBlack, uGGamma, uGContrast, uGSat, uGWarm, uGTint, uGSharpen;
 uniform float uAB;             // 0 = the live picture, 1 = the take frame
@@ -230,6 +233,26 @@ void main() {
         col.g = video(uv, zoom).g;
         col.b = video(uv + vec2(uRgbShift, 0.0), zoom).b;
     } else col = video(uv, zoom);
+    if (uGran > 0.0) {
+        // the granular picture: the frame is the buffer, now at its right
+        // edge, and every grain a band at its spot, as wide as the grain,
+        // lifted by its window with soft edges, a bright playhead line where
+        // it reads; outside the bands the frame darkens a little
+        float lit = 0.0, line = 0.0;
+        float px1 = 1.5 / uRes.x;
+        for (int i = 0; i < 16; i++) {
+            if (i >= uGranN) break;
+            vec4 hd = uGranHeads[i];
+            if (hd.y <= 0.0) continue;
+            float e = max(px1, 0.08 * hd.y);
+            float inside = clamp((vUV.x - hd.x) / e, 0.0, 1.0)
+                         * clamp((hd.x + hd.y - vUV.x) / e, 0.0, 1.0);
+            lit = max(lit, inside * hd.w);
+            line = max(line, clamp(1.0 - abs(vUV.x - hd.z) / px1, 0.0, 1.0) * inside);
+        }
+        col = col * (1.0 - 0.3 * uGran + 0.6 * uGran * lit) + 0.16 * uGran * lit;
+        col = mix(col, 1.0 - col, line * uGran);
+    }
     if (uEdges > 0.0) {
         vec2 d = 1.0 / uRes;
         float gx = luma(video(uv + vec2(d.x, 0.0), zoom)) - luma(col);
@@ -361,6 +384,9 @@ class GLBackdrop(QOpenGLWidget):
         self._t0 = time.monotonic()
         self._frame_n = 0
         self._last_t = self._t0
+        self._t_acc = 0.0                # the effects' clock (uTime, iTime), in seconds
+        self.time_rate = 1.0             # how fast it runs: the section's head (a tape stop
+                                         # slows the strobes and the grain to a stop with it)
         self.log = []                    # compile errors etc., for the GUI
         self.frame_ms = 0.0              # smoothed CPU time of paintGL
         self.frames = 0                  # paints so far (the stats HUD reads the rate)
@@ -729,9 +755,10 @@ class GLBackdrop(QOpenGLWidget):
         self._ensure_fbos()
         W, H = self._fbo_size
         now = time.monotonic()
-        t = now - self._t0
         dt = now - self._last_t
         self._last_t = now
+        self._t_acc += max(0.0, dt) * float(self.time_rate)
+        t = self._t_acc
         self._frame_n += 1
         cur, prev = self._ping, 1 - self._ping
 
@@ -872,3 +899,9 @@ class GLBackdrop(QOpenGLWidget):
         f("uRepeatK", float(rpt[0]) if rpt else 0.0)
         f("uRepeatFrac", float(rpt[1]) if rpt else 0.0)
         f("uSwell", float(g("swell", 0.0)))
+        gr = g("gran")
+        f("uGran", float(gr["amt"]) if gr else 0.0)
+        heads = (gr.get("heads") or [])[:16] if gr else []
+        p.setUniformValue1i("uGranN", len(heads))
+        for i, (x0, w, hx, lit) in enumerate(heads):
+            p.setUniformValue(f"uGranHeads[{i}]", float(x0), float(w), float(hx), float(lit))

@@ -63,11 +63,18 @@ from gacha_fetch import (INSTALL_HINT as FETCH_INSTALL_HINT, FetchWorker,
 from gacha_midi import (CYCLES_CHANNELS, CYCLES_ROOT, DRUM_LABELS, DRUM_NOTES, DRUM_ROLES,
                         MIDI_AVAILABLE, MidiIn, MidiOut, format_binding, midi_inputs,
                         midi_outputs, parse_binding)
-from gacha_fx import ALL_CHANNELS, AUDIO_FX, BIPOLAR, CHANNELS, VOICE_LABELS, VOICES
+from gacha_frag import (FRAG_DIRS, FRAG_DIVS, FRAG_PLAYS, FRAG_RATES, FRAG_UNITS, FRAGMENTS,
+                        MAX_VOICES)
+from gacha_fx import (ALL_CHANNELS, AUDIO_FX, BIPOLAR, CHANNELS, REV_TIMES, REVERSE,
+                      VOICE_LABELS, VOICES)
 from gacha_erae import ERAE_AVAILABLE, PORT as ERAE_PORT, EraeSurface
 from gacha_vst import KNOBS as VST_KNOBS, InsertChain, place_editor_window, scan_plugins
 from gacha_lfo import (LfoEngine, SHAPES as LFO_SHAPES, RATES as LFO_RATES,
                        RATE_DEFAULT as LFO_RATE_DEFAULT, MODES as LFO_MODES, N_SLOTS as LFO_SLOTS)
+from gacha_scene import (SceneBank, Morph, GROUPS as SCENE_GROUPS,
+                         GROUP_LABELS as SCENE_GROUP_LABELS, MORPH_BARS, MORPH_DEFAULT,
+                         N_SLOTS as SCENE_SLOTS)
+from gacha_macro import MacroEngine, N_SLOTS as MACRO_SLOTS, N_DESTS as MACRO_ROWS
 try:
     import psutil                    # cpu and memory for the stats HUD
 except ImportError:                  # pragma: no cover
@@ -224,6 +231,14 @@ VIDEO_EFFECTS = [
     ("edges", "edges", 0.3, "Edge detection, blended in"),
     ("lines", "scanlines", 0.4, "CRT scanlines"),
     ("grain", "grain", 0.3, "Film grain"),
+    ("gran", "granular", 0.5, "Granular picture: while a fragment sounds (Perform "
+                              "tab) the frame is the slice and every grain is a lit "
+                              "band at its spot, as wide as the grain, swelling and "
+                              "fading with it, a playhead line crossing it (backwards "
+                              "for a reversed grain); the motion scatters the bands, "
+                              "the size widens them, a frozen playhead holds the "
+                              "frame. With none sounding, bands on the Fragments "
+                              "rows' settings alone"),
     ("zoom", "zoom", 0.5, "Zoom punches in with the loudness"),
     ("trails", "trails", 0.4, "Motion trails: bright parts linger"),
     ("glitch", "glitch", 0.4, "Horizontal glitch tears, more when loud. Per "
@@ -304,7 +319,7 @@ KEYMAP += [("grade", f"grade_{k}", "", f"{lbl}: {lo:g} to {hi:g}, neutral {val:g
            for k, lbl, (lo, hi, _s, val), _t in VIDEO_GRADE]
 KEYMAP += [("fx", f"fx_{k}", "", f"{lbl} strength, 0 (off) to 1")
            for k, lbl, _d, _t in VIDEO_EFFECTS]
-# the audio racks: ten effects and a volume per channel (the live input and
+# the audio racks: eleven effects and a volume per channel (the live input and
 # the four stems), every one a knob; then a focused set (the same knobs for
 # whichever channel was focused last) and the five focus buttons
 for _ch in CHANNELS:
@@ -354,7 +369,7 @@ KEYMAP += [("show", "video_off", "V", "video off: no picture, no decoding, no GP
                                       "(the sound runs as usual), off/on")]
 # the drum voices of a section (gacha_fx.VOICES): each in or out and soloed,
 # all back in, the grid the switches, events and bursts land on, and a rack
-# per voice (ten effects and a volume, like the five channels above) with
+# per voice (eleven effects and a volume, like the five channels above) with
 # its focus button
 KEYMAP += [("voices", f"voice_{_v}", f"Shift+F{_i}",
             f"{VOICE_LABELS[_v]} in/out, on the quantize grid; its MIDI notes follow")
@@ -385,7 +400,62 @@ KEYMAP += [("section", "repeat", "H", "repeat (hold): the cell of the bar playin
            ("section", "rep_later", ".", "repeat position one cell later"),
            ("section", "rep_pos", "", "repeat position as a knob: the captured cell in the "
                                      "middle, 16 cells earlier to 16 later"),
-           ("section", "rep_rev", "/", "repeat backwards off/on")]
+           ("section", "rep_rev", "/", "repeat backwards off/on"),
+           ("section", "half", "Shift+H", "half time off/on: the bar at half speed from its "
+                                          "start, on the grid; the clock and the bar stay"),
+           ("section", "double", "Ctrl+H", "double time off/on: the bar at double speed from "
+                                           "its start, on the grid"),
+           ("section", "speed_sync", "", "half and double time resync every: 1/2 bar, 1, 2, "
+                                         "4 bars or the loop, as a knob"),
+           ("section", "pitch_lock", "", "pitch locked off/on: half and double time, a nudge "
+                                         "and a tempo change keep the pitch (the stretch) "
+                                         "instead of following the speed"),
+           ("section", "brake", "Shift+B", "tape stop, held: the section decelerates to a stop "
+                                           "over the length next to it; let go, it spins back "
+                                           "up to the transport, which ran on"),
+           ("section", "brake_len", "", "tape stop length as a knob: 1/4 bar at the bottom, "
+                                        "4 bars at the top"),
+           ("section", "nudge_down", "J", "nudge down, held: the section a few percent slower "
+                                          "and the clock with it, to line up with something "
+                                          "on its own clock (not under Link)"),
+           ("section", "nudge_up", "K", "nudge up, held: a few percent faster")]
+# the fragments (Perform tab): the bar sliced, a slice held sounds as grains
+KEYMAP += [("frag", "frag", "F", "fragments (hold): the slice of the bar under the playhead "
+                                 "(or the one picked in the Perform tab) sounds as grains in "
+                                 "place of the section, which runs on underneath; let go, "
+                                 "the release, then the section")]
+KEYMAP += [("frag", f"frag_{_n}", "", f"fragments (hold): slice {_n} of the bar, of the "
+                                      "slices set in the Perform tab")
+           for _n in range(1, 17)]
+KEYMAP += [("frag", "frag_div", "", "fragments slices per bar as a knob: 4, 8, 16, 32"),
+           ("frag", "frag_slice", "", "fragments slice for the F key as a knob: follow at the "
+                                      "bottom, then slice 1 up to the last"),
+           ("frag", "frag_size", "", "fragments grain size as a knob: 1/64 of the bar at the "
+                                     "bottom up to a bar"),
+           ("frag", "frag_rate", "", "fragments grain rate as a knob: dense at the bottom, "
+                                     "then a grain every 1/64 of the bar up to every bar"),
+           ("frag", "frag_motion", "", "fragments motion, 0 to 800 %: how far from the "
+                                       "playhead the grains land, in grain sizes"),
+           ("frag", "frag_pitch", "", "fragments pitch as a knob: -24 semitones at the "
+                                      "bottom, +24 at the top, none in the middle"),
+           ("frag", "frag_speed", "", "fragments playhead speed as a knob: -200 % at the "
+                                      "bottom, frozen in the middle, +200 % at the top"),
+           ("frag", "frag_repeats", "", "fragments repeats, 1 to 16: each grain that many "
+                                        "times over"),
+           ("frag", "frag_shape", "", "fragments grain envelope, 0 to 100 %: a pluck, a "
+                                      "Hann in the middle, open"),
+           ("frag", "frag_dir", "", "fragments grain direction, next: forward, reverse, "
+                                    "random, alternate"),
+           ("frag", "frag_play", "", "fragments playback at the slice's ends, next: loop, "
+                                     "ping-pong, once"),
+           ("frag", "frag_a", "", "fragments attack, 0 to 2 s"),
+           ("frag", "frag_d", "", "fragments decay, 0 to 2 s"),
+           ("frag", "frag_s", "", "fragments sustain, 0 to 100 %"),
+           ("frag", "frag_r", "", "fragments release, 0 to 4 s")]
+# the reverse delay's time and feedback (Perform tab), every channel's
+KEYMAP += [("mix", "rev_time", "", "reverse delay time as a knob: 1/64 of the bar at the "
+                                   "bottom up to a bar, every channel's"),
+           ("mix", "rev_fb", "", "reverse delay feedback, 0 to 95 %, every channel's")]
 # the LFOs (LFO tab): each slot in or out and its depth as a knob, every
 # trig and one-shot slot restarted, and the panic key
 KEYMAP += [row for _n in range(1, LFO_SLOTS + 1)
@@ -395,12 +465,33 @@ KEYMAP += [row for _n in range(1, LFO_SLOTS + 1)
 KEYMAP += [("lfo", "lfo_trig", "", "retrigger: every trig and one-shot LFO restarts its "
                                    "cycle now (a section start and a drop do this too)"),
            ("lfo", "lfo_off", "Shift+L", "every LFO off, the knobs back where you set them")]
+# the scenes (Scenes tab): every slot loaded and saved from a button, and
+# the morph switch
+KEYMAP += [("scene", f"scene_load_{_n}", "", f"scene {_n}: load it (the groups it ticks), at "
+                                             "once or morphed over the time set in the tab")
+           for _n in range(1, SCENE_SLOTS + 1)]
+KEYMAP += [("scene", f"scene_save_{_n}", "", f"scene {_n}: save the state as it is now into "
+                                             "the slot")
+           for _n in range(1, SCENE_SLOTS + 1)]
+KEYMAP += [("scene", "scene_morph", "", "scene morph off/on: a load glides the knobs over the "
+                                        "time set in the Scenes tab instead of jumping")]
+# the macros (Macros tab): each one a knob, 0 to 100 %, that moves every
+# destination of its row through its range
+KEYMAP += [("macro", f"macro_{_n}", "", f"macro {_n}, 0 to 100 %: every knob it points at "
+                                        "(Macros tab) follows through its own range")
+           for _n in range(1, MACRO_SLOTS + 1)]
 # ids held rather than pressed: the key's or the note's release matters too
 # (no QShortcut, the event filter sees both; a CC's falling edge releases)
-HOLD = {"repeat"}
+HOLD = {"repeat", "brake", "nudge_down", "nudge_up", "frag"} \
+    | {f"frag_{_n}" for _n in range(1, 17)}
 # ids that take a value (0..1) instead of firing; only a CC can drive them
 CONTINUOUS = {"ab", "volume", "sync", "shader_mix", "shader_pick", "avol", "burst_len",
-              "rep_div", "rep_pos"} | {f"lfo_{_n}_depth" for _n in range(1, LFO_SLOTS + 1)} \
+              "rep_div", "rep_pos", "speed_sync", "brake_len", "frag_div", "frag_slice",
+              "frag_size", "frag_rate", "frag_motion", "frag_pitch", "frag_speed",
+              "frag_repeats", "frag_shape", "frag_a", "frag_d", "frag_s", "frag_r",
+              "rev_time", "rev_fb"} \
+    | {f"lfo_{_n}_depth" for _n in range(1, LFO_SLOTS + 1)} \
+    | {f"macro_{_n}" for _n in range(1, MACRO_SLOTS + 1)} \
     | {f"grade_{k}" for k, *_ in VIDEO_GRADE} | {f"fx_{k}" for k, *_ in VIDEO_EFFECTS} \
     | {f"afx_{k}" for k, *_ in AUDIO_FX} \
     | {f"afx_{_ch}_{k}" for _ch in ALL_CHANNELS for k, *_ in AUDIO_FX} \
@@ -410,15 +501,26 @@ KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
                  "grade": "source grade", "fx": "video effects",
                  "audio_focus": "audio racks: focused channel",
                  "vst": "master inserts (VST3)", "vfx": "video fx: the pool",
-                 "voices": "drum voices", "lfo": "LFOs",
+                 "voices": "drum voices", "lfo": "LFOs", "scene": "scenes",
+                 "macro": "macros", "frag": "fragments: the sliced bar",
                  **{f"audio_{_ch}": f"audio rack: {_ch}" for _ch in CHANNELS},
                  **{f"rack_{_v}": f"audio rack: {VOICE_LABELS[_v]} voice" for _v in VOICES}}
 VOICE_SHORT = {"kick": "kick", "snare": "snare", "hihat": "c.hat", "ohat": "o.hat",
                "ride": "ride", "glitch": "stutter", "sub": "sub"}
 LFO_LABEL_FIX = {"ab": "A/B", "volume": "main volume", "sync": "audio sync delay",
+                 "frag_div": "fragments: slices", "frag_slice": "fragments: slice",
+                 "frag_size": "fragments: grain size", "frag_rate": "fragments: grain rate",
+                 "frag_motion": "fragments: motion", "frag_pitch": "fragments: pitch",
+                 "frag_speed": "fragments: speed", "frag_repeats": "fragments: repeats",
+                 "frag_shape": "fragments: shape", "frag_a": "fragments: attack",
+                 "frag_d": "fragments: decay", "frag_s": "fragments: sustain",
+                 "frag_r": "fragments: release", "rev_time": "reverse delay: time",
+                 "rev_fb": "reverse delay: feedback",
                  "shader_mix": "shader opacity", "shader_pick": "shader pick",
                  "burst_len": "burst length", "rep_div": "repeat division",
-                 "rep_pos": "repeat position"}
+                 "rep_pos": "repeat position", "speed_sync": "speed resync",
+                 "brake_len": "tape stop length",
+                 **{f"macro_{_n}": f"macro {_n}" for _n in range(1, MACRO_SLOTS + 1)}}
 
 
 def _knob_label(group, ident, what):
@@ -438,7 +540,10 @@ def _knob_label(group, ident, what):
 
 # the LFO destinations: (ident, label) for every knob, in table order
 LFO_DESTS = [(ident, _knob_label(group, ident, what)) for group, ident, _k, what in KEYMAP
-             if ident in CONTINUOUS and group not in ("audio_focus", "lfo")]
+             if ident in CONTINUOUS and group not in ("audio_focus", "lfo", "scene")]
+# the macro destinations: the same knobs, the macros themselves left out
+# (a macro on a macro would loop)
+MACRO_DESTS = [(ident, label) for ident, label in LFO_DESTS if not ident.startswith("macro_")]
 # the quantize grid: what a switch, an event or a burst waits for while a
 # section plays, as a fraction of a bar (0 = at once)
 QUANT_GRIDS = [("off", 0.0), ("1/16", 1 / 16), ("1/8", 1 / 8), ("1/4", 1 / 4),
@@ -449,6 +554,18 @@ REPEAT_DIVS = [("bar", 1.0), ("1/2", 1 / 2), ("1/4", 1 / 4), ("1/8", 1 / 8),
                ("1/16", 1 / 16), ("1/32", 1 / 32), ("1/64", 1 / 64)]
 REPEAT_DEFAULT = "bar"
 REPEAT_RANGE = 16                 # cells earlier or later the position knob reaches
+# the speed: what half and double time resync on, and a tape stop's length
+SPEED_SYNCS = [("1/2", 0.5), ("1 bar", 1.0), ("2 bars", 2.0), ("4 bars", 4.0), ("loop", 0.0)]
+SPEED_SYNC_DEFAULT = "1 bar"
+BRAKE_LENS = [("1/4", 0.25), ("1/2", 0.5), ("1 bar", 1.0), ("2 bars", 2.0), ("4 bars", 4.0)]
+BRAKE_DEFAULT = "1 bar"
+PITCH_MODES = ["follows", "locked"]
+NUDGE_DEFAULT = 4                 # percent
+GRAN_VIEW_S = 1.25                # the granular picture, idle: seconds across the frame
+GRAN_HEADS = 16                   # bands drawn at the most
+FRAG_DEFAULTS = {"div": 16, "size": "1/16", "rate": "dense", "motion": 100, "pitch": 0,
+                 "speed": 100, "repeats": 1, "shape": 50, "dir": "forward", "play": "loop",
+                 "a": 5, "d": 200, "s": 100, "r": 250}
 
 
 def default_midi_map():
@@ -566,7 +683,7 @@ REVERSE_LENGTHS = {"1/8 bar": 1 / 8, "1/4 bar": 1 / 4, "1/2 bar": 1 / 2,
                    "1 bar": 1.0, "2 bars": 2.0, "random": None}
 
 LOOK_EXEMPT = {"color", "pump", "flash", "pixel", "kaleido", "reverse",
-               "clean"}
+               "clean", "gran"}
 
 
 class VideoFX:
@@ -600,6 +717,27 @@ class VideoFX:
             sy = np.clip(np.rint(cy + r * np.sin(t)), 0, h - 1).astype(np.intp)
             self._kmaps[key] = (sy, sx)
         return self._kmaps[key]
+
+    def granulate(self, px, gr):
+        """The granular picture: the frame is the buffer (now at its right
+        edge) and every grain a band at its spot, as wide as the grain,
+        lifted by its window with soft edges, a bright playhead line where
+        it reads; outside the bands the frame darkens a little."""
+        h, w = px.shape[:2]
+        amt = gr["amt"]
+        x = (np.arange(w) + 0.5) / w
+        lit = np.zeros(w, "float32")
+        line = np.zeros(w, "float32")
+        for x0, bw, hx, l in gr.get("heads", []):
+            if bw <= 0:
+                continue
+            e = max(1.5 / w, 0.08 * bw)                 # the edge's softness
+            inside = np.clip((x - x0) / e, 0, 1) * np.clip((x0 + bw - x) / e, 0, 1)
+            lit = np.maximum(lit, inside * l)
+            line = np.maximum(line, np.clip(1.0 - np.abs(x - hx) * w / 1.5, 0, 1) * inside)
+        gain = 1.0 - 0.3 * amt + 0.6 * amt * lit
+        out = px * gain[None, :, None] + (40.0 * amt * lit)[None, :, None]
+        return out * (1 - line[None, :, None] * amt) + (255.0 - out) * (line[None, :, None] * amt)
 
     def vignette(self, h, w):
         if self._vig is None or self._vig.shape != (h, w):
@@ -638,6 +776,9 @@ class VideoFX:
         if p > 1:
             blocks = px[::p, ::p]
             px = np.repeat(np.repeat(blocks, p, axis=0), p, axis=1)[:h, :w]
+        gr = g("gran")                        # the granular picture
+        if gr:
+            px = self.granulate(px, gr)
         gl = g("glitch", 0.0)
         if gl > 0 and rng.random() < gl:
             hmin, hmax = GLITCH_MODES[int(g("glitch_mode", 2))]
@@ -1563,6 +1704,9 @@ class Main(QMainWindow):
         self._perf_material = None                  # (key, Material)
         self._burst = None                          # (t0, until, take, off): a burst's picture
         self._perf_hold = None                      # the last take frame shown: held over gaps
+        self._head_tape = False
+        self._gran_clock = 0.0                 # the granular picture's grain clock
+        self._gran_t = None                     # a file tape slowed under the section's head
         self._perf_drop_t = None                    # monotonic time a break dropped into a section
         self._perf_ready = None                     # (key, Section, stems48) pre-rendered
         self._perf_key_last, self._perf_key_t = None, 0.0   # the knobs' last change, see _perf_refresh_ready
@@ -1768,6 +1912,15 @@ class Main(QMainWindow):
             "rep_finer": lambda: self._rep_div_step(1),
             "rep_coarser": lambda: self._rep_div_step(-1),
             "rep_div": self._rep_div_frac,
+            "half": self.half_btn.toggle,
+            "double": self.double_btn.toggle,
+            "speed_sync": lambda x: self._combo_frac(self.speed_sync, x),
+            "pitch_lock": lambda: self.pitch_mode.setCurrentIndex(
+                1 - self.pitch_mode.currentIndex()),
+            "brake": lambda: self._brake_hold("midi", True),
+            "brake_len": lambda x: self._combo_frac(self.brake_len, x),
+            "nudge_down": lambda: self._nudge_hold(-1, "midi", True),
+            "nudge_up": lambda: self._nudge_hold(1, "midi", True),
             "rep_earlier": lambda: self.rep_pos.setValue(self.rep_pos.value() - 1),
             "rep_later": lambda: self.rep_pos.setValue(self.rep_pos.value() + 1),
             "rep_pos": lambda x: self.rep_pos.setValue(
@@ -1836,6 +1989,14 @@ class Main(QMainWindow):
             self.actions[f"lfo_{n}_depth"] = lambda x, n=n: self._lfo_depth_frac(n - 1, x)
         self.actions["lfo_trig"] = lambda: self.lfo.trigger(time.monotonic())
         self.actions["lfo_off"] = self._lfo_all_off
+        # the scenes: a load and a save button per slot, the morph switch
+        for n in range(1, SCENE_SLOTS + 1):
+            self.actions[f"scene_load_{n}"] = lambda n=n: self._scene_load(n - 1)
+            self.actions[f"scene_save_{n}"] = lambda n=n: self._scene_save(n - 1)
+        self.actions["scene_morph"] = self.scene_morph_on.toggle
+        # the macros: each one's knob (its slider fans out on every change)
+        for n in range(1, MACRO_SLOTS + 1):
+            self.actions[f"macro_{n}"] = self._frac_setter(self.macro_rows[n - 1]["knob"])
         # the knobs the LFOs read: every widget-backed one by its id (the
         # rest, shader pick, burst length, the repeat division and the VST
         # knobs, are read by _lfo_get on their own terms)
@@ -1846,10 +2007,42 @@ class Main(QMainWindow):
         self.knob_widgets.update({f"fx_{k}": sp for k, sp in self.vfx.items()})
         self.knob_widgets.update({(f"avol_{ch}" if key == "vol" else f"afx_{ch}_{key}"): sp
                                   for (ch, key), sp in self.afx.items()})
+        self.knob_widgets.update({f"macro_{n}": self.macro_rows[n - 1]["knob"]
+                                  for n in range(1, MACRO_SLOTS + 1)})
         # the holds: a release handler next to the press, and the keys the
         # event filter watches (a shortcut would fire on the press alone)
-        self.releases = {"repeat": lambda: self._rep_hold("midi", False)}
-        self.holds = {"repeat": self._rep_hold}
+        # the fragments: the F key's slice, a note per slice, the rows' knobs
+        self.actions["frag"] = lambda: self._frag_hold_pick("midi", True)
+        for n in range(1, 17):
+            self.actions[f"frag_{n}"] = lambda n=n: self._frag_hold(n, "midi", True)
+        self.frag_combos = {"frag_div": self.frag_div, "frag_slice": self.frag_slice,
+                            "frag_size": self.frag_size, "frag_rate": self.frag_rate,
+                            "rev_time": self.rev_time}      # combos read as knobs
+        self.actions["rev_fb"] = self._frac_setter(self.rev_fb)
+        self.knob_widgets["rev_fb"] = self.rev_fb
+        for ident, combo in self.frag_combos.items():
+            self.actions[ident] = lambda x, c=combo: self._combo_frac(c, x)
+        for ident, w in (("frag_motion", self.frag_motion), ("frag_pitch", self.frag_pitch),
+                         ("frag_speed", self.frag_speed), ("frag_repeats", self.frag_repeats),
+                         ("frag_shape", self.frag_shape), ("frag_a", self.frag_a),
+                         ("frag_d", self.frag_d), ("frag_s", self.frag_s), ("frag_r", self.frag_r)):
+            self.actions[ident] = self._frac_setter(w)
+            self.knob_widgets[ident] = w
+        self.actions["frag_dir"] = lambda: self._combo_next(self.frag_dir)
+        self.actions["frag_play"] = lambda: self._combo_next(self.frag_play)
+        self.releases = {"repeat": lambda: self._rep_hold("midi", False),
+                         "brake": lambda: self._brake_hold("midi", False),
+                         "frag": lambda: self._frag_hold_pick("midi", False),
+                         **{f"frag_{n}": (lambda n=n: self._frag_hold(n, "midi", False))
+                            for n in range(1, 17)},
+                         "nudge_down": lambda: self._nudge_hold(-1, "midi", False),
+                         "nudge_up": lambda: self._nudge_hold(1, "midi", False)}
+        self.holds = {"repeat": self._rep_hold, "brake": self._brake_hold,
+                      "frag": self._frag_hold_pick,
+                      **{f"frag_{n}": (lambda src, on, n=n: self._frag_hold(n, src, on))
+                         for n in range(1, 17)},
+                      "nudge_down": lambda src, on: self._nudge_hold(-1, src, on),
+                      "nudge_up": lambda src, on: self._nudge_hold(1, src, on)}
         self._hold_keys = {QKeySequence(key).toString(): ident
                            for _g, ident, key, _w in KEYMAP if key and ident in HOLD}
         missing = [ident for _g, ident, _k, _w in KEYMAP if ident not in self.actions]
@@ -2008,6 +2201,8 @@ class Main(QMainWindow):
         tabs.addTab(self._tab_audio_fx(), "Audio FX")
         tabs.addTab(self._tab_video_fx(), "Video FX")
         tabs.addTab(self._tab_lfo(), "LFO")
+        tabs.addTab(self._tab_scenes(), "Scenes")
+        tabs.addTab(self._tab_macros(), "Macros")
         tabs.addTab(self._tab_controls(), "Controls")
         tabs.addTab(self._tab_log(), "Log")
         HoverTabs(tabs)                  # hover a tab to open it, no click
@@ -2027,6 +2222,14 @@ class Main(QMainWindow):
     def _combo_next(combo):
         if combo.count():
             combo.setCurrentIndex((combo.currentIndex() + 1) % combo.count())
+
+    @staticmethod
+    def _combo_frac(combo, x):
+        """A knob over a combo's items: the first at the bottom, the last
+        at the top."""
+        n = combo.count()
+        if n:
+            combo.setCurrentIndex(min(n - 1, int(max(0.0, min(1.0, x)) * n)))
 
     def _pick_shader_frac(self, x):
         """A knob over the shaders: the bottom of its travel is off, the rest
@@ -2188,7 +2391,8 @@ class Main(QMainWindow):
             tree.setStyleSheet(f"QTreeWidget {{ font-size: 12px; }} "
                                f"QTreeWidget::item {{ height: {max(13, round(row_h * 0.8))}px; }}")
         for group in groups:                     # long knob lists: folded at first
-            if group in ("grade", "fx", "vfx", "lfo") or group.startswith("rack_") \
+            if group in ("grade", "fx", "vfx", "lfo", "scene", "macro") \
+                    or group.startswith("rack_") \
                     or group.startswith("audio_") and group != "audio_focus":
                 groups[group].setExpanded(False)
         for c in range(3):
@@ -3365,6 +3569,217 @@ class Main(QMainWindow):
         form.addRow("Repeat", self._row([("", self.rep_btn), ("", self.rep_div),
                                          ("position", self.rep_pos), ("", self.rep_pos_lbl),
                                          ("", zero_btn), ("", self.rep_rev)]))
+        # the speed: half and double time, the tape stop, the nudge, the pitch
+        self.half_btn = QPushButton("half time (Shift+H)")
+        self.half_btn.setCheckable(True)
+        self.half_btn.setToolTip(
+            "The bar at half speed from its start, resynced every sync below, so the "
+            "clock, the bar, Link and the MIDI clock never move: the Gross Beat way. "
+            "An octave down with the pitch following; at pitch with it locked. Lands "
+            "on the quantize grid. A MIDI button; never remembered.")
+        self.half_btn.toggled.connect(lambda on: self._speed_toggled("half", on))
+        self.double_btn = QPushButton("double (Ctrl+H)")
+        self.double_btn.setCheckable(True)
+        self.double_btn.setToolTip(
+            "The bar at double speed from its start: this bar and the next inside one, "
+            "resynced every sync below. An octave up, or at pitch when locked. Lands on "
+            "the quantize grid. A MIDI button; never remembered.")
+        self.double_btn.toggled.connect(lambda on: self._speed_toggled("double", on))
+        self.speed_sync = QComboBox()
+        self.speed_sync.addItems([name for name, _b in SPEED_SYNCS])
+        s = self.settings.value("perform/speed_sync", SPEED_SYNC_DEFAULT)
+        self.speed_sync.setCurrentText(
+            str(s) if self.speed_sync.findText(str(s)) >= 0 else SPEED_SYNC_DEFAULT)
+        self.speed_sync.setToolTip(
+            "How often half and double time jump back to the transport: every half "
+            "bar, bar, 2 or 4 bars, or only at the loop's end (half time then plays the "
+            "whole loop over two loops). Remembered; a MIDI knob.")
+        self.speed_sync.currentTextChanged.connect(self._speed_sync_changed)
+        self.pitch_mode = QComboBox()
+        self.pitch_mode.addItems(PITCH_MODES)
+        p = self.settings.value("perform/pitch", PITCH_MODES[0])
+        self.pitch_mode.setCurrentText(str(p) if str(p) in PITCH_MODES else PITCH_MODES[0])
+        self.pitch_mode.setToolTip(
+            "What the pitch does under half and double time, a nudge and a tempo change: "
+            "follows the speed (varispeed, the Looper's way: half time is an octave "
+            "down), or locked (a granular stretch keeps it, the warped clip's way; the "
+            "drums smear a little at half speed). The tape stop always drops, that is "
+            "the point. Remembered; the MIDI button pitch_lock flips it.")
+        self.pitch_mode.currentTextChanged.connect(self._pitch_changed)
+        self._brake_sources = set()
+        self.brake_btn = QPushButton("tape stop (Shift+B)")
+        self.brake_btn.setCheckable(True)
+        self.brake_btn.setToolTip(
+            "Hold Shift+B (or the MIDI note): the section decelerates to a stop over the "
+            "length next to it, the pitch falling with it and the picture slowing to a "
+            "freeze; let go, it spins back up over the same slope and the transport, "
+            "which ran on underneath, is heard again on the grid: the bar, the clock, "
+            "Link and a queued section are untouched. This button latches it for the "
+            "mouse. A break wins over it; a stop ends it.")
+        self.brake_btn.toggled.connect(lambda on: self._brake_hold("ui", on))
+        self.brake_len = QComboBox()
+        self.brake_len.addItems([name for name, _b in BRAKE_LENS])
+        b = self.settings.value("perform/brake_len", BRAKE_DEFAULT)
+        self.brake_len.setCurrentText(
+            str(b) if self.brake_len.findText(str(b)) >= 0 else BRAKE_DEFAULT)
+        self.brake_len.setToolTip("From full speed to the stop, in bars at the live tempo; "
+                                  "the spin-up takes as long. Remembered; a MIDI knob.")
+        self.brake_len.currentTextChanged.connect(self._brake_len_changed)
+        self._nudge_sources = {-1: set(), 1: set()}
+        self.nudge_down_btn = QPushButton("nudge − (J)")
+        self.nudge_down_btn.setToolTip(
+            "Held: the section a few percent slower (the amount next to it) and the "
+            "live clock with it, so the shaders, the LFOs and the MIDI clock slide too: "
+            "to line up with a tape or a drum machine running on its own clock. Not "
+            "under Link, which owns the beat. The pitch follows unless locked.")
+        self.nudge_down_btn.pressed.connect(lambda: self._nudge_hold(-1, "ui", True))
+        self.nudge_down_btn.released.connect(lambda: self._nudge_hold(-1, "ui", False))
+        self.nudge_up_btn = QPushButton("nudge + (K)")
+        self.nudge_up_btn.setToolTip("Held: a few percent faster; see nudge −")
+        self.nudge_up_btn.pressed.connect(lambda: self._nudge_hold(1, "ui", True))
+        self.nudge_up_btn.released.connect(lambda: self._nudge_hold(1, "ui", False))
+        self.nudge_pct = QSpinBox()
+        self.nudge_pct.setRange(1, 10)
+        self.nudge_pct.setSuffix(" %")
+        self.nudge_pct.setValue(self.settings.value("perform/nudge_pct", NUDGE_DEFAULT, type=int))
+        self.nudge_pct.setToolTip("How much a nudge speeds up or slows down. Remembered.")
+        self.nudge_pct.valueChanged.connect(
+            lambda v: self.settings.setValue("perform/nudge_pct", int(v)))
+        form.addRow("Speed", self._row([("", self.half_btn), ("", self.double_btn),
+                                        ("sync", self.speed_sync), ("pitch", self.pitch_mode)]))
+        form.addRow("", self._row([("", self.brake_btn), ("", self.brake_len),
+                                   ("", self.nudge_down_btn), ("", self.nudge_up_btn),
+                                   ("", self.nudge_pct)]))
+        # the fragments: the bar sliced, a slice held sounding as grains
+        # (gacha_frag), Bitwig's Sampler in Sliced mode playing Fragments
+        sv = self.settings.value
+        self.frag_div = QComboBox()
+        self.frag_div.addItems([str(d) for d in FRAG_DIVS])
+        self.frag_div.setCurrentText(str(sv("perform/frag_div", FRAG_DEFAULTS["div"], type=int)))
+        self.frag_div.setToolTip(
+            "Slices per bar: the bar playing is cut into that many equal pieces, each a "
+            "MIDI note (frag_1 to frag_16, the fragments group of the Controls tab; past "
+            "16 only the slice pick reaches them). Remembered; a MIDI knob.")
+        self.frag_slice = QComboBox()
+        self._frag_fill_slices(str(sv("perform/frag_slice", "follow")))
+        self.frag_slice.setToolTip(
+            "The slice the F key and the button hold: follow is the slice under the "
+            "playhead at the press, the sampler's way of playing what is there; or a "
+            "fixed one. Remembered; a MIDI knob.")
+        self.frag_size = QComboBox()
+        self.frag_size.addItems([name for name, _f in FRAG_UNITS])
+        self.frag_size.setCurrentText(str(sv("perform/frag_size", FRAG_DEFAULTS["size"])))
+        self.frag_size.setToolTip(
+            "A grain's length, as a fraction of the bar (Bitwig's beat units; a 16th by "
+            "default), so a tempo change keeps the grains in time: a 64th buzzes, an 8th "
+            "keeps whole hits. Remembered; a MIDI knob.")
+        self.frag_rate = QComboBox()
+        self.frag_rate.addItems([name for name, _f in FRAG_RATES])
+        self.frag_rate.setCurrentText(str(sv("perform/frag_rate", FRAG_DEFAULTS["rate"])))
+        self.frag_rate.setToolTip(
+            "How often a grain starts: dense is eight of them overlapping whatever the "
+            "size (a cloud); a beat unit starts one on every such line of the bar's grid, "
+            "in time with the loop (a 16th with 16th grains is the slice stuttered on the "
+            "grid, a 16th with 64th grains a rhythm of blips). Remembered; a MIDI knob.")
+        self.frag_motion = QSpinBox(minimum=0, maximum=800, suffix=" %")
+        self.frag_motion.setValue(sv("perform/frag_motion", FRAG_DEFAULTS["motion"], type=int))
+        self.frag_motion.setToolTip(
+            "How far from the playhead each grain lands, up to that many grain sizes "
+            "either way at random, and its place in the stereo field with it: 0 is the "
+            "slice replayed as it is, 100 % a smear, 800 % the whole slice as a cloud. "
+            "Remembered.")
+        self.frag_pitch = QSpinBox(minimum=-24, maximum=24, suffix=" st")
+        self.frag_pitch.setValue(sv("perform/frag_pitch", FRAG_DEFAULTS["pitch"], type=int))
+        self.frag_pitch.setToolTip("The grains' pitch, two octaves either way; the playhead's "
+                                   "speed is untouched by it. Remembered.")
+        self.frag_speed = QSpinBox(minimum=-200, maximum=200, suffix=" %")
+        self.frag_speed.setValue(sv("perform/frag_speed", FRAG_DEFAULTS["speed"], type=int))
+        self.frag_speed.setToolTip(
+            "The playhead's speed through the slice: 100 % is the section's own, 50 % "
+            "half time at pitch, 0 frozen on the spot (a drone of that instant), "
+            "negative backwards. Remembered.")
+        self.frag_repeats = QSpinBox(minimum=1, maximum=16)
+        self.frag_repeats.setValue(sv("perform/frag_repeats", FRAG_DEFAULTS["repeats"], type=int))
+        self.frag_repeats.setToolTip("Each grain triggered that many times over, the same spot "
+                                     "and place: a roll, denser. Remembered.")
+        self.frag_shape = QSpinBox(minimum=0, maximum=100, suffix=" %")
+        self.frag_shape.setValue(sv("perform/frag_shape", FRAG_DEFAULTS["shape"], type=int))
+        self.frag_shape.setToolTip("The grain's envelope: 0 a pluck (a short attack, the rest "
+                                   "falling), 50 % a Hann, 100 % open (short ramps, flat "
+                                   "between). Remembered.")
+        self.frag_dir = QComboBox()
+        self.frag_dir.addItems(FRAG_DIRS)
+        self.frag_dir.setCurrentText(str(sv("perform/frag_dir", FRAG_DEFAULTS["dir"])))
+        self.frag_dir.setToolTip("The grains' direction: forward, reverse, each at random, or "
+                                 "in turn. Remembered; a MIDI button steps it.")
+        self.frag_play = QComboBox()
+        self.frag_play.addItems(FRAG_PLAYS)
+        self.frag_play.setCurrentText(str(sv("perform/frag_play", FRAG_DEFAULTS["play"])))
+        self.frag_play.setToolTip("What the playhead does at the slice's ends: loop round, "
+                                  "ping-pong, or once (the voice releases there). Remembered; "
+                                  "a MIDI button steps it.")
+        self.frag_a = QSpinBox(minimum=0, maximum=2000, suffix=" ms")
+        self.frag_a.setValue(sv("perform/frag_a", FRAG_DEFAULTS["a"], type=int))
+        self.frag_a.setToolTip("Attack: the voice fades in over it on the press, the section "
+                               "out. Remembered.")
+        self.frag_d = QSpinBox(minimum=0, maximum=2000, suffix=" ms")
+        self.frag_d.setValue(sv("perform/frag_d", FRAG_DEFAULTS["d"], type=int))
+        self.frag_d.setToolTip("Decay, down to the sustain. Remembered.")
+        self.frag_s = QSpinBox(minimum=0, maximum=100, suffix=" %")
+        self.frag_s.setValue(sv("perform/frag_s", FRAG_DEFAULTS["s"], type=int))
+        self.frag_s.setToolTip("Sustain, the level held while the key is down. Remembered.")
+        self.frag_r = QSpinBox(minimum=0, maximum=4000, suffix=" ms")
+        self.frag_r.setValue(sv("perform/frag_r", FRAG_DEFAULTS["r"], type=int))
+        self.frag_r.setToolTip("Release: the voice fades out over it when let go, the section "
+                               "back in. Remembered.")
+        for w in (self.frag_slice, self.frag_size, self.frag_rate, self.frag_dir, self.frag_play):
+            w.currentTextChanged.connect(self._frag_changed)
+        for w in (self.frag_motion, self.frag_pitch, self.frag_speed, self.frag_repeats,
+                  self.frag_shape, self.frag_a, self.frag_d, self.frag_s, self.frag_r):
+            w.valueChanged.connect(self._frag_changed)
+        self.frag_div.currentTextChanged.connect(self._frag_div_changed)
+        self._frag_sources = {}                 # slice key -> who holds it
+        self._frag_pick_key = 0                 # the key the F key is holding
+        self.frag_btn = QPushButton("fragments (F)")
+        self.frag_btn.setCheckable(True)
+        self.frag_btn.setToolTip(
+            "Hold F (or the MIDI note; a note per slice is in the Controls tab's fragments "
+            "group): the slice picked next to it, of the bar playing, sounds as grains in "
+            "place of the section, through the same stems, racks and switches; the "
+            "section runs on underneath and comes back with the release. Up to four "
+            "slices at once from the notes. This button latches it for the mouse.")
+        self.frag_btn.toggled.connect(lambda on: self._frag_hold_pick("ui", on))
+        form.addRow("Fragments", self._row([("", self.frag_btn), ("slices", self.frag_div),
+                                            ("slice", self.frag_slice), ("size", self.frag_size),
+                                            ("rate", self.frag_rate), ("motion", self.frag_motion),
+                                            ("pitch", self.frag_pitch), ("speed", self.frag_speed)]))
+        form.addRow("", self._row([("repeats", self.frag_repeats), ("shape", self.frag_shape),
+                                   ("dir", self.frag_dir), ("play", self.frag_play),
+                                   ("A", self.frag_a), ("D", self.frag_d), ("S", self.frag_s),
+                                   ("R", self.frag_r)]))
+        self._frag_changed()
+        # the reverse delay (a rack effect, its knob the mix per channel): the
+        # time and the feedback, one setting for every channel
+        self.rev_time = QComboBox()
+        self.rev_time.addItems([name for name, _f in REV_TIMES])
+        rt = str(sv("perform/rev_time", "1/4"))
+        self.rev_time.setCurrentText(rt if self.rev_time.findText(rt) >= 0 else "1/4")
+        self.rev_time.setToolTip(
+            "The reverse delay's time, as a fraction of the bar, following the tempo: that "
+            "much sound is played backwards that much late (a beat by default; a 64th is a "
+            "buzz at the grain of the tempo, a bar a whole phrase turned round). For every "
+            "channel's reverse delay knob (Audio FX tab). Remembered; a MIDI knob.")
+        self.rev_time.currentTextChanged.connect(self._rev_changed)
+        self.rev_fb = QSpinBox(minimum=0, maximum=95, suffix=" %")
+        self.rev_fb.setValue(sv("perform/rev_fb", 50, type=int))
+        self.rev_fb.setToolTip(
+            "The reverse delay's feedback: the echo's share fed back into the line, so the "
+            "repeats alternate backwards and forwards; 0 one echo, 95 % a long tail. "
+            "Remembered; a MIDI knob.")
+        self.rev_fb.valueChanged.connect(self._rev_changed)
+        form.addRow("Reverse delay", self._row([("time", self.rev_time),
+                                                ("feedback", self.rev_fb)]))
+        self._rev_changed()
         burst_btn = QPushButton("burst (B)")
         burst_btn.setToolTip(
             "A slice of the material from a random spot, right now, at the "
@@ -3683,7 +4098,7 @@ class Main(QMainWindow):
         rows = [("Color", ("color", "tint", "pump", "flash")),
                 ("Pixels", ("pixel", "bits", "dither")),
                 ("Tone", ("mono", "solar", "edges", "lines")),
-                ("Grain", ("grain",)),
+                ("Grain", ("grain", "gran")),
                 ("Motion", ("zoom", "trails", "glitch", "rgb", "reverse")),
                 ("Frame", ("vign", "kaleido", "clean"))]
         labels = {k: lbl for k, lbl, _, _ in VIDEO_EFFECTS}
@@ -3869,6 +4284,9 @@ class Main(QMainWindow):
         if ident == "burst_len":
             lo, hi = self.burst_len.minimum(), self.burst_len.maximum()
             return math.log(self.burst_len.value() / lo) / math.log(hi / lo)
+        if ident in self.frag_combos:
+            c = self.frag_combos[ident]
+            return (c.currentIndex() + 0.5) / max(1, c.count())
         if ident == "rep_div":
             n = self.rep_div.count()
             return (self.rep_div.currentIndex() + 0.5) / n
@@ -3882,18 +4300,556 @@ class Main(QMainWindow):
             act(x)
 
     def _lfo_tick(self):
-        """The engine, 100 times a second; the bars and the status a third
-        of that."""
-        self.lfo.tick(time.monotonic())
+        """The engine, 100 times a second, a scene morph in flight first
+        (what it writes is the LFOs' new centre); the bars and the status a
+        third of that."""
+        now = time.monotonic()
+        self._scene_tick(now)
+        self.lfo.tick(now)
         self._lfo_ticks += 1
         if self._lfo_ticks % 3:
             return
+        self._scene_status()
         on = []
         for i, (s, r) in enumerate(zip(self.lfo.slots, self.lfo_rows)):
             r["bar"].set_value(s.value if s.on else 0.0, s.on and s.out is not None)
             if s.on and s.dest:
                 on.append(str(i + 1))
         self.lfo_status.setText("LFOs on: " + ", ".join(on) if on else "no LFO on")
+
+    # ---------- macros ----------
+    def _tab_macros(self):
+        """Eight macros, every slot a row: a name, the knob, its value, the
+        two capture buttons and an edit button; under them the
+        destinations of the macro picked in the combo, eight rows of a
+        knob with its lo and its hi. Everything is remembered."""
+        self.macros = MacroEngine(MACRO_SLOTS, self._lfo_set, MACRO_ROWS)
+        self.macros.load_json(self.settings.value("macros/slots", ""))
+        self.macro_rows = []
+        self._macro_save_timer = QTimer(self)      # a knob under an LFO moves 100 times a
+        self._macro_save_timer.setSingleShot(True)  # second: the settings a little later
+        self._macro_save_timer.setInterval(400)
+        self._macro_save_timer.timeout.connect(self._macro_save_settings)
+        grid = QGridLayout()
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        heads = ["", "name", "knob", "", "", "", "", ""]
+        for c, head in enumerate(heads):
+            lbl = QLabel(head)
+            lbl.setProperty("role", "sub")
+            grid.addWidget(lbl, 0, c)
+        for i, mc in enumerate(self.macros.slots):
+            r = i + 1
+            num = QLabel(str(r))
+            num.setProperty("role", "sub")
+            name = QLineEdit(mc.name)
+            name.setPlaceholderText(f"macro {r}")
+            name.setToolTip("A name for the row and the status; the slot is the number")
+            name.textEdited.connect(lambda t, i=i: self._macro_name_edited(i, t))
+            knob = QSlider(Qt.Horizontal)
+            knob.setRange(0, 1000)
+            knob.setValue(int(round(1000 * mc.value)))
+            knob.setMinimumWidth(120)
+            knob.setToolTip(f"Macro {r}: every knob in its list follows, from its lo at the "
+                            "left to its hi at the right. A MIDI knob in the Controls tab's "
+                            "macros group, and a destination for an LFO.")
+            knob.valueChanged.connect(lambda v, i=i: self._macro_moved(i, v))
+            val = QLabel(f"{round(100 * mc.value)} %")
+            val.setProperty("role", "sub")
+            val.setFixedWidth(40)
+            lo_btn = QPushButton("set lo")
+            lo_btn.setFixedWidth(56)
+            lo_btn.setToolTip(f"Every knob macro {r} points at takes the value it sits at "
+                              "now as its lo: dial the quiet state by hand, press this")
+            lo_btn.clicked.connect(lambda _c, i=i: self._macro_capture(i, "lo"))
+            hi_btn = QPushButton("set hi")
+            hi_btn.setFixedWidth(56)
+            hi_btn.setToolTip(f"Every knob macro {r} points at takes the value it sits at "
+                              "now as its hi: dial the peak by hand, press this")
+            hi_btn.clicked.connect(lambda _c, i=i: self._macro_capture(i, "hi"))
+            edit = QPushButton("edit")
+            edit.setFixedWidth(44)
+            edit.setToolTip(f"Macro {r}'s destinations in the list below")
+            edit.clicked.connect(lambda _c, i=i: self.macro_pick.setCurrentIndex(i))
+            info = QLabel("")
+            info.setProperty("role", "sub")
+            row = {"name": name, "knob": knob, "val": val, "lo": lo_btn, "hi": hi_btn,
+                   "edit": edit, "info": info}
+            self.macro_rows.append(row)
+            cells = [num, name, knob, val, lo_btn, hi_btn, edit, info]
+            for c, wdg in enumerate(cells):
+                grid.addWidget(wdg, r, c)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 2)
+        grid.setColumnStretch(len(heads) - 1, 1)
+        # the destinations of one macro at a time
+        pick_row = QHBoxLayout()
+        pick_row.setContentsMargins(8, 4, 8, 0)
+        pick_lbl = QLabel("destinations of")
+        pick_lbl.setProperty("role", "sub")
+        self.macro_pick = QComboBox()
+        for mc in self.macros.slots:
+            self.macro_pick.addItem(mc.label)
+        self.macro_pick.setToolTip("Which macro the list below edits")
+        self.macro_pick.currentIndexChanged.connect(self._macro_show)
+        self.macro_status = QLabel("")
+        self.macro_status.setProperty("role", "sub")
+        pick_row.addWidget(pick_lbl)
+        pick_row.addWidget(self.macro_pick)
+        pick_row.addSpacing(12)
+        pick_row.addWidget(self.macro_status, stretch=1)
+        dgrid = QGridLayout()
+        dgrid.setContentsMargins(8, 4, 8, 8)
+        dgrid.setHorizontalSpacing(6)
+        dgrid.setVerticalSpacing(4)
+        for c, head in enumerate(["", "knob", "lo %", "hi %"]):
+            lbl = QLabel(head)
+            lbl.setProperty("role", "sub")
+            dgrid.addWidget(lbl, 0, c)
+        self.macro_dest_rows = []
+        for j in range(MACRO_ROWS):
+            num = QLabel(str(j + 1))
+            num.setProperty("role", "sub")
+            dest = QComboBox()
+            dest.addItem("(none)", "")
+            for ident, label in MACRO_DESTS:
+                dest.addItem(label, ident)
+            dest.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            dest.setMinimumContentsLength(20)
+            dest.setToolTip("A knob this macro moves: any knob of the Controls tab but the "
+                            "macros themselves")
+            lo = QSpinBox()
+            lo.setRange(0, 100)
+            lo.setToolTip("Where the knob sits with the macro at 0, as a percentage of the "
+                          "knob's range; above hi, the knob runs the other way. Changing it "
+                          "writes the knob at the macro's value now, so you hear it.")
+            hi = QSpinBox()
+            hi.setRange(0, 100)
+            hi.setValue(100)
+            hi.setToolTip("Where the knob sits with the macro at 100 %, as a percentage of "
+                          "the knob's range")
+            dest.currentIndexChanged.connect(lambda _v, j=j: self._macro_dest_edited(j, False))
+            lo.valueChanged.connect(lambda _v, j=j: self._macro_dest_edited(j, True))
+            hi.valueChanged.connect(lambda _v, j=j: self._macro_dest_edited(j, True))
+            self.macro_dest_rows.append({"dest": dest, "lo": lo, "hi": hi})
+            for c, wdg in enumerate([num, dest, lo, hi]):
+                dgrid.addWidget(wdg, j + 1, c)
+        dgrid.setColumnStretch(1, 1)
+        hint = QLabel("A macro is one knob over many: each destination runs from its lo to "
+                      "its hi as the macro goes from 0 to 100 %, set by the numbers or by "
+                      "ear with set lo and set hi (every destination takes where it sits "
+                      "now). The macro writes when it moves; a hand turn, a scene or an "
+                      "LFO can move a destination in between, the next move takes it "
+                      "back. An LFO on a macro wiggles the whole list. Every macro is a "
+                      "MIDI knob (Controls tab, macros group).")
+        hint.setProperty("role", "sub")
+        hint.setWordWrap(True)
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addLayout(grid)
+        outer.addLayout(pick_row)
+        outer.addLayout(dgrid)
+        outer.addWidget(hint)
+        outer.addStretch(1)
+        page = QWidget()
+        page.setLayout(outer)
+        self._macro_refresh_rows()
+        self._macro_show(0)
+        return self._scrolling(page)
+
+    def _macro_save_settings(self):
+        self.settings.setValue("macros/slots", self.macros.to_json())
+
+    def _macro_refresh_rows(self):
+        for mc, r in zip(self.macros.slots, self.macro_rows):
+            n = len(mc.active)
+            r["info"].setText(f"{n} knob{'s' if n != 1 else ''}" if n else "no knob")
+
+    def _macro_name_edited(self, i, text):
+        self.macros.slots[i].name = text
+        self.macro_pick.setItemText(i, self.macros.slots[i].label)
+        self._macro_save_settings()
+
+    def _macro_moved(self, i, v):
+        """The knob of macro i: every destination written, the row's
+        value, the status, the settings a little later."""
+        self.macros.move(i, v / 1000.0)
+        self.macro_rows[i]["val"].setText(f"{round(v / 10)} %")
+        self.macro_status.setText(self.macros.summary(i))
+        self._macro_save_timer.start()
+
+    def _macro_set_quiet(self, i, x):
+        """Macro i's knob to x without the fan-out (a scene load, which
+        carries the destinations itself)."""
+        knob = self.macro_rows[i]["knob"]
+        knob.blockSignals(True)
+        try:
+            knob.setValue(int(round(1000 * max(0.0, min(1.0, x)))))
+        finally:
+            knob.blockSignals(False)
+        self.macros.move(i, knob.value() / 1000.0, write=False)
+        self.macro_rows[i]["val"].setText(f"{round(knob.value() / 10)} %")
+        self._macro_save_timer.start()
+
+    def _macro_capture(self, i, which):
+        """Every destination's lo or hi from where its knob sits now."""
+        n = self.macros.capture(i, which, self._scene_knob)
+        if self.macro_pick.currentIndex() == i:
+            self._macro_show(i)
+        self._macro_save_settings()
+        label = self.macros.slots[i].label
+        self.log.appendPlainText(f"macro: {label} {which} set from {n} knob{'s' if n != 1 else ''}"
+                                 if n else f"macro: {label} has no knob to set")
+
+    def _macro_show(self, i):
+        """Macro i's destinations into the editor rows, quietly."""
+        for d, r in zip(self.macros.slots[i].dests, self.macro_dest_rows):
+            widgets = (r["dest"], r["lo"], r["hi"])
+            for w in widgets:
+                w.blockSignals(True)
+            try:
+                r["dest"].setCurrentIndex(max(0, r["dest"].findData(d.ident)))
+                r["lo"].setValue(int(round(100 * d.lo)))
+                r["hi"].setValue(int(round(100 * d.hi)))
+            finally:
+                for w in widgets:
+                    w.blockSignals(False)
+
+    def _macro_dest_edited(self, j, write):
+        """Row j of the editor into the macro it shows; a range change
+        (`write`) sets that knob at the macro's value now, so it is heard;
+        picking a knob leaves it where it sits until the macro moves."""
+        i = self.macro_pick.currentIndex()
+        r = self.macro_dest_rows[j]
+        ident = r["dest"].currentData() or ""
+        self.macros.assign(i, j, ident, r["lo"].value() / 100.0, r["hi"].value() / 100.0)
+        if ident and write:
+            d = self.macros.slots[i].dests[j]
+            self._lfo_set(ident, max(0.0, min(1.0, d.at(self.macros.slots[i].value))))
+        self._macro_refresh_rows()
+        self._macro_save_settings()
+
+    # ---------- scenes ----------
+    def _tab_scenes(self):
+        """Eight scenes, every slot a row: a name, what it carries (the four
+        groups), save, load, and when it was saved. Below, the morph: off,
+        a load sets every knob at once; on, the knobs glide over a time in
+        bars at the live tempo. Everything is remembered."""
+        self.scenes = SceneBank(SCENE_SLOTS)
+        self.scenes.load_json(self.settings.value("scenes/slots", ""))
+        self.scene_morph = None                  # a Morph in flight, or None
+        self.scene_rows = []
+        grid = QGridLayout()
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        heads = ["", "name", "carries", "", "", "", "", "", ""]
+        for c, head in enumerate(heads):
+            lbl = QLabel(head)
+            lbl.setProperty("role", "sub")
+            grid.addWidget(lbl, 0, c)
+        for i, sc in enumerate(self.scenes.slots):
+            r = i + 1
+            num = QLabel(str(r))
+            num.setProperty("role", "sub")
+            name = QLineEdit(sc.name)
+            name.setPlaceholderText(f"scene {r}")
+            name.setToolTip("A name for the row and the status; the slot is the number")
+            name.textEdited.connect(lambda t, i=i: self._scene_name_edited(i, t))
+            ticks = {}
+            for g in SCENE_GROUPS:
+                cb = QCheckBox(SCENE_GROUP_LABELS[g])
+                cb.setChecked(sc.ticks.get(g, True))
+                cb.setToolTip({
+                    "audio": "the twelve racks and their volumes, the main volume, the sync "
+                             "delay, the A/B pedal, the burst length, the VST knobs and the "
+                             "inserts bypass",
+                    "voices": "the drum voices in or out, the solos, the stems, the quantize "
+                              "grid",
+                    "lfo": "the eight LFO rows, on states included",
+                    "video": "the source grade, every effect strength, the shader, its "
+                             "opacity and blend, video-only, the picture mode and the "
+                             "dissolve"}[g] + "; unticked, a load leaves it alone (a save "
+                                              "keeps everything)")
+                cb.toggled.connect(lambda on, i=i, g=g: self._scene_tick_changed(i, g, on))
+                ticks[g] = cb
+            save = QPushButton("save")
+            save.setFixedWidth(48)
+            save.setToolTip(f"The whole state as it is now into scene {r} (knobs an LFO "
+                            "is on at their centre). A MIDI button in the Controls tab's "
+                            "scenes group.")
+            save.clicked.connect(lambda _c, i=i: self._scene_save(i))
+            load = QPushButton("load")
+            load.setFixedWidth(48)
+            load.setToolTip(f"Scene {r} back: the ticked groups, the switches at once, the "
+                            "knobs at once or gliding (morph below). A MIDI button in the "
+                            "scenes group.")
+            load.clicked.connect(lambda _c, i=i: self._scene_load(i))
+            info = QLabel("")
+            info.setProperty("role", "sub")
+            row = {"name": name, "ticks": ticks, "save": save, "load": load, "info": info}
+            self.scene_rows.append(row)
+            cells = [num, name] + [ticks[g] for g in SCENE_GROUPS] + [save, load, info]
+            for c, wdg in enumerate(cells):
+                grid.addWidget(wdg, r, c)
+        grid.setColumnStretch(1, 2)
+        grid.setColumnStretch(len(heads) - 1, 1)
+        self.scene_morph_on = QCheckBox("morph")
+        self.scene_morph_on.setChecked(self.settings.value("scenes/morph", False, type=bool))
+        self.scene_morph_on.setToolTip("On, a load glides every knob that differs from where "
+                                       "it sits to the scene's value over the time next to "
+                                       "it; the switches (voices, stems, the shader, the LFO "
+                                       "rows) flip at the start. Off, everything lands at "
+                                       "once. A MIDI button in the scenes group.")
+        self.scene_morph_on.toggled.connect(
+            lambda on: self.settings.setValue("scenes/morph", bool(on)))
+        self.scene_morph_bars = QComboBox()
+        self.scene_morph_bars.addItems([name for name, _b in MORPH_BARS])
+        b = self.settings.value("scenes/morph_bars", MORPH_DEFAULT)
+        self.scene_morph_bars.setCurrentText(
+            str(b) if self.scene_morph_bars.findText(str(b)) >= 0 else MORPH_DEFAULT)
+        self.scene_morph_bars.setToolTip("How long the glide takes, in bars at the live tempo "
+                                         "(a playing section's, Link's or the taps')")
+        self.scene_morph_bars.currentTextChanged.connect(
+            lambda t: self.settings.setValue("scenes/morph_bars", t))
+        self.scene_status = QLabel("no scene loaded")
+        self.scene_status.setProperty("role", "sub")
+        hint = QLabel("A scene is the live state: the racks, the voices, the LFOs, the "
+                      "picture. Save keeps all of it; load applies the groups the row "
+                      "ticks, so a scene with only video ticked is a look that leaves the "
+                      "sound alone. Loading another scene mid-morph glides on from where "
+                      "the knobs are. Each slot's save and load are MIDI buttons (Controls "
+                      "tab, scenes group).")
+        hint.setProperty("role", "sub")
+        hint.setWordWrap(True)
+        row = QHBoxLayout()
+        row.setContentsMargins(8, 0, 8, 8)
+        row.addWidget(self.scene_morph_on)
+        row.addWidget(self.scene_morph_bars)
+        row.addSpacing(12)
+        row.addWidget(self.scene_status, stretch=1)
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addLayout(grid)
+        outer.addLayout(row)
+        outer.addWidget(hint)
+        outer.addStretch(1)
+        page = QWidget()
+        page.setLayout(outer)
+        self._scene_refresh_rows()
+        return self._scrolling(page)
+
+    def _scene_refresh_rows(self):
+        for sc, r in zip(self.scenes.slots, self.scene_rows):
+            if sc.empty:
+                text = "empty"
+            else:
+                text = f"saved {sc.saved_at}" if sc.saved_at else "saved"
+                if self.scenes.current == sc.i:
+                    text = "loaded · " + text
+            r["info"].setText(text)
+            r["load"].setEnabled(not sc.empty)
+
+    def _scene_save_settings(self):
+        self.settings.setValue("scenes/slots", self.scenes.to_json())
+
+    def _scene_name_edited(self, i, text):
+        self.scenes.slots[i].name = text
+        self._scene_save_settings()
+        self._scene_status()
+
+    def _scene_tick_changed(self, i, g, on):
+        self.scenes.slots[i].ticks[g] = bool(on)
+        self._scene_save_settings()
+
+    # what a scene holds, group by group
+    def _scene_knob_ids(self, g):
+        if g == "audio":
+            return ([f"afx_{ch}_{k}" for ch in ALL_CHANNELS for k, *_ in AUDIO_FX]
+                    + [f"avol_{ch}" for ch in ALL_CHANNELS]
+                    + ["volume", "sync", "ab", "burst_len"]
+                    + list(self.frag_combos) + ["frag_motion", "frag_pitch", "frag_speed",
+                                                "frag_repeats", "frag_shape", "frag_a",
+                                                "frag_d", "frag_s", "frag_r", "rev_fb"]
+                    + [f"vst_{n}" for n in range(1, VST_KNOBS + 1)]
+                    + [f"macro_{n}" for n in range(1, MACRO_SLOTS + 1)])
+        if g == "video":
+            return ([f"grade_{k}" for k, *_ in VIDEO_GRADE]
+                    + [f"fx_{k}" for k, *_ in VIDEO_EFFECTS] + ["shader_mix"])
+        return []
+
+    def _scene_knob(self, ident):
+        """A knob as the LFOs read it, but at its centre when an LFO is on
+        it: what you set, never the wiggle."""
+        for s in self.lfo.slots:
+            if s.on and s.dest == ident and s.base is not None:
+                return s.base
+        return self._lfo_get(ident)
+
+    def _scene_switches(self, g):
+        if g == "audio":
+            return {"inserts": self.vst_bypass.isChecked()}
+        if g == "voices":
+            sw = {f"voice_{v}": cb.isChecked() for v, cb in self.perf_voices.items()}
+            sw.update({f"solo_{v}": b.isChecked() for v, b in self.perf_solos.items()})
+            sw.update({f"stem_{st}": cb.isChecked() for st, cb in self.perf_stems.items()})
+            sw["quant"] = self.perf_quant.currentText()
+            return sw
+        if g == "lfo":
+            return {"lfo_rows": [self._lfo_row_settings(j) for j in range(LFO_SLOTS)]}
+        if g == "video":
+            return {"shader": self.shader.currentText(),
+                    "shader_blend": self.shader_blend.currentText(),
+                    "video_plain": self.video_plain.isChecked(),
+                    "picture": self.perf_picture.currentText(),
+                    "dissolve": self.perf_dissolve.currentText()}
+        return {}
+
+    def _scene_capture(self):
+        """The whole state now: {group: {"knobs": {id: 0..1}, "switches": {}}}."""
+        state = {}
+        for g in SCENE_GROUPS:
+            knobs = {}
+            for ident in self._scene_knob_ids(g):
+                x = self._scene_knob(ident)
+                if x is not None:
+                    knobs[ident] = round(float(x), 6)
+            state[g] = {"knobs": knobs, "switches": self._scene_switches(g)}
+        return state
+
+    def _scene_apply_switch(self, ident, val):
+        """One switch of a scene back onto its widget."""
+        if ident == "inserts":
+            self.vst_bypass.setChecked(bool(val))
+        elif ident.startswith("voice_") and ident[6:] in self.perf_voices:
+            self.perf_voices[ident[6:]].setChecked(bool(val))
+        elif ident.startswith("solo_") and ident[5:] in self.perf_solos:
+            self.perf_solos[ident[5:]].setChecked(bool(val))
+        elif ident.startswith("stem_") and ident[5:] in self.perf_stems:
+            self.perf_stems[ident[5:]].setChecked(bool(val))
+        elif ident == "quant":
+            if self.perf_quant.findText(str(val)) >= 0:
+                self.perf_quant.setCurrentText(str(val))
+        elif ident == "lfo_rows" and isinstance(val, list):
+            self._scene_apply_lfo_rows(val)
+        elif ident == "shader":
+            name = str(val)
+            if name == "off":
+                self.select_shader_key(0)
+            elif self.shader.findText(name) >= 0:
+                self.shader.setCurrentText(name)
+                self._shader_user_off = False
+        elif ident == "shader_blend":
+            if self.shader_blend.findText(str(val)) >= 0:
+                self.shader_blend.setCurrentText(str(val))
+        elif ident == "video_plain":
+            self.video_plain.setChecked(bool(val))
+        elif ident == "picture":
+            if self.perf_picture.findText(str(val)) >= 0:
+                self.perf_picture.setCurrentText(str(val))
+        elif ident == "dissolve":
+            if self.perf_dissolve.findText(str(val)) >= 0:
+                self.perf_dissolve.setCurrentText(str(val))
+
+    def _scene_apply_lfo_rows(self, rows):
+        """The LFO rows of a scene onto the tab: the widgets quietly, then
+        each row into the engine (a slot going off writes its centre back,
+        a new destination too)."""
+        for i, st in enumerate(rows[:LFO_SLOTS]):
+            if not isinstance(st, dict):
+                continue
+            r = self.lfo_rows[i]
+            widgets = [r[k] for k in ("on", "dest", "shape", "rate", "depth", "phase", "pol",
+                                      "mode")]
+            for w in widgets:
+                w.blockSignals(True)
+            try:
+                j = r["dest"].findData(st.get("dest", ""))
+                r["dest"].setCurrentIndex(max(0, j))
+                if st.get("shape") in LFO_SHAPES:
+                    r["shape"].setCurrentText(st["shape"])
+                if r["rate"].findText(str(st.get("rate", ""))) >= 0:
+                    r["rate"].setCurrentText(str(st["rate"]))
+                r["depth"].setValue(int(round(100 * float(st.get("depth", 0.5)))))
+                r["phase"].setValue(int(round(360 * float(st.get("phase", 0.0)))) % 360)
+                r["pol"].setCurrentIndex(1 if st.get("unipolar") else 0)
+                if st.get("mode") in LFO_MODES:
+                    r["mode"].setCurrentText(st["mode"])
+                r["on"].setChecked(bool(st.get("on", False)))
+            finally:
+                for w in widgets:
+                    w.blockSignals(False)
+            self._lfo_push(i)
+
+    def _scene_save(self, i):
+        """The state now into slot i (the name stays)."""
+        sc = self.scenes.slots[i]
+        sc.save(self._scene_capture())
+        self.scenes.current = i
+        self._scene_save_settings()
+        self._scene_refresh_rows()
+        self._scene_status()
+        self.log.appendPlainText(f"scene: {sc.label} saved")
+
+    def _scene_morph_secs(self):
+        bars = dict(MORPH_BARS).get(self.scene_morph_bars.currentText(), 1.0)
+        return bars * 4 * 60.0 / max(1e-6, self.tempo.bpm)
+
+    def _scene_load(self, i):
+        """Slot i back: the switches of its ticked groups at once, the knobs
+        at once or as a morph from where they sit."""
+        sc = self.scenes.slots[i]
+        if sc.empty:
+            self.log.appendPlainText(f"scene: {sc.label} is empty")
+            return
+        switches, knobs = sc.plan()
+        for ident, val in switches.items():
+            self._scene_apply_switch(ident, val)
+        self.scenes.current = i
+        if self.scene_morph_on.isChecked() and knobs:
+            start = {ident: self._scene_knob(ident) for ident in knobs}
+            self.scene_morph = Morph(time.monotonic(), self._scene_morph_secs(), start, knobs)
+            if not self.scene_morph.pairs:
+                self.scene_morph = None
+        else:
+            self.scene_morph = None
+            for ident, x in knobs.items():
+                self._scene_set(ident, x)
+        self._scene_refresh_rows()
+        self._scene_status()
+        self.log.appendPlainText(f"scene: {sc.label} loaded"
+                                 + (f", morph {self.scene_morph_bars.currentText()}"
+                                    if self.scene_morph else ""))
+
+    def _scene_tick(self, now):
+        m = self.scene_morph
+        if m is None:
+            return
+        for ident, x in m.step(now).items():
+            self._scene_set(ident, x)
+        if m.done:
+            self.scene_morph = None
+
+    def _scene_set(self, ident, x):
+        """A knob of a scene onto its widget; a macro's own knob without
+        its fan-out, the scene carrying the destinations itself."""
+        if ident.startswith("macro_") and ident in self.knob_widgets:
+            self._macro_set_quiet(int(ident[6:]) - 1, x)
+        else:
+            self._lfo_set(ident, x)
+
+    def _scene_status(self):
+        cur = self.scenes.current
+        if cur is None:
+            text = "no scene loaded"
+        else:
+            text = self.scenes.slots[cur].label
+            if self.scene_morph is not None:
+                text += (f" · morph {self.scene_morph_bars.currentText()}, "
+                         f"{round(100 * self.scene_morph.frac)} %")
+        if self.scene_status.text() != text:
+            self.scene_status.setText(text)
 
     def _tab_video_fx(self):
         """The pool: which video effects and which shaders are in the show at
@@ -5847,6 +6803,257 @@ class Main(QMainWindow):
         self.rep_pos_lbl.setText(f"{v:+d}" if v else "0")
         self._rep_apply()
 
+    # ---------- the speed: gears, tape stop, nudge, pitch ----------
+    def _player(self):
+        la = self.through
+        return la.player if la is not None and la.running else None
+
+    def _speed_toggled(self, gear, on):
+        """Half or double time pressed: the other one off, the player told
+        (it lands on the grid)."""
+        other = self.double_btn if gear == "half" else self.half_btn
+        if on and other.isChecked():
+            other.blockSignals(True)
+            other.setChecked(False)
+            other.blockSignals(False)
+        self._speed_apply()
+
+    def _speed_apply(self):
+        pl = self._player()
+        if pl is None:
+            return
+        gear = "half" if self.half_btn.isChecked() else \
+            "double" if self.double_btn.isChecked() else None
+        pl.speed_sync = dict(SPEED_SYNCS).get(self.speed_sync.currentText(), 1.0)
+        pl.locked = self.pitch_mode.currentText() == "locked"
+        pl.brake_bars = dict(BRAKE_LENS).get(self.brake_len.currentText(), 1.0)
+        pl.set_speed(gear)
+
+    def _speed_sync_changed(self, name):
+        self.settings.setValue("perform/speed_sync", name)
+        self._speed_apply()
+
+    def _pitch_changed(self, name):
+        self.settings.setValue("perform/pitch", name)
+        self._speed_apply()
+
+    def _brake_len_changed(self, name):
+        self.settings.setValue("perform/brake_len", name)
+        self._speed_apply()
+
+    def _brake_hold(self, source, on):
+        """The tape stop held (`on`) or let go by `source`: "key", "midi" or
+        "ui" (the latching button). It brakes while any of them holds it."""
+        if on:
+            self._brake_sources.add(source)
+        else:
+            self._brake_sources.discard(source)
+        held = bool(self._brake_sources)
+        if self.brake_btn.isChecked() != held:
+            self.brake_btn.blockSignals(True)
+            self.brake_btn.setChecked(held)
+            self.brake_btn.blockSignals(False)
+        pl = self._player()
+        if pl is not None:
+            pl.brake_bars = dict(BRAKE_LENS).get(self.brake_len.currentText(), 1.0)
+            pl.set_brake(held and pl.playing)
+
+    def _nudge_hold(self, sign, source, on):
+        """A nudge held or let go; the rate follows at the next poll."""
+        if on:
+            self._nudge_sources[sign].add(source)
+        else:
+            self._nudge_sources[sign].discard(source)
+        if on and self._link_active():
+            self.log.appendPlainText("nudge: not under Link, the session owns the beat")
+
+    def _nudge_factor(self):
+        """The rate's nudge: 1 ± the amount while held (none under Link)."""
+        if self._link_active():
+            return 1.0
+        f = 1.0
+        pct = self.nudge_pct.value() / 100.0
+        if self._nudge_sources[1]:
+            f *= 1.0 + pct
+        if self._nudge_sources[-1]:
+            f *= 1.0 - pct
+        return f
+
+    def _frag_fill_slices(self, want=None):
+        """The slice pick: follow, then one entry per slice of the division."""
+        cur = want if want is not None else self.frag_slice.currentText()
+        div = int(self.frag_div.currentText() or 16)
+        self.frag_slice.blockSignals(True)
+        self.frag_slice.clear()
+        self.frag_slice.addItems(["follow"] + [str(k) for k in range(1, div + 1)])
+        self.frag_slice.setCurrentText(cur if self.frag_slice.findText(cur) >= 0 else "follow")
+        self.frag_slice.blockSignals(False)
+
+    def _frag_div_changed(self, _text):
+        self._frag_fill_slices()
+        self._frag_changed()
+
+    def _frag_changed(self, *_a):
+        """The Fragments rows into the engine, and remembered."""
+        f = FRAGMENTS
+        f["div"] = int(self.frag_div.currentText() or 16)
+        f["size"] = dict(FRAG_UNITS).get(self.frag_size.currentText(), 1 / 16)
+        f["rate"] = dict(FRAG_RATES).get(self.frag_rate.currentText(), 0.0)
+        f["motion"] = self.frag_motion.value() / 100.0
+        f["pitch"] = float(self.frag_pitch.value())
+        f["speed"] = self.frag_speed.value() / 100.0
+        f["repeats"] = int(self.frag_repeats.value())
+        f["shape"] = self.frag_shape.value() / 100.0
+        f["dir"] = self.frag_dir.currentText()
+        f["play"] = self.frag_play.currentText()
+        f["attack"] = self.frag_a.value() / 1000.0
+        f["decay"] = self.frag_d.value() / 1000.0
+        f["sustain"] = self.frag_s.value() / 100.0
+        f["release"] = self.frag_r.value() / 1000.0
+        st = self.settings.setValue
+        st("perform/frag_div", f["div"])
+        st("perform/frag_slice", self.frag_slice.currentText())
+        for name, w in (("size", self.frag_size), ("rate", self.frag_rate),
+                        ("dir", self.frag_dir), ("play", self.frag_play)):
+            st(f"perform/frag_{name}", w.currentText())
+        for name, w in (("motion", self.frag_motion), ("pitch", self.frag_pitch),
+                        ("speed", self.frag_speed), ("repeats", self.frag_repeats),
+                        ("shape", self.frag_shape), ("a", self.frag_a), ("d", self.frag_d),
+                        ("s", self.frag_s), ("r", self.frag_r)):
+            st(f"perform/frag_{name}", int(w.value()))
+
+    def _rev_changed(self, *_a):
+        """The Reverse delay row into every rack's effect, and remembered."""
+        REVERSE["time"] = dict(REV_TIMES).get(self.rev_time.currentText(), 0.25)
+        REVERSE["feedback"] = self.rev_fb.value() / 100.0
+        self.settings.setValue("perform/rev_time", self.rev_time.currentText())
+        self.settings.setValue("perform/rev_fb", int(self.rev_fb.value()))
+
+    def _frag_hold(self, key, source, on):
+        """Slice `key` (1..32, or 0 for the slice under the playhead) held
+        (`on`) or let go by `source`: "key", "midi" or "ui". The voice
+        plays while any source holds that key."""
+        srcs = self._frag_sources.setdefault(key, set())
+        was = bool(srcs)
+        if on:
+            srcs.add(source)
+        else:
+            srcs.discard(source)
+        held = bool(srcs)
+        pl = self._player()
+        if pl is not None and held != was:
+            if held:
+                if pl.playing:
+                    pl.frag.press(key)
+            else:
+                pl.frag.release(key)
+        if key == self._frag_pick_key and self.frag_btn.isChecked() != held:
+            self.frag_btn.blockSignals(True)
+            self.frag_btn.setChecked(held)
+            self.frag_btn.blockSignals(False)
+
+    def _frag_hold_pick(self, source, on):
+        """The F key and the button: the slice picked in the Perform tab
+        (follow = the one under the playhead), the key fixed at the press
+        so the let-go releases the same voice."""
+        if on and not any(self._frag_sources.get(self._frag_pick_key, ())):
+            pick = self.frag_slice.currentText()
+            self._frag_pick_key = int(pick) if pick.isdigit() else 0
+        self._frag_hold(self._frag_pick_key, source, on)
+
+    def _frag_release_all(self):
+        """Every held slice let go (a stop): the sources and the voices."""
+        for key, srcs in list(self._frag_sources.items()):
+            if srcs:
+                srcs.clear()
+                self._frag_hold(key, "ui", False)
+        pl = self._player()
+        if pl is not None:
+            pl.frag.clear()
+
+    def _frag_note(self):
+        """The fragments for the status: 'fragments 3/16 · 1/16 · dense ·
+        motion 100 %' or ''."""
+        pl = self._player()
+        fs = pl.frag_state() if pl is not None else None
+        if fs is None:
+            return ""
+        parts = [f"fragments {fs['slice']}/{fs['div']}", self.frag_size.currentText(),
+                 self.frag_rate.currentText(), f"motion {self.frag_motion.value()} %"]
+        if self.frag_speed.value() != 100:
+            parts.append("frozen" if self.frag_speed.value() == 0
+                         else f"speed {self.frag_speed.value()} %")
+        if self.frag_pitch.value():
+            parts.append(f"{self.frag_pitch.value():+d} st")
+        if fs["voices"] > 1:
+            parts.append(f"{fs['voices']} voices")
+        return " · ".join(parts)
+
+    def _gran_state(self):
+        """The fragments sounding, for the picture, or None."""
+        pl = self._player()
+        return pl.frag_state() if pl is not None else None
+
+    def _gran_heads(self, gs, size):
+        """The bands of the granular picture: (left edge, width, playhead,
+        lit), all as fractions of the frame's width. A fragment's own
+        grains when one sounds, the frame being its slice; else a few
+        made up on the Fragments rows' settings, cycling on the grain
+        clock over GRAN_VIEW_S seconds, so the picture shows what the rows
+        would do."""
+        heads = []
+        if gs is not None:
+            for x0, w, ph, rev in gs["heads"][:GRAN_HEADS]:
+                x0 = min(x0, 1.0 - w)
+                hx = x0 + (1.0 - ph if rev else ph) * w
+                lit = 0.5 - 0.5 * math.cos(2 * math.pi * ph)
+                heads.append((x0, w, hx, lit))
+            return heads
+        spread = min(1.0, self.frag_motion.value() / 400.0)
+        for i in range(5):
+            life = self._gran_clock + ((i * 0.618) % 1.0)
+            gen = math.floor(life)
+            ph = life - gen
+            h = lambda k: (math.sin(i * 127.1 + gen * 7.13 + k * 311.7) * 43758.5453) % 1.0
+            pos = size + 0.005 + h(1) * spread
+            rev = spread > 0.5 and h(2) < spread - 0.5
+            x0 = 1.0 - pos / GRAN_VIEW_S
+            w = size / GRAN_VIEW_S
+            hx = x0 + (1.0 - ph if rev else ph) * w
+            heads.append((x0, w, hx, 0.5 - 0.5 * math.cos(2 * math.pi * ph)))
+        return heads
+
+    def _speed_note(self, pl):
+        """The speed for the status: '' or ' · half time', ' · tape stop
+        42 %', ' · nudge +4 %', ' · 126/120 bpm'."""
+        parts = []
+        hs = pl.head_state()
+        if hs["mode"] == "brake":
+            parts.append(f"tape stop {round(100 * hs['rate'])} %")
+        elif hs["mode"] == "half":
+            parts.append("half time")
+        elif hs["mode"] == "double":
+            parts.append("double time")
+        nf = self._nudge_factor()
+        if nf != 1.0:
+            parts.append(f"nudge {'+' if nf > 1 else '-'}{self.nudge_pct.value()} %")
+        if abs(self.tempo.bpm - pl.bpm) > 0.05:
+            parts.append(f"{self.tempo.bpm:.0f}/{pl.bpm:.0f} bpm")
+        if parts and pl.locked and hs["mode"] != "brake":
+            parts.append("at pitch")
+        return "".join(" · " + p for p in parts)
+
+    def _head_phase(self):
+        """(beat phase, bar phase) of what sounds under a gear or a tape
+        stop, for the shaders, or None when the head is the transport."""
+        pl = self._player()
+        if pl is None or not pl.playing or pl.head_state()["mode"] is None \
+                or not pl.beat_frames:
+            return None
+        h = pl.heard_s() * pl.sr
+        bf = pl.beat_frames
+        return (h % bf) / bf, (h % (4 * bf)) / (4 * bf)
+
     def _quant_frac(self):
         """The quantize grid as a fraction of a bar, 0 = at once."""
         return dict(QUANT_GRIDS).get(self.perf_quant.currentText(), 0.0)
@@ -5913,6 +7120,13 @@ class Main(QMainWindow):
                 self._link_transport(False)            # with it; idling alone sends nothing
                 if "ui" in self._rep_sources:          # the latched repeat ends with it
                     self._rep_hold("ui", False)
+                if "ui" in self._brake_sources:        # and the latched tape stop
+                    self._brake_hold("ui", False)
+                if any(self._frag_sources.values()):   # and the fragments held
+                    self._frag_release_all()
+                for btn in (self.half_btn, self.double_btn):   # the gears start over
+                    if btn.isChecked():
+                        btn.setChecked(False)
             if self.backdrop.override is not None and burst is None:
                 self.backdrop.override = None
             if burst is None and self._webcam_b():     # webcam on B: the pedal works
@@ -5942,6 +7156,21 @@ class Main(QMainWindow):
             self._show_live_bpm()
             self._link_push(pl.bpm)                    # and so does the Link session
             self._link_transport(True)                 # which plays now, if it did not
+            self._speed_apply()                        # the gears, the pitch, the sync
+            if self._brake_sources:                    # still held: on the new one too
+                self._brake_hold("ui", "ui" in self._brake_sources)
+        # the transport's rate: the clock's tempo over the section's (a
+        # tempo change, Link's or the box's, is followed without a render)
+        # times a held nudge; and the clock's bar on the transport, so the
+        # shaders, the LFOs and the meter slide with a nudge
+        pl.set_rate(self.tempo.bpm / max(1e-6, pl.bpm) * self._nudge_factor())
+        if pl.loop_t0 and not pl.filling:
+            bar_s = 4 * 60.0 / self.tempo.bpm
+            off = (pl.loop_t0 - self.tempo.anchor) % bar_s
+            if off > bar_s / 2:
+                off -= bar_s
+            if abs(off) > 0.002:
+                self.tempo.anchor += off
         if pl.dropped:                                 # a break ended here: the drop
             pl.dropped = False
             self._perf_drop_t = time.monotonic()
@@ -5966,21 +7195,28 @@ class Main(QMainWindow):
             self.perf_status.setText(
                 f"{pl.fill_armed[0]} on bar {on}  ·  bar {bar}/{pl.bars}  ·  {ready}")
             big = f"{pl.fill_armed[0]} on bar {on}"
+        elif pl.frag_state() is not None:              # a slice as grains over the loop
+            big = self._frag_note() + self._speed_note(pl)
+            self.perf_status.setText(f"{big}  ·  bar {bar}/{pl.bars}  ·  {ready}")
         elif pl.repeat is not None:                    # a held repeat over the loop
             _div, off, rev = pl.repeat
             big = (f"repeat {self.rep_div.currentText()}" + (f" {off:+d}" if off else "")
-                   + (" reversed" if rev else ""))
+                   + (" reversed" if rev else "") + self._speed_note(pl))
             self.perf_status.setText(f"{big}  ·  bar {bar}/{pl.bars}  ·  {ready}")
         else:
             root = f" in {sec.root}" if getattr(sec, "root", None) else ""
+            spd = self._speed_note(pl)
             self.perf_status.setText(
-                f"playing {sec.kind}{root} {pl.bpm:.0f} bpm  ·  bar {bar}/{pl.bars}  ·  {ready}")
-            big = f"{sec.kind}{root}  ·  {pl.bpm:.0f} bpm"
+                f"playing {sec.kind}{root} {pl.bpm:.0f} bpm{spd}  ·  bar {bar}/{pl.bars}"
+                f"  ·  {ready}")
+            big = f"{sec.kind}{root}  ·  {pl.bpm:.0f} bpm{spd}"
         win = pl.repeat_window()
         if win is not None:                            # the window, in bars
             bar_frames = 4 * pl.beat_frames
             win = (win[0] / bar_frames, win[1] / bar_frames, win[2],
                    pl.heard_s() * pl.bpm / 60.0 / 4)
+        if pl.head_state()["mode"] is not None and pl.repeat is None:
+            bar_pos = (pl.heard_s() * pl.bpm / 60.0 / 4) % max(1, pl.bars)   # what sounds
         self.perf_meter.set_state(big, pl.bars, bar_pos, win)
         # picture: the frame the sounding sample was cut from, dissolved into
         # the live picture by the A/B pedal (follow), or pinned to either side
@@ -6516,7 +7752,7 @@ class Main(QMainWindow):
         bpm, _beat, _phase = self.link.snapshot()
         la = self.through
         pl = la.player if la is not None and la.running else None
-        if (pl is None or not pl.playing) and abs(bpm - self.tempo.bpm) > 0.01:
+        if abs(bpm - self.tempo.bpm) > 0.01:            # a playing section follows (its rate)
             self.tempo.set_bpm(bpm)
             self._show_live_bpm()
         playing = self.link.playing
@@ -6837,6 +8073,7 @@ class Main(QMainWindow):
         section = idle and self._perf_sounding
         if idle and not section and not any(cb.isChecked() for cb in self.vfx_on.values()):
             return None                         # the clip as it is
+        head_speed = None                       # a file tape's speed under the section's head
         if live or idle:
             now = time.monotonic()
             if live and self.live_auto.isChecked():
@@ -6848,6 +8085,22 @@ class Main(QMainWindow):
                 env = self.live.loud
             else:                               # idle: a pulse on every beat
                 env = 0.35 + 0.65 * (1.0 - (pos % beat_ms) / beat_ms) ** 2
+            # the section's head (a gear, a tape stop) takes the picture
+            # with it: a file on the tape side runs at its speed (the live
+            # input cannot), the effects' clock slows and stops with it
+            pl = self._player()
+            hr = 1.0
+            if pl is not None and pl.playing and pl.head_state()["mode"] is not None:
+                hr = float(pl.head_state()["rate"])
+            self.backdrop.time_rate = hr
+            src = getattr(self.backdrop, "source", None)
+            if src is not None and isinstance(getattr(src, "current", None), Path):
+                head_on = hr != 1.0 or self._head_phase() is not None
+                if head_on != self._head_tape:
+                    self._head_tape = head_on
+                    src.catch_up = not head_on      # slowed on purpose: no rewind after
+                if head_on:
+                    head_speed = hr
         else:
             pos = self._playhead_ms()
             fade = self._outro_fade(pos)
@@ -6911,6 +8164,11 @@ class Main(QMainWindow):
             # the shaders that age with it (vhs) moving
             "song_pos": (pos / 300000.0) % 1.0 if live or idle
             else pos / total_ms if total_ms else 0.0}}
+        ph = self._head_phase()                 # a gear or a tape stop: the beat is the head's
+        if ph is not None:
+            st["music"]["beat"], st["music"]["bar"] = ph
+        if head_speed is not None:
+            st["speed"] = head_speed
         # clean video: rolled once per bar, on its downbeat, with probability
         # = strength; the first 1/16 note of the bar then flashes the video as
         # it is (no effects, no shader layer), only the outro fade
@@ -6946,6 +8204,23 @@ class Main(QMainWindow):
                         if 0 <= left < length:
                             st["reverse"] = 1.0 + 2.0 * (1 - left / length)
                             st.pop("speed", None)   # the swell wins over the timeline
+        if v["gran"]:
+            # the granular picture: the frame in grains the size of the
+            # sound's, on the row's settings, lit by the loudest cloud
+            # sounding (alone at the knob's strength with none), its clock
+            # one grain per grain length, the frame held while frozen
+            gs = self._gran_state()
+            size = max(0.005, FRAGMENTS["size"] * 4 * beat_ms / 1000.0)
+            tnow = time.monotonic()
+            if self._gran_t is not None:
+                self._gran_clock += max(0.0, min(0.2, tnow - self._gran_t)) / size
+            self._gran_t = tnow
+            amt = v["gran"] * ((0.6 + 0.4 * gs["level"]) if gs else 0.7)
+            frozen = gs is not None and gs["speed"] == 0.0
+            st["gran"] = {"amt": min(1.0, amt), "freeze": frozen,
+                          "heads": self._gran_heads(gs, size)}
+            if frozen:
+                st["freeze"] = True
         if self.video_plain.isChecked() or (self._clean_on and in_bar < beat_ms / 4):
             st["clean"] = True
             if fade < 1.0:
