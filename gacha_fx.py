@@ -30,7 +30,9 @@ its echo fed back). A plugin handing back blocks
 of varying length goes through a FIFO. Every amount is ramped over the
 block it changes in, so knobs never zip. Delay time follows the beat
 (`Rack.beat_s`, set from the song or the live clock): a dotted eighth, the
-dub classic.
+dub classic. What a knob does not say (the delay's time and feedback, the
+reverb's room, the chorus rate...) is a setting shared by every rack,
+FX_SETTINGS / FX_SET below, set from the GUI thread and read per block.
 
     rack = Rack(48000)
     rack.amounts["reverb"] = 0.4      # from any thread
@@ -49,24 +51,30 @@ AUDIO_FX = [
     ("lowpass", "lowpass", 0.0, "Ladder lowpass sweeping down from 20 kHz to 150 Hz, "
                                 "resonance rising with it; the club door closing"),
     ("drive", "drive", 0.0, "The engine's tanh saturator, gain-compensated: denser, "
-                            "not louder; up to +30 dB into the shaper at full"),
-    ("crush", "bitcrush", 0.0, "Bit depth from 16 down to 3 bits at full, crossfaded in"),
-    ("lofi", "lo-fi codec", 0.0, "Phone codec: 3.4 kHz lowpass, 8 kHz sample-and-hold, "
-                                 "8-bit mu-law, crossfaded in"),
-    ("chorus", "chorus", 0.0, "Chorus, depth and mix rising together"),
-    ("phaser", "phaser", 0.0, "Phaser, depth, feedback and mix rising together"),
-    ("pitch", "pitch", 0.0, "Pitch shift: off in the middle, down to -12 semitones "
-                            "at the bottom, up to +12 at the top; the shift fades "
-                            "in over the first semitones"),
-    ("delay", "delay", 0.0, "Tempo-synced delay, a dotted eighth, feedback rising "
-                            "with the knob; only repeats at full"),
+                            "not louder; up to the gain setting (30 dB) into the shaper "
+                            "at full, a lowpass (tone) on the driven sound"),
+    ("crush", "bitcrush", 0.0, "Bit depth from 16 down to the bits setting (3) at full, "
+                               "crossfaded in"),
+    ("lofi", "lo-fi codec", 0.0, "Phone codec: 3.4 kHz lowpass, a sample-and-hold at the "
+                                 "rate setting (8 kHz), mu-law at the bits setting (8), "
+                                 "crossfaded in"),
+    ("chorus", "chorus", 0.0, "Chorus, depth and mix rising together; rate, delay and "
+                              "feedback in the settings"),
+    ("phaser", "phaser", 0.0, "Phaser, depth, feedback and mix rising together; rate and "
+                              "centre in the settings"),
+    ("pitch", "pitch", 0.0, "Pitch shift: off in the middle, down by the range setting "
+                            "(12 semitones) at the bottom, up by it at the top; the shift "
+                            "fades in over the first semitones"),
+    ("delay", "delay", 0.0, "Tempo-synced delay at the time setting (a dotted eighth), "
+                            "the feedback setting its repeats; this knob the wet mix, only "
+                            "repeats at full"),
     ("reverse", "reverse delay", 0.0, "Reverse delay: the time's worth of sound played "
                                       "backwards, that much late, the reversed echo fed back "
                                       "so the repeats come backwards, forwards, backwards; "
-                                      "the time and the feedback are the Perform tab's "
-                                      "Reverse delay row, this knob the wet mix, only "
-                                      "echoes at full"),
-    ("reverb", "reverb", 0.0, "Reverb, the room growing with the knob; a wash at full"),
+                                      "the time and the feedback in the settings, this knob "
+                                      "the wet mix, only echoes at full"),
+    ("reverb", "reverb", 0.0, "Reverb at the size, damping and width settings; this knob "
+                              "the wet mix, a wash at full"),
 ]
 BIPOLAR = {"pitch"}                      # -1..1 knobs, off at 0 in the middle
 CHANNELS = ("live", "drums", "layers", "chops", "events")   # live = the input through
@@ -81,9 +89,10 @@ ALL_CHANNELS = CHANNELS + VOICES         # every rack there is
 PITCH_DEAD = 0.04                        # |pitch| below this = off (knob centre)
 
 
-def _tanh_drive(x, amount, bias=0.15):
-    """Soft saturation, RMS matched by a fixed curve so the level holds."""
-    d = 10 ** (amount * 30 / 20)                              # up to +30 dB
+def _tanh_drive(x, amount, db=30.0, bias=0.15):
+    """Soft saturation, RMS matched by a fixed curve so the level holds;
+    `db` the push into the shaper at amount 1."""
+    d = 10 ** (amount * db / 20)                              # up to +db
     y = np.tanh(x * d + bias) - np.tanh(bias)
     return y * (0.3 / max(1e-6, np.tanh(0.3 * d)))            # compensate
 
@@ -94,7 +103,7 @@ class LoFi:
 
     def __init__(self, sr, rate=8000.0):
         self.sr = int(sr)
-        self.step = self.sr / rate                           # 6 at 48 kHz
+        self.step = self.sr / rate                           # 6 at 48 kHz, set per block
         self.lp = LowpassFilter(cutoff_frequency_hz=3400.0)
         self.phase = 0.0                                     # next sample to hold
         self.held = np.zeros((2, 1), np.float32)
@@ -104,8 +113,10 @@ class LoFi:
         self.phase = 0.0
         self.held[:] = 0.0
 
-    def process(self, x):
+    def process(self, x, rate=8000.0, bits=8):
+        """The line at `rate` Hz of sample-and-hold and `bits` of mu-law."""
         bs = x.shape[1]
+        self.step = self.sr / max(100.0, float(rate))
         y = self.lp.process(x, self.sr, reset=False)
         # hold points: every `step` frames from the carried phase
         k = np.arange(bs)
@@ -124,8 +135,9 @@ class LoFi:
             self.held = vals[:, -1:].copy()
             self.phase = self.phase + self.step * n_new - bs
         mu = 255.0
+        q = float(2 ** (max(2, int(bits)) - 1) - 1)                      # 127 at 8 bits
         c = np.sign(out) * np.log1p(mu * np.abs(out)) / np.log1p(mu)   # compress
-        c = np.round(c * 127.0) / 127.0                                  # 8 bits
+        c = np.round(c * q) / q                                          # the word
         return (np.sign(c) * (np.expm1(np.abs(c) * np.log1p(mu)) / mu)).astype(np.float32)
 
 
@@ -170,24 +182,82 @@ class PitchShifter:
         return out
 
 
-# the reverse delay's time and feedback, one setting for every channel
-# (the Perform tab's Reverse delay row): set from the GUI thread, read per block
-REVERSE = {"time": 0.25,         # the chunk, as a fraction of the bar (a beat)
-           "feedback": 0.5}      # the echo's share fed back, 0..0.95
+# the effects' settings, one for every channel's rack (the Audio FX tab's
+# block under the racks): what the knob in the grid does not say. A row:
+# (ident, effect key, label, kind, lo, hi, default, suffix, what); kind
+# "int" a whole number, "dbl" one decimal, "list" a menu, lo the (name,
+# value) pairs and default a name. FX_SET holds the values (a menu's as its
+# number), set from the GUI thread and read per block.
+DELAY_TIMES = [("1/32", 1 / 32), ("1/16", 1 / 16), ("1/12", 1 / 12), ("1/8", 1 / 8),
+               ("3/16", 3 / 16), ("1/4", 1 / 4), ("3/8", 3 / 8), ("1/2", 1 / 2),
+               ("1 bar", 1.0)]
 REV_TIMES = [("1/64", 1 / 64), ("1/32", 1 / 32), ("1/16", 1 / 16), ("1/8", 1 / 8),
              ("1/4", 1 / 4), ("1/2", 1 / 2), ("1 bar", 1.0)]
+FX_SETTINGS = [
+    ("hp_res", "highpass", "resonance", "int", 0, 100, 60, " %",
+     "how much the ladder rings at its cutoff with the knob up; 0 none, 100 a whistle"),
+    ("hp_drive", "highpass", "drive", "dbl", 1.0, 10.0, 1.0, "",
+     "the ladder's input gain: 1 clean, up to 10 for a filter that saturates"),
+    ("lp_res", "lowpass", "resonance", "int", 0, 100, 75, " %",
+     "how much the ladder rings at its cutoff with the knob up; 0 none, 100 a whistle"),
+    ("lp_drive", "lowpass", "drive", "dbl", 1.0, 10.0, 1.0, "",
+     "the ladder's input gain: 1 clean, up to 10 for a filter that saturates"),
+    ("drv_gain", "drive", "gain", "int", 6, 40, 30, " dB",
+     "the push into the shaper with the knob at full: 6 a warm edge, 40 a fuzz"),
+    ("drv_tone", "drive", "tone", "dbl", 1.0, 16.0, 8.0, " kHz",
+     "a lowpass on the driven sound: low dark and woolly, high open and fizzy"),
+    ("crush_bits", "crush", "bits at full", "int", 1, 12, 3, " bits",
+     "the bit depth the knob reaches at full, down from 16: 1 a square buzz, 8 a sampler"),
+    ("lofi_rate", "lofi", "rate", "dbl", 2.0, 16.0, 8.0, " kHz",
+     "the sample-and-hold rate of the phone line: 2 kHz a growl of aliasing, 8 a phone"),
+    ("lofi_bits", "lofi", "bits", "int", 3, 12, 8, " bits",
+     "the mu-law word: 3 crackles, 8 a phone, 12 nearly clean"),
+    ("cho_rate", "chorus", "rate", "dbl", 0.1, 5.0, 0.8, " Hz",
+     "the modulation's speed: slow a wide shimmer, fast a wobble"),
+    ("cho_delay", "chorus", "delay", "dbl", 1.0, 20.0, 7.0, " ms",
+     "the centre delay: short a flange, long a doubling"),
+    ("cho_fb", "chorus", "feedback", "int", 0, 90, 0, " %",
+     "the delayed sound fed back: 0 a chorus, high a flanger's metal"),
+    ("pha_rate", "phaser", "rate", "dbl", 0.1, 5.0, 0.6, " Hz",
+     "the sweep's speed: slow a slow swirl, fast a tremolo"),
+    ("pha_centre", "phaser", "centre", "int", 200, 5000, 1300, " Hz",
+     "the centre of the sweep: low in the body, high in the air"),
+    ("pitch_range", "pitch", "range", "int", 1, 24, 12, " st",
+     "the semitones at the knob's ends: 12 an octave each way, 1 a fine detune, 24 two"),
+    ("dly_time", "delay", "time", "list", DELAY_TIMES, None, "3/16", "",
+     "the delay's time as a fraction of the bar, following the tempo: 3/16 the dotted "
+     "eighth, 1/12 a triplet, 1 bar a whole one"),
+    ("dly_fb", "delay", "feedback", "int", 0, 95, 45, " %",
+     "the echo fed back: 0 one repeat, 95 % a long tail"),
+    ("rev_time", "reverse", "time", "list", REV_TIMES, None, "1/4", "",
+     "the reverse delay's time as a fraction of the bar, following the tempo: that much "
+     "sound is played backwards that much late (a beat by default; a 64th is a buzz at "
+     "the grain of the tempo, a bar a whole phrase turned round)"),
+    ("rev_fb", "reverse", "feedback", "int", 0, 95, 50, " %",
+     "the reversed echo's share fed back into the line, so the repeats alternate "
+     "backwards and forwards; 0 one echo, 95 % a long tail (soft-clipped, it cannot run "
+     "away)"),
+    ("rvb_size", "reverb", "size", "int", 0, 100, 65, " %",
+     "the room: small a closet, 100 a hall that hardly decays"),
+    ("rvb_damp", "reverb", "damping", "int", 0, 100, 50, " %",
+     "how fast the highs die in the tail: 0 bright and metallic, 100 dark and soft"),
+    ("rvb_width", "reverb", "width", "int", 0, 100, 100, " %",
+     "the stereo spread of the tail: 0 mono, 100 wide"),
+]
+FX_SET = {ident: (dict(lo)[default] if kind == "list" else float(default))
+          for ident, _fx, _l, kind, lo, _hi, default, _s, _w in FX_SETTINGS}
 
 
 class ReverseDelay:
     """The typical reverse delay: the input is cut into chunks a delay
-    time D long (REVERSE["time"] of the bar, a beat by default, following
+    time D long (FX_SET["rev_time"] of the bar, a beat by default, following
     the tempo) and each chunk is played
     back backwards during the next D, so what went in during a beat is
     heard a beat later, reversed, its tail first (a 10 ms fade at each
     chunk's ends keeps the seam clean). The wet output is fed back into
     the line, so the second echo is the reversed echo reversed again,
     forwards, two beats late, the third backwards once more, the pedal's
-    alternating repeats; the fed-back share (REVERSE["feedback"]) is
+    alternating repeats; the fed-back share (FX_SET["rev_fb"], a percent) is
     soft-clipped so it cannot run away. A change of D (a tempo change, the
     row) crossfades over the block it lands in."""
 
@@ -217,9 +287,9 @@ class ReverseDelay:
 
     def process(self, x, a, beat_s):
         """(2, bs) in, the fully wet echoes (2, bs) out (the amount `a` is
-        the rack's mix), the chunk REVERSE["time"] of a bar of `beat_s`."""
+        the rack's mix), the chunk FX_SET["rev_time"] of a bar of `beat_s`."""
         bs = x.shape[1]
-        secs = float(REVERSE.get("time", 0.25)) * 4.0 * float(beat_s)
+        secs = float(FX_SET.get("rev_time", 0.25)) * 4.0 * float(beat_s)
         D = int(round(max(0.01, min(4.0, secs)) * self.sr))   # 10 ms: a buzz, up to a bar
         t0 = self.t
         idx = (t0 + np.arange(bs)) % self.n
@@ -227,7 +297,7 @@ class ReverseDelay:
         if self._D is None:                                    # this block's own frames
             self._D = D
         D0 = self._D
-        fb = max(0.0, min(0.95, float(REVERSE.get("feedback", 0.5))))
+        fb = max(0.0, min(0.95, float(FX_SET.get("rev_fb", 50.0)) / 100.0))
         xf = np.linspace(0.0, 1.0, bs, dtype=np.float32) if D != D0 else None
         # a chunk boundary inside the block: the frames after it read the
         # frames before it (the seam), so those get their echo written
@@ -293,7 +363,7 @@ class Rack:
                 p = PitchShifter(sr)
             elif key == "delay":
                 p = Delay(delay_seconds=0.75 * self.beat_s, feedback=0.3, mix=1.0)
-                self._delay_s = 0.75 * self.beat_s
+                self._delay_s = None                             # set on the first block
             elif key == "reverse":
                 p = ReverseDelay(sr)
             elif key == "reverb":
@@ -306,42 +376,52 @@ class Rack:
         -1..1 for pitch), parameters following the knob."""
         sr = self.sr
         p = self._get(key)
+        s = FX_SET
         if key == "highpass":
             p.cutoff_hz = 20.0 * (8000.0 / 20.0) ** a
-            p.resonance = 0.1 + 0.5 * a
+            p.resonance = 0.1 + 0.8 * (s["hp_res"] / 100.0) * a
+            p.drive = max(1.0, s["hp_drive"])
             return p.process(x, sr, reset=False)
         if key == "lowpass":
             p.cutoff_hz = 20000.0 * (150.0 / 20000.0) ** a
-            p.resonance = 0.1 + 0.6 * a
+            p.resonance = 0.1 + 0.8 * (s["lp_res"] / 100.0) * a
+            p.drive = max(1.0, s["lp_drive"])
             return p.process(x, sr, reset=False)
         if key == "drive":
-            return p.process(_tanh_drive(x, a), sr, reset=False)
+            p.cutoff_frequency_hz = max(200.0, s["drv_tone"] * 1000.0)
+            return p.process(_tanh_drive(x, a, s["drv_gain"]), sr, reset=False)
         if key == "crush":
-            p.bit_depth = 16.0 - 13.0 * a
+            p.bit_depth = 16.0 - (16.0 - max(1.0, s["crush_bits"])) * a
             return p.process(x, sr, reset=False)
         if key == "lofi":
-            return p.process(x)
+            return p.process(x, s["lofi_rate"] * 1000.0, int(s["lofi_bits"]))
         if key == "chorus":
             p.depth = 0.2 + 0.7 * a
+            p.rate_hz = s["cho_rate"]
+            p.centre_delay_ms = s["cho_delay"]
+            p.feedback = s["cho_fb"] / 100.0
             return p.process(x, sr, reset=False)
         if key == "phaser":
             p.depth = 0.3 + 0.7 * a
             p.feedback = 0.2 + 0.5 * a
+            p.rate_hz = s["pha_rate"]
+            p.centre_frequency_hz = s["pha_centre"]
             return p.process(x, sr, reset=False)
         if key == "pitch":
-            return p.process(x, 12.0 * a)
+            return p.process(x, s["pitch_range"] * a)
         if key == "delay":
-            want = 0.75 * max(0.1, min(2.0, self.beat_s))
+            want = max(0.02, min(4.0, s["dly_time"] * 4.0 * self.beat_s))
             if self._delay_s is None or abs(want - self._delay_s) > 1e-3:
                 p.delay_seconds = want
                 self._delay_s = want
-            p.feedback = 0.2 + 0.55 * a
+            p.feedback = max(0.0, min(0.95, s["dly_fb"] / 100.0))
             return p.process(x, sr, reset=False)
         if key == "reverse":
             return p.process(x, a, self.beat_s)
         if key == "reverb":
-            p.room_size = 0.3 + 0.65 * a
-            p.damping = 0.6 - 0.3 * a
+            p.room_size = s["rvb_size"] / 100.0
+            p.damping = s["rvb_damp"] / 100.0
+            p.width = s["rvb_width"] / 100.0
             return p.process(x, sr, reset=False)
         return x
 

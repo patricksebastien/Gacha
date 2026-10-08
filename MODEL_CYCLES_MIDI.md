@@ -5,7 +5,10 @@ What the box can do over MIDI, and what that means for Gacha. Compiled
 and final OS, released 2021-05-26, Appendix A and chapter 12.3) plus the
 OS 1.13 release notes and Elektronauts threads for the parts the manual
 leaves out. Anything marked *verify* is not in the manual and needs a
-minute with the device.
+minute with the device. Since 2026-10 the box runs the Model-TG firmware
+(a patch over OS 1.13 with a Sampler machine); what that changes is in
+section 9, everything before it is the stock surface, which Model-TG
+keeps.
 
 Hookup here: the Model:Cycles hangs on the UMC204HD's DIN MIDI, so Gacha
 sees it as `UMC204HD 192k MIDI In` (from the box) and `UMC204HD 192k MIDI
@@ -312,3 +315,82 @@ Order to start: take recursion and tuned sub bass (no code), then CC out
 (reroll, drop, pedal crossfade), then clock out (delay and LFO lock), then
 the chord role and the Erae pads once the box's values are confirmed by
 ear.
+
+## 9. Model-TG firmware (2026-10-08)
+
+The box now runs [Model-TG](https://github.com/TinyGregAudio/Model-TG)
+(checked at commit 70b39dd, 2026-10-02): unofficial code patched into OS
+1.13 that adds a seventh machine, the **Sampler** (seven playback modes:
+one shot, loop, slice, granular, stretch, pluck, wave; stereo; slicing by
+equal parts, transients or markers; resampling of a track, the mix or USB
+audio), a retrig page with beat-repeat and twelve master FX, **Attack,
+Filter and Resonance** on the five stock machines, slide trigs, scale lock
+and a lower CPU load. Its docs (`docs/USER_GUIDE.md`, `docs/INTERNALS.md`)
+say nothing about MIDI; everything below is read out of the firmware
+source (`src/model_tg.s`, `src/phase1.s`) and is *verify* on the box.
+
+What the MIDI surface becomes:
+
+* **The stock CC table stands.** Model-TG patches the UI, the voices and
+  the save format; it adds no CC handler and no NRPN, and the only MIDI
+  code in it is the mute setter (so CC 94 out still follows a mute) and
+  some diagnostics that no shipped build installs.
+* **Machine CC 70: the Sampler is index 6.** The stock table clamps the
+  machine index to 5 (Chord); Model-TG lifts that, and every lookup it
+  patches treats 6 as the Sampler. Whether the CC path takes the raw index
+  or a scaled value is the same open question as the stock menus
+  (*verify*).
+* **The Sampler's four knobs are the machine slots.** Its page writes
+  Sample Start, Sample End, Filter and Resonance into the track words the
+  stock page writes for Color, Shape, Sweep and Contour (trackData +22,
+  +24, +26, +28), so CC 16..19 should land on them. In Granular, Stretch,
+  Pluck and Wave the same four words take new jobs (Position / Grain size
+  / Density / Spray; Speed / Grain size / Density / Spray; Strike pos /
+  Strike len / Tone / Feedback; Wave pos / Frame size / Smooth / Detune):
+  the parameters do not change, only what they do. The mode itself is set
+  on the box only (SETTINGS + PRESET), no CC. *verify* that CC 16..19 reach
+  a Sampler track: the stock CC handler might resolve them through the
+  per-machine array that has no row for machine 6, in which case they do
+  nothing there.
+* **Pitch CC 65 on a Sampler track pins the pitch** and ends note
+  tracking (the firmware author measured it: the common Pitch parameter is
+  kept off the Sampler page for that reason). Tune a Sampler track by the
+  note instead. Decay (CC 80), level, pan, sends, volume, mute, chance,
+  swing, gate and the LFO CCs are the common parameters and stay as they
+  are.
+* **Slice mode: the note is the slice.** Slice 1 is note 52 (the first trig
+  key in keyboard mode), one slice a semitone, so the root 60 Gacha sends is
+  slice 9 and 52..67 are the sixteen slices (17..32 above). Slices play at
+  their own speed.
+* **Attack, Filter, Resonance (stock machines): no CC.** They are real
+  parameters (indices 23, 24, 25; two of the firmware's "Error"
+  placeholders given a job) that p-lock, save and take the LFO, but no CC
+  number maps to them. They are new **LFO destinations** (CC 105) after
+  the stock list on an FM track; a Sampler track does not list them (its own
+  filter is in Sweep / Contour). The exact menu position is *verify*, like
+  the rest of that list.
+* **Mute on a Sampler track** (CC 94 or FUNC + pad) fades it out and ends
+  its note instead of cutting.
+* **Retrig page, master FX, resampling, slide trigs, scale lock:** buttons
+  and knobs on the box only, nothing over MIDI. The box's new beat-repeat
+  does not change the retrig Gacha does from the M:C tab (still plain
+  notes). Delay and reverb switch off while nothing sounds, which changes
+  nothing on the wire.
+* **Transfer identity (CYC / SMP)** is for uploading samples over USB with
+  Elektron Transfer, not DIN MIDI; it resets to CYC at every power-on.
+
+In Gacha (2026-10-08): `CYCLES_MACHINES` gained "sampler" (index 6),
+`CYCLES_LFO_DESTS` attack / filter / resonance at the end,
+`CYCLES_SAMPLER_MODES` the four knobs' names per mode, `CYCLES_SLICE_NOTE`
+52. The M:C tab: a track whose machine cell says sampler shows the color,
+shape, sweep and contour cells with the mode's names as a prefix (the job
+in the tooltip), its pitch cell is greyed and never sent (send all
+included), and a **mode** row per track (a local menu, not sent, remembered
+with the tab's values) tells the tab which mode the box is in so the names
+match.
+
+To verify with the box the first time: the machine menu reaches the
+Sampler at CC 70 = 6; CC 16..19 move Start / End / Filter / Res on a
+Sampler track; a Model:Cycles tick drum on a Slice-mode track picks slice 9
+at the root and walks the slices with the note map; the LFO destination
+menu's new entries.

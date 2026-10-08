@@ -109,22 +109,61 @@ CYCLES_ROOT = 60
 # "swing" 50..80 % over 0..127; "on" a switch, 0 or 127; "list" a menu,
 # its index sent (the menu's order, 0 first: the manual gives no values,
 # verify on the box); "dt" the delay time 1..128 in 128ths, sent - 1
-CYCLES_MACHINES = ["kick", "snare", "metal", "perc", "tone", "chord"]
+# the Model-TG firmware (github.com/TinyGregAudio/Model-TG, on the box since
+# 2026-10) adds a seventh machine, the Sampler: machine index 6 on the box
+# (stock OS 1.13 clamps the index to 5, so the value means nothing there)
+CYCLES_MACHINES = ["kick", "snare", "metal", "perc", "tone", "chord", "sampler"]
 CYCLES_LFO_WAVES = ["tri", "sine", "square", "saw", "env", "ramp", "random"]
+# Model-TG adds attack, filter and resonance to the five stock machines as
+# LFO destinations (parameter indices 23..25, after the stock list; a
+# Sampler track does not list them, its own filter sits in sweep / contour)
 CYCLES_LFO_DESTS = ["none", "pitch", "fine tune", "decay", "color", "shape", "sweep",
                     "contour", "delay send", "reverb send", "vol + dist", "pan", "punch",
-                    "gate"]
+                    "gate", "attack", "filter", "resonance"]
+# the Sampler's four page knobs sit in the machine slots color, shape, sweep
+# and contour (the same track words the stock page writes, so CC 16..19 by
+# the stock mapping, to verify on the box) and change job with the playback
+# mode, which only the box sets (SETTINGS + PRESET); the tab is told which:
+# (mode, the short names for the cells, the long names for the tooltips)
+CYCLES_SAMPLER_KNOBS = ("color", "shape", "sweep", "contour")
+_SAMPLE_WINDOW = (("start", "end", "filt", "res"),
+                  ("sample start (above end plays it reversed)", "sample end",
+                   "filter cutoff, a 4-pole ladder low-pass", "filter resonance"))
+CYCLES_SAMPLER_MODES = [
+    ("one shot", *_SAMPLE_WINDOW),
+    ("loop", *_SAMPLE_WINDOW),
+    ("slice", ("start", "end", "filt", "res"),
+     ("start, inside the slice the note picks", "end, inside the slice",
+      "filter cutoff", "filter resonance")),
+    ("granular", ("pos", "size", "dens", "spray"),
+     ("grain position in the sample", "grain size, 10 ms to 1 s", "grain density",
+      "position spray")),
+    ("stretch", ("speed", "size", "dens", "spray"),
+     ("playhead speed: 0 frozen, 96 the original, 127 about 3.8 times",
+      "grain size", "grain density", "position spray")),
+    ("pluck", ("strike", "len", "tone", "fdbk"),
+     ("where the string is struck", "strike length, 1 ms to 1 s", "string tone",
+      "string feedback")),
+    ("wave", ("wave", "frame", "smooth", "detune"),
+     ("wavetable position", "frame size, 32 to 4096 samples (2048 for Serum and "
+      "Vital tables)", "frame smoothing", "detune")),
+]
+# Slice mode: the note picks the slice, slice 1 at note 52 (the box's first
+# trig key), one a semitone, so the root 60 plays slice 9
+CYCLES_SLICE_NOTE = 52
 # the multiplier: the tempo-synced set (x the tempo) then the fixed one
 # (x 120 BPM, free of the tempo); the box's own order to verify
 _MULTS = ("1", "2", "4", "8", "16", "32", "64", "128", "256", "512", "1k", "2k")
 CYCLES_LFO_MULTS = [f"x{m}" for m in _MULTS] + [f"{m} fixed" for m in _MULTS]
 CYCLES_PARAMS = [
     ("machine", 70, "machine", "list", 0,
-     "the FM machine the track runs: kick, snare, metal, perc, tone, chord (OS 1.13 "
-     "takes it over CC; the menu order is a guess, verify on the box)"),
+     "the machine the track runs: kick, snare, metal, perc, tone, chord, and the "
+     "Model-TG firmware's sampler (OS 1.13 takes it over CC; the menu order is a "
+     "guess, verify on the box)"),
     ("pitch", 65, "pitch", "semi", 0,
      "tuning, -24 to +24 semitones; the box slews a CC jump into a glide, a firmware "
-     "quirk with no switch, so a step sounds as a portamento"),
+     "quirk with no switch, so a step sounds as a portamento; not sent to a sampler "
+     "track, where the pitch CC pins the pitch and ends its note tracking"),
     ("decay", 80, "decay", "u", 64, "the amp envelope's decay, 0 to 127"),
     ("color", 16, "color", "u", 64, "machine dependent: kick punch, snare noise..."),
     ("shape", 17, "shape", "u", 64, "machine dependent; chord: picks the chord"),
