@@ -2,7 +2,7 @@
 """
 gacha.py — Qt front-end for the gacha_engine.py render engine.
 
-Left side: all generation parameters in tabs (General / Perform / Drums /
+Left side: all generation parameters in tabs (Perform / Drums / ... / Settings /
 Sections, the layers & effects on the same page / Video / Audio FX / Video FX /
 Controls) and the live render log in a tab of its own.
 Right side: the sample library (samples/, one subfolder per set, with
@@ -38,7 +38,8 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QCompleter, QDoubleSpinBox,
     QFormLayout, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QPlainTextEdit, QProgressBar, QProgressDialog, QPushButton, QSlider, QSpinBox,
+    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QProgressDialog, QPushButton,
+    QSlider, QSpinBox,
     QStyle,
     QScrollArea, QSizePolicy, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout,
@@ -52,7 +53,7 @@ from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
 from gacha_link import INSTALL_HINT as LINK_INSTALL_HINT, LINK_AVAILABLE, LinkClock
 from gacha_audio import LiveAudio, audio_apis, audio_devices, audio_status, PHRASE_BARS
 from gacha_takes import TakeStore
-from gacha_section import (Material, cut_burst, render_section, render_oneshot,
+from gacha_section import (EXTRA_KINDS, Material, cut_burst, render_section, render_oneshot,
                            render_swell, KINDS, STEMS)
 import gacha_engine as E
 from scipy.signal import resample_poly
@@ -140,6 +141,7 @@ QPushButton#generate {
     font-weight: bold;
 }
 QPushButton#generate:hover { background: rgba(255, 96, 70, 220); }
+QPushButton#next { font-weight: bold; font-size: 20px; padding: 4px 14px; }
 QPushButton#small { padding: 2px 10px; font-size: 12px; }
 QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit {
     background: rgba(28, 11, 9, 117); border: 1px solid rgba(212, 48, 30, 170);
@@ -159,6 +161,8 @@ QCheckBox::indicator:checked {
     background: rgba(212, 48, 30, 198); border-color: rgba(255, 120, 90, 240);
 }
 QLabel[role="sub"] { color: rgba(242,233,229,99); font-size: 13px; }
+QCheckBox[role="pool"] { font-size: 19px; spacing: 10px; padding: 3px 0; }
+QCheckBox[role="pool"]::indicator { width: 28px; height: 28px; border-radius: 6px; }
 QComboBox QAbstractItemView { background: rgb(42, 18, 14); }
 QComboBox QLineEdit { background: transparent; border: none; padding: 0; }
 QLabel, QCheckBox { background: transparent; }
@@ -1686,6 +1690,71 @@ class PerfMeter(QWidget):
         p.end()
 
 
+class DragSpin(QObject):
+    """Every number box a fader for a finger: press on one and drag up or
+    down, the value follows, the box's whole range over DRAG_PX (300 px)
+    so a short swipe is a nudge and a long one the whole travel. A tap or
+    a sideways drag is left to the box (the caret, the text selection),
+    the drag takes over past a few pixels up or down. One filter on the
+    application, so every spinbox has it, touch or mouse (a finger is a
+    mouse to a widget that takes no touch events)."""
+    DRAG_PX = 300.0                       # the full range over this much travel
+    ARM_PX = 8                            # vertical travel before the drag takes over
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._box = None                  # the spinbox under the finger
+        self._y0 = 0.0
+        self._v0 = 0.0
+        self._armed = False
+
+    @staticmethod
+    def _spin_of(obj):
+        if isinstance(obj, QAbstractSpinBox):
+            return obj
+        if isinstance(obj, QLineEdit) and isinstance(obj.parent(), QAbstractSpinBox):
+            return obj.parent()
+        return None
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            box = self._spin_of(obj)
+            if box is not None and box.isEnabled() and not box.isReadOnly():
+                self._box, self._armed = box, False
+                self._y0 = event.globalPosition().y()
+                self._v0 = float(box.value())
+            return False
+        if self._box is None:
+            return False
+        if t == QEvent.MouseMove:
+            try:
+                dy = self._y0 - event.globalPosition().y()
+            except RuntimeError:
+                self._box = None
+                return False
+            if not self._armed:
+                if abs(dy) < self.ARM_PX:
+                    return False
+                self._armed = True
+                le = self._box.lineEdit() if hasattr(self._box, "lineEdit") else None
+                if le is not None:
+                    le.deselect()
+            box = self._box
+            lo, hi = box.minimum(), box.maximum()
+            v = self._v0 + dy / self.DRAG_PX * (hi - lo)
+            v = max(lo, min(hi, v))
+            if isinstance(box, QDoubleSpinBox):
+                box.setValue(round(v, box.decimals()))
+            else:
+                box.setValue(int(round(v)))
+            return True                    # not a text selection
+        if t == QEvent.MouseButtonRelease:
+            armed, self._box, self._armed = self._armed, None, False
+            return armed
+        return False
+
+
 class HoverTabs(QObject):
     """Switch a QTabWidget's page by hovering its tabs: after `delay` ms on
     one tab it becomes current, no click needed. Install with
@@ -1819,7 +1888,7 @@ class Main(QMainWindow):
         # song's loudness envelope and section map
         self.live = LiveInput(self)
         self.tempo = TapTempo()
-        # Ableton Link: with the General tab's Link button on, the live clock
+        # Ableton Link: with the Settings tab's Link button on, the live clock
         # shares the network session's tempo (gacha_link.py), polled
         self.link = None
         if LINK_AVAILABLE:
@@ -1979,10 +2048,12 @@ class Main(QMainWindow):
         split.addWidget(left_w)
         split.addWidget(right_w)
         left_w.setMinimumWidth(560)      # four-spinbox rows need the room
-        # parameters 60 %, the file lists 40 %; the ratio survives resizes
-        # and follows the handle when it is dragged
+        # the file lists as narrow as they go at launch, the parameters
+        # take the rest; a dragged handle sets a ratio that then survives
+        # resizes
         self.split = split
-        self._split_ratio = 0.70            # the tabs' share of the width at launch
+        self._split_right_min = right_min
+        self._split_ratio = None            # None: the lists at their minimum width
         split.splitterMoved.connect(self._split_dragged)
         self.setStyleSheet(STYLE)
         self.gl_mode = gl_available()
@@ -2020,6 +2091,9 @@ class Main(QMainWindow):
         self._gl_log_timer.start(500)
         self.ui = split
         QApplication.instance().installEventFilter(self)
+        # a finger (or the mouse) dragging up or down on any number box
+        self._drag_spin = DragSpin(self)
+        QApplication.instance().installEventFilter(self._drag_spin)
         # the performer's actions, by id: the keys in KEYMAP and the MIDI
         # bindings both land here. Application shortcuts fire exactly once
         # per press, whatever has focus, even with the interface hidden.
@@ -2331,8 +2405,8 @@ class Main(QMainWindow):
         elif la is not None and la.error:
             parts.append(f"audio not open: {la.error[:50]}")
         # the clock and what the next N would render, then the song-only
-        # structure settings (a live section is always 8 bars, no intro or
-        # outro: those shape a Generate)
+        # structure settings (a live section is always 8 bars; the intro
+        # and outro styles shape the live kinds of those names too)
         bpm = self.tempo.bpm
         bar_s = 4 * 60.0 / bpm
         parts.append(f"clock {bpm:6.1f} bpm  bar {bar_s:.2f} s  beat {bar_s / 4:.3f} s")
@@ -2371,7 +2445,6 @@ class Main(QMainWindow):
         drums, sections = self._tab_drums(), self._tab_sections_layers()
         video = self._tab_video()
         perform = self._tab_perform()
-        tabs.addTab(general, "General")
         tabs.addTab(perform, "Perform")
         tabs.addTab(drums, "Drums")
         tabs.addTab(sections, "Sections")
@@ -2382,6 +2455,7 @@ class Main(QMainWindow):
         tabs.addTab(self._tab_lfo(), "LFO")
         tabs.addTab(self._tab_scenes(), "Scenes")
         tabs.addTab(self._tab_macros(), "Macros")
+        tabs.addTab(general, "Settings")
         tabs.addTab(self._tab_controls(), "Controls")
         tabs.addTab(self._tab_log(), "Log")
         HoverTabs(tabs)                  # hover a tab to open it, no click
@@ -2461,8 +2535,9 @@ class Main(QMainWindow):
     def _apply_split(self):
         w = self.split.width()
         if w > 0:
+            right = self._split_right_min if self._split_ratio is None                 else int(w * (1 - self._split_ratio))
             self.split.blockSignals(True)
-            self.split.setSizes([int(w * self._split_ratio), int(w * (1 - self._split_ratio))])
+            self.split.setSizes([max(0, w - right), right])
             self.split.blockSignals(False)
 
     def resizeEvent(self, event):
@@ -2729,7 +2804,7 @@ class Main(QMainWindow):
         self.midi_metro = QCheckBox("metronome")
         self.midi_metro.setToolTip(
             "A click on every beat, higher and louder on the one, into the mix (the audio "
-            "output open, General tab): on the playing section's own beat grid, through the "
+            "output open, Settings tab): on the playing section's own beat grid, through the "
             "gears and a tape stop, or on the live clock (tap, downbeat, BPM box, Link) with "
             "nothing playing. With the port open every beat also goes out as a note on the "
             "notes' channel, under the same lead as the hits: the one as the first note "
@@ -3963,7 +4038,7 @@ class Main(QMainWindow):
             self.afx_status.setStyleSheet("color: rgba(242,233,229,160); padding: 0 8px;")
         else:
             text = ("racks OFF: the audio stream is not open (no output device, or it "
-                    "could not be opened: see Audio output in the General tab), so songs "
+                    "could not be opened: see Audio output in the Settings tab), so songs "
                     "play through Qt and none of these knobs, volumes or F1-F4 apply.")
             self.afx_status.setStyleSheet("color: rgb(255, 150, 120); padding: 0 8px;")
         self.afx_status.setText(text)
@@ -3997,6 +4072,43 @@ class Main(QMainWindow):
     def _tab_perform(self):
         """The live section engine: what the feet will drive on stage."""
         form = QFormLayout()
+        # the song shapes the live set borrows, at hand: the intro and the
+        # outro style and the drum style, each the Generate / Drums tab's
+        # own box again, the pairs one setting
+        self.perf_intro = QComboBox()
+        self.perf_outro = QComboBox()
+        self.perf_drum_style = QComboBox()
+        for mine, theirs, tip in (
+                (self.perf_intro, self.intro_style,
+                 "How an intro section is shaped (next kind: intro): random picks one of "
+                 "the rest; ambient (textures, "
+                 "the drums now and then), sparse (one voice), build (the voices stack "
+                 "up bar by bar), drums-first (no layers), filtered (a lowpass opens over "
+                 "the 8 bars), reverse-swell (a reversed sample swells into the loop's "
+                 "end, no drums: N on its last bar is the drop), collage (scattered "
+                 "one-shots, no beat). The Generate tab's box, without its none: a live "
+                 "intro always has a shape."),
+                (self.perf_outro, self.outro_style,
+                 "How an outro section ends (next kind: outro): the effect blends in over "
+                 "the last bars of a shorter groove and rings out to silence by bar 8, "
+                 "where the sections stop by themselves; random picks one. The Generate "
+                 "tab's box without its none, with its tail, bars, wet and amount."),
+                (self.perf_drum_style, self.drum_style,
+                 "The drum style the next section is patterned in: the Drums tab's box; "
+                 "random picks one per section (the one playing shows in the meter).")):
+            # the same names but none (a live intro or outro always has a
+            # shape), so the pair is kept by name: the Generate tab on none
+            # leaves this box where it was, and the live render reads this one
+            mine.addItems([t for t in (theirs.itemText(i) for i in range(theirs.count()))
+                           if t != "none"])
+            if mine.findText(theirs.currentText()) >= 0:
+                mine.setCurrentText(theirs.currentText())
+            mine.setToolTip(tip)
+            mine.currentTextChanged.connect(theirs.setCurrentText)
+            theirs.currentTextChanged.connect(
+                lambda t, m=mine: m.setCurrentText(t) if m.findText(t) >= 0 else None)
+        form.addRow("Shapes", self._row([("intro", self.perf_intro), ("outro", self.perf_outro),
+                                         ("drums", self.perf_drum_style)]))
         self.perf_material = QComboBox()
         self.perf_material.addItems(["takes, else ticked samples", "takes only",
                                      "ticked samples"])
@@ -4006,15 +4118,34 @@ class Main(QMainWindow):
             "when there are none. The ticked videos' soundtracks join them "
             "with Video audio on (Video tab), and are the material on their "
             "own when no sample is ticked. Nothing ticked anywhere: nothing.")
+        # as narrow as it goes: the row has three boxes, the list opens full width
+        self.perf_material.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.perf_material.setMinimumContentsLength(9)
+        self.perf_material.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         self.perf_kind = QComboBox()
-        self.perf_kind.addItems(["random"] + list(KINDS))
+        self.perf_kind.addItems(["random"] + list(KINDS) + list(EXTRA_KINDS))
         self.perf_kind.setToolTip(
             "Shape of the next section. groove: full kit, one to three layers, "
             "maybe chops. break: one or two drum voices under more layers. "
-            "build: the voices stack up bar by bar. sparse: one voice, one layer.")
-        form.addRow("Material", self._row([("", self.perf_material), ("next kind", self.perf_kind)]))
-        next_btn = QPushButton("next section (N)")
-        next_btn.setMinimumHeight(30)
+            "build: the voices stack up bar by bar. sparse: one voice, one layer. "
+            "random: one of those four. intro and outro: 8 bars shaped by the intro "
+            "and outro styles above; an outro is entered at bar 5, ends in silence and "
+            "stops the sections on its last bar.")
+        # the live clock's bpm box again (the Sections tab's), the two one value
+        self.perf_bpm = QDoubleSpinBox(minimum=40.0, maximum=240.0, singleStep=1.0,
+                                       decimals=1, suffix=" bpm")
+        self.perf_bpm.setValue(self.live_bpm.value())
+        self.perf_bpm.setToolTip("The live clock's tempo, the bpm box of the Sections tab: "
+                                 "the next section renders at it. Type it or tap it (T).")
+        self.perf_bpm.valueChanged.connect(self.live_bpm.setValue)
+        self.live_bpm.valueChanged.connect(self.perf_bpm.setValue)
+        form.addRow("Material", self._row([("", self.perf_material),
+                                           ("next kind", self.perf_kind),
+                                           ("", self.perf_bpm)]))
+        next_btn = QPushButton("play (N)")     # "next section (N)" once one has played
+        next_btn.setObjectName("next")          # the set's own colour, big type
+        self.perf_next_btn = next_btn
+        next_btn.setMinimumHeight(40)
         next_btn.setToolTip(
             "A new 8-bar section from the material at the live tempo, on the "
             "next bar. One is rendered ahead while the current one loops, so "
@@ -4475,15 +4606,17 @@ class Main(QMainWindow):
                                    "sweep underneath is the loop running on, where letting "
                                    "go lands.")
         form.addRow(self.perf_meter)
+        # the small status line: kept for the code that writes it, not shown;
+        # the meter's big line carries what it said
         self.perf_status = QLabel("no section")
-        self.perf_status.setProperty("role", "sub")
-        self.perf_status.setWordWrap(True)
-        form.addRow("", self.perf_status)
-        hint = QLabel("needs the audio output open (General tab): the section is mixed "
-                      "into that stream. Tempo = the live clock (tap T, or the bpm box).")
-        hint.setProperty("role", "sub")
-        form.addRow("", hint)
-        return self._wrap(form)
+        self.perf_status.hide()
+        # in a scroll area, like the FX tabs: the page is the tallest and
+        # would otherwise set the window's minimum height, which at a high
+        # DPI scale can top the screen's work area and stop the window
+        # from maximizing in one go; at full size it shows whole
+        area = self._scrolling(self._wrap(form))
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return area
 
     def _tab_video(self):
         form = QFormLayout()
@@ -4562,7 +4695,7 @@ class Main(QMainWindow):
         save_btn.setToolTip(
             "Write the takes not yet on disk to videos/takes_<date>/ now, in the "
             "background (the encode can glitch the live sound: between pieces). "
-            "With 'keep the takes' ticked in General they are written when the "
+            "With 'keep the takes' ticked in Settings they are written when the "
             "app quits anyway.")
         save_btn.clicked.connect(self._save_takes)
         clear_btn = QPushButton("clear (Ctrl+Shift+R)")
@@ -4585,7 +4718,7 @@ class Main(QMainWindow):
             "first), the root note from a running chroma for the tint. Needs "
             "about 4 s of music. Tapping T switches this off and follows "
             "your taps instead; X marks a drop by hand and restarts the bar. "
-            "With Ableton Link on (General tab) the tempo is the session's "
+            "With Ableton Link on (Settings tab) the tempo is the session's "
             "and only the root note is taken from the audio.")
         self.live_status = QLabel("")
         self.live_status.setProperty("role", "sub")
@@ -5470,6 +5603,7 @@ class Main(QMainWindow):
         self.vfx_on = {}
         for key, label, _d, tip in VIDEO_EFFECTS:
             cb = QCheckBox(label)
+            cb.setProperty("role", "pool")           # big: ticked by a finger on stage
             cb.setToolTip(tip)
             cb.setChecked(key in fx_on)              # all off until ticked
             cb.toggled.connect(lambda on, key=key: self._vfx_on_changed(key, on))
@@ -5478,6 +5612,7 @@ class Main(QMainWindow):
         self.shader_on = {}
         for p in shader_files():
             cb = QCheckBox(p.stem)
+            cb.setProperty("role", "pool")
             cb.setToolTip(f"{p.name}: in the pool the random choice, Space, the digit "
                           "keys and the shader knob draw from")
             cb.setChecked(p.stem not in sh_off)
@@ -5496,14 +5631,14 @@ class Main(QMainWindow):
         form.addRow("", hint)
         for key, cb in self.vfx_on.items():
             self.vfx[key].setEnabled(cb.isChecked())
-        return self._wrap(form)
+        return self._scrolling(self._wrap(form))     # the big ticks may outgrow the pane
 
     def _pool_box(self, boxes):
         """A grid of tick boxes, seven per column, with all / none below."""
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(2)
+        grid.setHorizontalSpacing(24)
+        grid.setVerticalSpacing(4)
         for i, cb in enumerate(boxes.values()):
             grid.addWidget(cb, i % 7, i // 7)
         row = QHBoxLayout()
@@ -5751,7 +5886,7 @@ class Main(QMainWindow):
             pass
 
     def _live_io_rows(self, form):
-        """The live I/O, below the song parameters in the General tab: the app's audio output
+        """The live I/O, below the song parameters in the Settings tab: the app's audio output
         (the stream every sound goes through), the live input, the video
         input and the audio analysis."""
         self.through_on = QCheckBox("live input: plays through its rack to the "
@@ -5943,12 +6078,9 @@ class Main(QMainWindow):
 
     def _tab_general(self):
         form = QFormLayout()
-        self.count = QSpinBox(minimum=1, maximum=50, value=1)
-        form.addRow("Number of songs", self.count)
-
         self.duration = QSpinBox(minimum=10, maximum=600, value=180,
                                  suffix=" s")
-        form.addRow("Duration", self.duration)
+        form.addRow("Song duration", self.duration)
 
         self._live_clock_rows(form)
 
@@ -5970,7 +6102,40 @@ class Main(QMainWindow):
         gap.setFixedHeight(10)                  # a breath before the live I/O rows
         form.addRow("", gap)
         self._live_io_rows(form)
+        # every remembered value forgotten, after a yes: the app restarts
+        # with its defaults (the files, takes, renders and plugins stay)
+        reset_btn = QPushButton("forget every saved setting...")
+        reset_btn.setObjectName("small")
+        reset_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        reset_btn.setToolTip("Every value Gacha remembers between launches (ports, the MIDI "
+                             "map, the knobs, the pools, the scenes, the macros, the M:C "
+                             "tab, the window) is forgotten and the app restarts with its "
+                             "defaults; asks first. Samples, videos, takes, renders and "
+                             "plugins on disk are untouched.")
+        reset_btn.clicked.connect(self._reset_settings)
+        gap2 = QWidget()
+        gap2.setFixedHeight(10)
+        form.addRow("", gap2)
+        form.addRow("", reset_btn)
         return self._wrap(form)
+
+    def _reset_settings(self):
+        """A confirmation, then every setting cleared on the way out and the
+        app started again (closing writes settings, so the wipe is last)."""
+        ask = QMessageBox(self)
+        ask.setWindowTitle("Forget every saved setting?")
+        ask.setIcon(QMessageBox.Warning)
+        ask.setText("Forget every saved setting and restart Gacha with its defaults?")
+        ask.setInformativeText("Ports, the MIDI map, every knob and tick, the pools, the "
+                               "scenes, the macros, the M:C tab and the window are forgotten. "
+                               "Files on disk (samples, videos, takes, renders, plugins) stay.")
+        ask.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        ask.setDefaultButton(QMessageBox.Cancel)
+        if ask.exec() != QMessageBox.Yes:
+            return
+        self._wipe_settings = True
+        self.log.appendPlainText("settings: forgotten on the way out, restarting")
+        self.close()
 
     def _live_clock_rows(self, form):
         """The one BPM: the live clock. It runs the visuals, the racks' delays
@@ -6162,7 +6327,7 @@ class Main(QMainWindow):
     def _tab_sections(self):
         form = QFormLayout()
         self.intro_style = QComboBox()
-        self.intro_style.addItems(["ambient", "sparse", "none", "build",
+        self.intro_style.addItems(["random", "ambient", "sparse", "none", "build",
                                    "drums-first", "reverse-swell", "collage",
                                    "filtered"])
         form.addRow("Intro style", self.intro_style)
@@ -6676,7 +6841,9 @@ class Main(QMainWindow):
         return {"pan_drums": min(1.0, abs(self.pan_drums.value())),
                 "pan_layers": min(1.0, abs(self.pan_layers.value())),
                 "pan_events": min(1.0, abs(self.pan_events.value())),
-                "drum_style": self.drum_style.currentText()}
+                "drum_style": self.drum_style.currentText(),
+                "intro_style": self.perf_intro.currentText(),      # the Perform tab's copies:
+                "outro_style": self.perf_outro.currentText()}      # never none
 
     def generate(self):
         self._show_log()                        # watch the render as it goes
@@ -6699,7 +6866,7 @@ class Main(QMainWindow):
                     "videos have no audio track. Tick samples in the Samples tab, "
                     "or tick a video with sound in the Videos tab")
                 return
-        job = {"count": self.count.value(),
+        job = {"count": 1,                      # one song a Generate
                "duration": self.duration.value(),
                "samples": samples,
                "video_audio": video_audio,
@@ -7161,7 +7328,7 @@ class Main(QMainWindow):
         """N: the next section, on the bar. Uses the pre-rendered one when it
         matches the material, kind and tempo; else renders and plays when done."""
         if self.through is None or not self.through.running:
-            self.log.appendPlainText("perform: the audio output is not open (General tab)")
+            self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
             return
         key = self._perf_key()
         if key[0] is None:
@@ -7183,9 +7350,13 @@ class Main(QMainWindow):
         if not pl.playing:                  # from silence: a new song for the picture too,
             self._pick_song_video()         # a ticked video instead of whatever was on
             self._live_switch_t = time.monotonic()
-        pl.queue(stems, sec.events, sec.bpm, sec.bars, bar_t0)
+        # an outro is entered at its second half: four bars of groove into
+        # the ending effect and the ring-out, then the stop
+        start_bar = sec.bars // 2 if sec.kind == "outro" else 0
+        pl.queue(stems, sec.events, sec.bpm, sec.bars, bar_t0, start_bar)
         self._perf_playing = sec
         self._perf_current = (sec, stems, self.through.sr)   # what a start brings back
+        self.perf_next_btn.setText("next section (N)")       # from here on N moves on
         wait = "" if bar_t0 is None or bar_t0 <= time.monotonic() \
             else f", on the Link bar in {bar_t0 - time.monotonic():.1f} s"
         self.log.appendPlainText(f"section: {sec.kind} {sec.bpm:.0f} bpm, "
@@ -7233,7 +7404,7 @@ class Main(QMainWindow):
         last (stopped by Shift+N or a Link peer), nothing new is rendered.
         Nothing to bring back: says so and waits for N."""
         if self.through is None or not self.through.running:
-            self.log.appendPlainText("perform: the audio output is not open (General tab)")
+            self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
             return False
         pl = self.through.player
         if pl.playing or pl.pending is not None:
@@ -7250,7 +7421,7 @@ class Main(QMainWindow):
     def perform_event(self):
         """E: a one-shot from the material, on the quantize grid."""
         if self.through is None or not self.through.running:
-            self.log.appendPlainText("perform: the audio output is not open (General tab)")
+            self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
             return
         key = self._perf_key()
         if key[0] is None:
@@ -7261,7 +7432,7 @@ class Main(QMainWindow):
         """G / Shift+G: a break of `kind` on the 4-bar phrase's last bar, then
         the next section on the one (the pre-rendered one when it fits)."""
         if self.through is None or not self.through.running:
-            self.log.appendPlainText("perform: the audio output is not open (General tab)")
+            self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
             return
         pl = self.through.player
         if pl.playing and not pl.filling:
@@ -7279,7 +7450,7 @@ class Main(QMainWindow):
         quantize grid, over the tape; the frame it was cut from takes the
         picture while it sounds."""
         if self.through is None or not self.through.running:
-            self.log.appendPlainText("perform: the audio output is not open (General tab)")
+            self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
             return
         key = self._perf_key()
         if key[0] is None:
@@ -7385,7 +7556,9 @@ class Main(QMainWindow):
             pl.set_repeat(dict(REPEAT_DIVS).get(self.rep_div.currentText(), 1.0),
                           self.rep_pos.value(), self.rep_rev.isChecked())
         else:
-            pl.clear_repeat()
+            # let go on the next bar, so the cells roll out in time (at
+            # once with the quantize grid off)
+            pl.clear_repeat(1.0 if la.quant > 0 else 0.0)
 
     def _rep_div_changed(self, name):
         self.settings.setValue("perform/rep_div", name)
@@ -7863,7 +8036,16 @@ class Main(QMainWindow):
             self.perf_status.setText(
                 f"playing {sec.kind}{root} {pl.bpm:.0f} bpm{spd}  ·  bar {bar}/{pl.bars}"
                 f"  ·  {ready}")
-            big = f"{sec.kind}{root}  ·  {pl.bpm:.0f} bpm{spd}"
+            kind = sec.kind + (f" {sec.style}" if getattr(sec, "style", None) else "")
+            big = f"{kind}{root}  ·  {pl.bpm:.0f} bpm{spd}"
+            if getattr(sec, "drum_style", None):
+                big += f"  ·  {sec.drum_style}"
+            if ready:
+                big += f"  ·  {ready}"
+            # an outro: silent by its last bar, the sections stop there
+            if sec.kind == "outro" and bar >= pl.bars and pl.pending is None:
+                self.perform_stop()                    # _perf_playing is None from here
+                big = f"{kind}{root}  ·  ending"
         win = pl.repeat_window()
         if win is not None:                            # the window, in bars
             bar_frames = 4 * pl.beat_frames
@@ -7898,6 +8080,8 @@ class Main(QMainWindow):
         """Frame of the take the loudest-priority event sounding at `pos`
         (seconds into the loop) was cut from, or None (no video in it)."""
         sec = self._perf_playing
+        if sec is None:                              # gone in this very tick (an outro's end)
+            return None
         takes = {t.name: t for t in self.takes.takes}
         order = {"kick": 0, "snare": 0, "hihat": 0, "ohat": 0, "ride": 0, "glitch": 0,
                  "chop": 1, "oneshot": 1, "texture": 2}
@@ -8018,7 +8202,7 @@ class Main(QMainWindow):
 
     def _flush_takes(self):
         """Quit: the takes still only in RAM are encoded now (the MJPEG mov by
-        ffmpeg, on the archive worker) when the General tab says to keep
+        ffmpeg, on the archive worker) when the Settings tab says to keep
         them, a progress window counting them down; cancel quits without
         the rest. This is what keeps the encode out of the show."""
         todo = self.takes.unsaved() if self.keep_takes.isChecked() else []
@@ -8324,9 +8508,10 @@ class Main(QMainWindow):
 
     def _show_live_bpm(self):
         """The bpm box shows the clock, without that counting as an edit."""
-        self.live_bpm.blockSignals(True)
-        self.live_bpm.setValue(self.tempo.bpm)
-        self.live_bpm.blockSignals(False)
+        for box in (self.live_bpm, self.perf_bpm):
+            box.blockSignals(True)
+            box.setValue(self.tempo.bpm)
+            box.blockSignals(False)
 
     def tap_tempo(self):
         """T: one tap on the beat. The first tap of a series is the downbeat,
@@ -8360,7 +8545,7 @@ class Main(QMainWindow):
         self.log.appendPlainText(f"link: {'play' if on else 'stop'} sent to the session")
 
     def _link_toggled(self, on):
-        """The General tab's Link button: join or leave the Link session. Alone
+        """The Settings tab's Link button: join or leave the Link session. Alone
         our tempo is the session's; joining peers, theirs comes in (Link's
         rule: the session that is already there wins) and shows in the bpm
         box within a poll."""
@@ -8768,6 +8953,9 @@ class Main(QMainWindow):
         v = {k: (sp.value() if self.vfx_on[k].isChecked() else 0.0)
              for k, sp in self.vfx.items()}
         idx, sec, kind = 0, None, "groove"
+        if self._perf_playing is not None and getattr(self._perf_playing, "kind", "") \
+                in EXTRA_KINDS:
+            kind = self._perf_playing.kind              # the shaders' iSection: intro, outro
         sec_start_ms = 0
         if live or idle:
             # no section map: every 8 bars count as a section, so the look,
@@ -9037,7 +9225,7 @@ class Main(QMainWindow):
         if state == QMediaPlayer.PlayingState and not self.player.streaming \
                 and any(sp.value() != (1.0 if k == "vol" else 0.0) for (_c, k), sp in self.afx.items()):
             self.log.appendPlainText("audio fx: the song plays through Qt, the racks do not "
-                                     "apply; the audio output is not open (General tab)")
+                                     "apply; the audio output is not open (Settings tab)")
         if state == QMediaPlayer.PlayingState and self.auto_hide.isChecked():
             self._hide_ui()                 # straight away when a song starts
         else:
@@ -9181,6 +9369,16 @@ class Main(QMainWindow):
         if getattr(self, "fetch_worker", None) is not None:
             self.fetch_worker.stop()
         event.accept()
+        if getattr(self, "_wipe_settings", False):
+            # once the event loop is done: the timers that write settings
+            # (the port scans, the audio status) have fired their last by then
+            QApplication.instance().aboutToQuit.connect(self._wipe_and_restart)
+
+    def _wipe_and_restart(self):
+        self.settings.clear()
+        self.settings.sync()
+        subprocess.Popen([sys.executable, *sys.argv], cwd=str(Path.cwd()),
+                         close_fds=True)                  # a fresh Gacha with the defaults
 
 
 if __name__ == "__main__":

@@ -87,16 +87,20 @@ class Freeze:
         behind the frozen spot of the grain's far edge, its length in
         seconds, its phase 0..1, backwards), the level, and the share."""
         heads = []
-        G = len(self.g_len)
+        # the audio thread replaces these arrays one by one as grains die:
+        # read one snapshot of each and no further than the shortest
+        g_len, g_age, g_ratio = self.g_len, self.g_age, self.g_ratio
+        g_rev, g_start = self.g_rev, self.g_start
+        G = min(len(g_len), len(g_age), len(g_ratio), len(g_rev), len(g_start))
         if G:
             sr = self.sr
-            order = np.argsort(self.g_age)[:16]
+            order = np.argsort(g_age[:G])[:16]
             for i in order:
-                n, r, rev = int(self.g_len[i]), float(self.g_ratio[i]), bool(self.g_rev[i])
+                n, r, rev = int(g_len[i]), float(g_ratio[i]), bool(g_rev[i])
                 span = n * r
-                left = self.g_start[i] - span if rev else self.g_start[i]
+                left = g_start[i] - span if rev else g_start[i]
                 heads.append((float((self._written - left) / sr), n / sr,
-                              float(min(1.0, max(0.0, self.g_age[i] / n))), rev))
+                              float(min(1.0, max(0.0, g_age[i] / max(1, n)))), rev))
         return {"grains": G, "heads": heads, "level": min(1.0, self.level),
                 "env": self._env}
 

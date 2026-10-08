@@ -275,8 +275,12 @@ class SectionPlayer:
     some cells earlier or later round the loop, forwards or backwards. The
     transport runs on underneath, so the bar, the clock and a queued
     section are untouched and letting go lands where the loop would have
-    been; the cell edges sit on the bar's own grid, so a change of division
-    or offset is in time at once. A break wins over it; a stop ends it.
+    been: at once, or, `clear_repeat(quant)` given a fraction of a bar, on
+    the transport's next line of that grid (the bar, from the GUI), the
+    cells rolling on until then; a press again before it keeps the hold
+    and its anchor. The cell edges sit on the bar's own grid, so a change
+    of division or offset is in time at once. A break wins over it; a stop
+    ends it.
     `heard_s()` and `repeat_state()` tell the picture what sounds.
 
     The speed, three layers over the transport, set from the GUI:
@@ -362,6 +366,7 @@ class SectionPlayer:
         # a loop frame) and what is heard belong to the audio thread
         self.repeat = None
         self._rep_anchor = None
+        self._rep_release = None             # a let-go waiting for the grid: its fraction of a bar
         self._heard = None                   # loop frame sounding at the block's end, or None
         self._rep_info = (0, 0.0)            # (cell count, 0..1 into the cell)
         self._resume = False                 # fade the transport back in after a repeat
@@ -428,10 +433,16 @@ class SectionPlayer:
         the anchor stays. See the class note. No-op with no section."""
         if self.playing:
             self.repeat = (float(div), int(offset), bool(rev))
+            self._rep_release = None         # held again before a let-go landed: it stays
 
-    def clear_repeat(self):
-        """Let go: the transport, which ran on underneath, is heard again."""
-        self.repeat = None
+    def clear_repeat(self, quant=0.0):
+        """Let go: the transport, which ran on underneath, is heard again,
+        at once, or with `quant` (a fraction of a bar, 1.0 the bar) on the
+        transport's next line of that grid, the cells rolling until then."""
+        if quant > 0 and self.repeat is not None and self.playing:
+            self._rep_release = float(quant)
+        else:
+            self.repeat, self._rep_release = None, None
 
     # ---- the speed (GUI thread)
     def set_rate(self, r):
@@ -877,12 +888,15 @@ class SectionPlayer:
                       "covered": 0, "after": 0}     # the MIDI out's window, see _fill_hits
         self.fill_armed = None
 
-    def queue(self, stems, events, bpm, bars, bar_t0=None):
+    def queue(self, stems, events, bpm, bars, bar_t0=None, start_bar=0):
         """The next section: on the loop's next bar while one plays, else
         from the next block, or, `bar_t0` given (monotonic seconds, the
         Link session's bar), exactly then: silence up to it inside the
-        block, or, when it has just passed, the loop entered that far in."""
-        self.pending = (stems, events, bpm, bars, bar_t0, drum_table(events, self.sr))
+        block, or, when it has just passed, the loop entered that far in.
+        `start_bar`: the loop entered that many bars in (an outro, from
+        its second half)."""
+        self.pending = (stems, events, bpm, bars, bar_t0, drum_table(events, self.sr),
+                        int(start_bar))
         self._pend_covered = 0
 
     def waiting_for(self):
@@ -930,12 +944,13 @@ class SectionPlayer:
             self.stems, self.events, self.n, self.pos = None, [], 0, 0
             self._ev = None
             self.repeat, self._rep_anchor, self._heard = None, None, None
+            self._rep_release = None
             self._brake, self._tfrac, self._hcov = None, 0.0, None
             self._head_mode, self._head_rate = None, 1.0
             self._ola, self._ola_on = {}, False
             self.frag.voices = []
             return
-        stems, events, bpm, bars, bar_t0, table = p
+        stems, events, bpm, bars, bar_t0, table, start_bar = p
         self._tfrac, self._hcov = 0.0, None
         self.frag.voices = []
         from_silence = self.stems is None
@@ -943,14 +958,16 @@ class SectionPlayer:
         self._ev = table
         self._covered, self._pend_covered = self._pend_covered, 0
         self.n = next(iter(stems.values())).shape[1]
-        self.pos, self._lead = 0, 0
         self.beat_frames = int(round(60.0 / bpm * self.sr))
-        self.loop_t0 = time.monotonic() if now is None else now
+        start = (start_bar * 4 * self.beat_frames) % max(1, self.n)   # entered this far in
+        self.pos, self._lead = start, 0
+        self._covered = start
+        self.loop_t0 = (time.monotonic() if now is None else now) - start / self.sr
         if bar_t0 is not None and from_silence and now is not None:
             if bar_t0 > now:                          # inside this block: silence first
                 self._lead = min(bs, int(round((bar_t0 - now) * self.sr)))
             else:                                     # the bar just passed: enter late
-                self.pos = int((now - bar_t0) * self.sr) % self.n
+                self.pos = (start + int((now - bar_t0) * self.sr)) % self.n
                 self._covered = self.pos
             self.loop_t0 = now + (self._lead - self.pos) / self.sr
         if from_silence:
@@ -1072,6 +1089,14 @@ class SectionPlayer:
                 self.speed = self._speed_req[0]       # a gear lands on the grid
                 self._speed_req = None
             rep = self.repeat
+            if rep is not None and self._rep_release is not None:
+                # a let-go waiting for the grid: the transport's next line
+                # of it at or past this block's start ends the hold here
+                # (a block early at the most, a few ms)
+                step = max(1, int(round(bar_f * self._rep_release)))
+                g = -(-i0 // step) * step
+                if g < i0 + max(1, m) or (self.n and i0 + m >= self.n):
+                    self.repeat, self._rep_release, rep = None, None, None
             tj = i0 + f0 + np.arange(n_out) * r       # the transport under each output frame
             H, gain = self._head(tj, r)
             P = tj if H is None else H

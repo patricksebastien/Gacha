@@ -387,6 +387,8 @@ def random_window(rng, clip, need, enabled):
 # dry, the effect ramps in over the last bars, then rings out into an
 # appended tail that ends in true silence.
 
+INTRO_STYLES = ["ambient", "sparse", "build", "drums-first", "reverse-swell", "collage",
+                "filtered"]            # what "random" picks from ("none" is no intro)
 OUTRO_STYLES = ["hall_wash", "dub_echo", "tape_stop", "filter_close",
                 "shimmer_freeze", "bitcrush_collapse", "codec_rot",
                 "glitch_stutter", "overdrive_bloom", "smear"]
@@ -1214,6 +1216,8 @@ def compose(seed, duration, sample_files, intro_bars=None,
     if intro_bars is not None and intro_bars < 1:   # 0 bars = no intro at all
         intro_bars, intro_style = None, "none"
     rng = random.Random(seed)
+    if intro_style == "random":
+        intro_style = rng.choice(INTRO_STYLES)
     bank = load_samples(sample_files)
     if not bank:
         sys.exit("No samples could be loaded")
