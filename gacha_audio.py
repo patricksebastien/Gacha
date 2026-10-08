@@ -115,6 +115,8 @@ except (ImportError, OSError) as e:        # no package, or no libportaudio
     SD_ERROR = str(e)
 
 from gacha_frag import Fragments
+from gacha_freeze import Freeze
+from gacha_metro import Metronome, VEL as METRO_VEL
 from gacha_fx import ALL_CHANNELS, Rack, STEM_CHANNELS, VOICES
 from gacha_midi import DRUM_NOTES, DRUM_ROLES
 
@@ -1390,6 +1392,8 @@ class LiveAudio:
         self._sw_wait = []                   # ...and waiting for the grid (audio thread)
         self._aud_before = frozenset()
         self._limiter = Limiter(threshold_db=-1.0, release_ms=100.0)
+        self.freeze = Freeze(self.sr)        # the master freeze (gacha_freeze): .held from any thread
+        self.metro = Metronome(self.sr)      # the metronome (gacha_metro): .on, .note, .anchor, .beat_s
         self.inserts = None                  # gacha_vst.InsertChain on the master, or None
         # the drum hits as MIDI notes (see the module note): a gacha_midi.MidiOut
         self.midi_out = None
@@ -1967,8 +1971,9 @@ class LiveAudio:
             ch, notes = int(self.midi_channel), self.midi_notes
             chans = self.midi_channels or {}
             w = float(np.sqrt(ab))                            # the section under the pedal
+            frozen = self.freeze.active                       # the hits pause under the freeze
             for hits, scale in ((self.player.hits, w), (self.song.hits, 1.0)):
-                if scale < 0.05:
+                if scale < 0.05 or frozen:
                     continue
                 for off, role, vel in hits:
                     aud = aud_after if sw_off is None or off >= sw_off else aud_before
@@ -2026,6 +2031,33 @@ class LiveAudio:
             elif not on:
                 continue
             y = y + blk
+        # the freeze (gacha_freeze): the whole mix held on the instant of the
+        # press, the live mix crossfaded out under the cloud and back on the
+        # let-go; a ring write while idle, out of the round-trip test
+        if pg is None:
+            y = self.freeze.process(y)
+        # the metronome (gacha_metro): the beats of this block on the
+        # section's grid or the live clock's, a click into the mix and a
+        # note per beat on the MIDI out under the hits' lead (one note for
+        # the one, another for the rest), out of the round-trip test
+        mt = self.metro
+        pl = self.player
+        bf = pl.beat_frames
+        grid = ((pl.grid_i0, bf, pl.rate, pl.grid_lead)
+                if pl.playing and bf and pl.grid_i0 is not None else None)
+        beats = mt.block(bs, grid, now, L)
+        if beats and midi and (mt.note >= 0 or mt.note_one >= 0):
+            base = t_block + out_lat - lead_s + L / sr
+            gate = self.midi_gate_ms / 1000.0
+            for off, acc in beats:
+                note = mt.note_one if acc else mt.note
+                if note < 0:
+                    continue
+                mo.note(int(self.midi_channel), int(note), METRO_VEL[1 if acc else 0],
+                        base + off / sr, gate)
+                self.midi_sent += 1
+        if pg is None:
+            mt.render(y)
         # master inserts (VST3 plugins): after the racks, before the gain and
         # the limiter, kept out of the round-trip test so its burst stays clean;
         # nothing at all is done here while no plugin is loaded

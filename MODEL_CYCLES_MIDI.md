@@ -83,6 +83,15 @@ Track parameters:
 
 Playback: Punch CC 66, Gate CC 67 (on/off toggles, p-lockable).
 
+Retrig: none. The RETRIG key (chapter 9.6: rate 1/1..1/80, length, fade,
+always-on, per track, stored in the pattern) has no CC, no NRPN and no
+note message; the box retrigs only from its own pads and [TRIG] keys.
+From outside, a retrig is just the note sent again at the rate (Gacha's
+M:C tab does that, with the box's velocity curve).
+
+Velocity modulation (Appendix B, the PAD menu's VDEP/DST): what a note's
+velocity shapes, pitch to LFO depth; set on the box, not over CC.
+
 LFO (per track): Speed 102 (-64..63, 64 = 0, negative runs backwards),
 Multiplier 103 (x1..x2k tempo-synced or fixed 120 BPM set), Fade 104
 (-64..63), Destination 105 (Appendix B list: pitch, fine tune, decay,
@@ -179,16 +188,33 @@ Already there in `gacha_midi.py` and `gacha.py`:
   section clears on its bar. Box side: SYNC > CLK IN on. Clock in (the box
   as master) is still open.
 
+* **CC out and the M:C tab (done 2026-10-07).** `MidiOut.cc(channel, cc,
+  value, force)` on the same port and thread: CCs gathered for 2 ms and
+  sent together, one value per controller, a repeat of the last value
+  dropped (force sends it), at most one value per controller every 10 ms
+  (`CC_MIN_S`) so an LFO on a knob cannot drown the notes on the DIN wire.
+  The tables (`CYCLES_PARAMS`, `CYCLES_FX_PARAMS`, the menus, the retrig
+  lists) and `cycles_cc_value()` in `gacha_midi.py`; the tab in `gacha.py`
+  (`_tab_cycles`): a cell per parameter per track on channels 1..6, the
+  FX pair on the FX channel box, all of them MIDI-learnable, LFO and macro
+  destinations, and the "mc" scene group. Menus go out as the menu index,
+  the mute as 0/127: to verify by ear, like the AUTO channel default.
+* **Retrig from here (done 2026-10-07).** `MidiOut.retrig_start(channel,
+  note, velocity, period_s, length_s, fade)` / `retrig_stop(channel)`: the
+  note again every period from the sender thread, the velocity curve as
+  the box's FDE and LEN; a hold button per track on the tab, held from a
+  MIDI note or CC. Sent as plain notes, so the box needs RCV NOTE only.
+
 Not there yet, in rough order of payoff:
 
 1. **Clock and transport in.** MidiIn drops 0xF8/0xFA/0xFC; the box as
    master would need a tempo estimate from the ticks into the live clock.
    One direction only, never both.
-2. **CC out.** A generic `MidiOut.cc(channel, cc, value, due)` opens
-   everything in section 3: mutes per track (CC 94 on channel 1..6) tied
-   to the F-keys or the A/B pedal, machine swaps (CC 70), pitch/decay/
-   color from the grade or the LFO, delay and reverb sends under the
-   pedal. Mind the pitch slew.
+2. **CC out, the next layer.** The tab's cells are knobs, so the mutes
+   under the F-keys, the sends under the A/B pedal, a reroll of color /
+   shape / sweep / contour at a section start are a macro, an LFO or a
+   scene away; what is missing is the automatic part (reroll per section,
+   the pedal as a crossfader into FM). Mind the pitch slew.
 3. **Program change out.** `MidiOut.pc(channel, program)` when a section
    starts, so the box's pattern follows Gacha's sections; it lands at the
    end of the box's current pattern, so send it a pattern early or keep

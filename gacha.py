@@ -35,7 +35,7 @@ from PySide6.QtCore import QRegularExpression
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PySide6.QtWidgets import (
     QFileDialog, QFrame,
-    QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+    QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QCompleter, QDoubleSpinBox,
     QFormLayout, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QPlainTextEdit, QProgressBar, QProgressDialog, QPushButton, QSlider, QSpinBox,
@@ -60,9 +60,12 @@ import threading
 from gacha_video import VideoSource, video_has_audio, video_input_modes, video_inputs
 from gacha_fetch import (INSTALL_HINT as FETCH_INSTALL_HINT, FetchWorker,
                          fetch_available, looks_like_url)
-from gacha_midi import (CYCLES_CHANNELS, CYCLES_ROOT, DRUM_LABELS, DRUM_NOTES, DRUM_ROLES,
-                        MIDI_AVAILABLE, MidiIn, MidiOut, format_binding, midi_inputs,
-                        midi_outputs, parse_binding)
+from gacha_midi import (CYCLES_CHANNELS, CYCLES_FX_PARAMS, CYCLES_LISTS, CYCLES_PARAMS,
+                        CYCLES_RANGES, CYCLES_RETRIG_LENS, CYCLES_RETRIG_RATES, CYCLES_ROOT,
+                        DRUM_LABELS, DRUM_NOTES, DRUM_ROLES, MIDI_AVAILABLE, MidiIn, MidiOut,
+                        cycles_cc_value, format_binding, midi_inputs, midi_outputs,
+                        parse_binding)
+from gacha_freeze import FREEZE
 from gacha_frag import (FRAG_DIRS, FRAG_DIVS, FRAG_PLAYS, FRAG_RATES, FRAG_UNITS, FRAGMENTS,
                         MAX_VOICES)
 from gacha_fx import (ALL_CHANNELS, AUDIO_FX, BIPOLAR, CHANNELS, REV_TIMES, REVERSE,
@@ -157,6 +160,7 @@ QCheckBox::indicator:checked {
 }
 QLabel[role="sub"] { color: rgba(242,233,229,99); font-size: 13px; }
 QComboBox QAbstractItemView { background: rgb(42, 18, 14); }
+QComboBox QLineEdit { background: transparent; border: none; padding: 0; }
 QLabel, QCheckBox { background: transparent; }
 QSplitter::handle { background: transparent; }
 """
@@ -362,7 +366,9 @@ KEYMAP += [("section", "burst", "B", "burst: a slice of the material from a rand
 KEYMAP += [("show", "video_second", "W", "second video input (the webcam) on the B side "
                                          "of the pedal, in place of the take frames, off/on")]
 # the drum hits as MIDI notes to another program (the Controls tab's MIDI out panel)
-KEYMAP += [("section", "midi_out", "", "MIDI out: the drum hits of the section and the "
+KEYMAP += [("section", "metronome", "", "metronome off/on: a click on every beat into the "
+                                        "mix, and a note per beat on the MIDI out port"),
+           ("section", "midi_out", "", "MIDI out: the drum hits of the section and the "
                                        "song as notes to the chosen port, off/on")]
 # the whole picture off: no decoding, no effects, no GPU, for a sound-only night
 KEYMAP += [("show", "video_off", "V", "video off: no picture, no decoding, no GPU work "
@@ -415,6 +421,18 @@ KEYMAP += [("section", "repeat", "H", "repeat (hold): the cell of the bar playin
                                            "up to the transport, which ran on"),
            ("section", "brake_len", "", "tape stop length as a knob: 1/4 bar at the bottom, "
                                         "4 bars at the top"),
+           ("section", "freeze", "Z", "freeze, held: the whole mix (tape, section, song) held "
+                                      "on the instant of the press as a drone of grains, the "
+                                      "picture on its frame; let go, the mix comes back where "
+                                      "it is"),
+           ("section", "freeze_size", "", "freeze grain size, 20 to 250 ms"),
+           ("section", "freeze_smear", "", "freeze smear, 0 to 100 %: a jitter round the frozen "
+                                           "spot, detune and stereo spray; past half, octave "
+                                           "and fifth scatter and reversed grains"),
+           ("section", "freeze_pitch", "", "freeze pitch as a knob: -24 semitones at the "
+                                           "bottom, +24 at the top"),
+           ("section", "freeze_a", "", "freeze attack, 1 ms to 2 s: the mix out, the drone in"),
+           ("section", "freeze_r", "", "freeze release, 1 ms to 4 s: the drone out, the mix back"),
            ("section", "nudge_down", "J", "nudge down, held: the section a few percent slower "
                                           "and the clock with it, to line up with something "
                                           "on its own clock (not under Link)"),
@@ -480,22 +498,60 @@ KEYMAP += [("scene", "scene_morph", "", "scene morph off/on: a load glides the k
 KEYMAP += [("macro", f"macro_{_n}", "", f"macro {_n}, 0 to 100 %: every knob it points at "
                                         "(Macros tab) follows through its own range")
            for _n in range(1, MACRO_SLOTS + 1)]
+# the Model:Cycles tab (gacha_midi.CYCLES_PARAMS): a knob per parameter per
+# track of the box and a retrig hold, the same set again for the focused
+# track with six focus buttons, the box's delay and reverb, the retrig's
+# settings. The tracks are the box's six, on MIDI channels 1 to 6, each the
+# drum the MIDI out's Model:Cycles tick sends there
+MC_TRACKS = tuple(range(1, 7))
+MC_ROLE = {ch: role for role, ch in CYCLES_CHANNELS.items()}
+MC_PARAM = {key: (cc, label, kind, default, what)
+            for key, cc, label, kind, default, what in CYCLES_PARAMS + CYCLES_FX_PARAMS}
+MC_RETRIG_KNOBS = ("mc_retrig_rate", "mc_retrig_len", "mc_retrig_fade", "mc_retrig_vel")
+for _t in MC_TRACKS:
+    KEYMAP += [(f"mc_{_t}", f"mc_{_t}_{key}", "", f"track {_t} {label}: {what}")
+               for key, _cc, label, _kind, _d, what in CYCLES_PARAMS]
+    KEYMAP += [(f"mc_{_t}", f"mc_retrig_{_t}", "",
+                f"track {_t} retrig (hold): the track's note again at the retrig rate "
+                "while held, the velocity fading as set (the box's own retrig has no CC)")]
+KEYMAP += [("mc_focus", f"mc_focus_{_t}", "", f"focus track {_t} for the knobs below")
+           for _t in MC_TRACKS]
+KEYMAP += [("mc_focus", f"mc_{key}", "", f"{label} of the focused track: {what}")
+           for key, _cc, label, _kind, _d, what in CYCLES_PARAMS]
+KEYMAP += [("mc_fx", f"mc_fx_{key}", "", f"{label}: {what}")
+           for key, _cc, label, _kind, _d, what in CYCLES_FX_PARAMS]
+KEYMAP += [("mc_retrig", "mc_retrig_rate", "", "retrig rate, as a knob: a note every bar at "
+                                                "the bottom up to every 1/80 of it"),
+           ("mc_retrig", "mc_retrig_len", "", "retrig length, as a knob: the velocity curve "
+                                               "over 1/8 of a step at the bottom up to 16 "
+                                               "steps, flat (infinite) at the top"),
+           ("mc_retrig", "mc_retrig_fade", "", "retrig fade, -128 to 127: negative fades the "
+                                                "velocity out over the length, positive in"),
+           ("mc_retrig", "mc_retrig_vel", "", "retrig velocity, 1 to 127: what the curve "
+                                               "starts from")]
+_MC_KNOBS = [key for key, _cc, _l, kind, *_ in CYCLES_PARAMS if kind != "on"]
+MC_CONTINUOUS = {f"mc_{_t}_{k}" for _t in MC_TRACKS for k in _MC_KNOBS} \
+    | {f"mc_{k}" for k in _MC_KNOBS} \
+    | {f"mc_fx_{key}" for key, _cc, _l, kind, *_ in CYCLES_FX_PARAMS if kind != "on"} \
+    | set(MC_RETRIG_KNOBS)
 # ids held rather than pressed: the key's or the note's release matters too
 # (no QShortcut, the event filter sees both; a CC's falling edge releases)
-HOLD = {"repeat", "brake", "nudge_down", "nudge_up", "frag"} \
-    | {f"frag_{_n}" for _n in range(1, 17)}
+HOLD = {"repeat", "brake", "nudge_down", "nudge_up", "frag", "freeze"} \
+    | {f"frag_{_n}" for _n in range(1, 17)} | {f"mc_retrig_{_t}" for _t in MC_TRACKS}
 # ids that take a value (0..1) instead of firing; only a CC can drive them
 CONTINUOUS = {"ab", "volume", "sync", "shader_mix", "shader_pick", "avol", "burst_len",
               "rep_div", "rep_pos", "speed_sync", "brake_len", "frag_div", "frag_slice",
               "frag_size", "frag_rate", "frag_motion", "frag_pitch", "frag_speed",
               "frag_repeats", "frag_shape", "frag_a", "frag_d", "frag_s", "frag_r",
-              "rev_time", "rev_fb"} \
+              "rev_time", "rev_fb", "freeze_size", "freeze_smear", "freeze_pitch",
+              "freeze_a", "freeze_r"} \
     | {f"lfo_{_n}_depth" for _n in range(1, LFO_SLOTS + 1)} \
     | {f"macro_{_n}" for _n in range(1, MACRO_SLOTS + 1)} \
     | {f"grade_{k}" for k, *_ in VIDEO_GRADE} | {f"fx_{k}" for k, *_ in VIDEO_EFFECTS} \
     | {f"afx_{k}" for k, *_ in AUDIO_FX} \
     | {f"afx_{_ch}_{k}" for _ch in ALL_CHANNELS for k, *_ in AUDIO_FX} \
-    | {f"avol_{_ch}" for _ch in ALL_CHANNELS} | {f"vst_{n}" for n in range(1, VST_KNOBS + 1)}
+    | {f"avol_{_ch}" for _ch in ALL_CHANNELS} | {f"vst_{n}" for n in range(1, VST_KNOBS + 1)} \
+    | MC_CONTINUOUS
 KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
                  "section": "section engine", "mix": "mix and shader",
                  "grade": "source grade", "fx": "video effects",
@@ -504,7 +560,11 @@ KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
                  "voices": "drum voices", "lfo": "LFOs", "scene": "scenes",
                  "macro": "macros", "frag": "fragments: the sliced bar",
                  **{f"audio_{_ch}": f"audio rack: {_ch}" for _ch in CHANNELS},
-                 **{f"rack_{_v}": f"audio rack: {VOICE_LABELS[_v]} voice" for _v in VOICES}}
+                 **{f"rack_{_v}": f"audio rack: {VOICE_LABELS[_v]} voice" for _v in VOICES},
+                 **{f"mc_{_t}": f"Model:Cycles: track {_t} ({DRUM_LABELS[MC_ROLE[_t]]})"
+                    for _t in MC_TRACKS},
+                 "mc_focus": "Model:Cycles: focused track",
+                 "mc_fx": "Model:Cycles: delay and reverb", "mc_retrig": "Model:Cycles: retrig"}
 VOICE_SHORT = {"kick": "kick", "snare": "snare", "hihat": "c.hat", "ohat": "o.hat",
                "ride": "ride", "glitch": "stutter", "sub": "sub"}
 LFO_LABEL_FIX = {"ab": "A/B", "volume": "main volume", "sync": "audio sync delay",
@@ -516,6 +576,9 @@ LFO_LABEL_FIX = {"ab": "A/B", "volume": "main volume", "sync": "audio sync delay
                  "frag_d": "fragments: decay", "frag_s": "fragments: sustain",
                  "frag_r": "fragments: release", "rev_time": "reverse delay: time",
                  "rev_fb": "reverse delay: feedback",
+                 "freeze_size": "freeze: grain size", "freeze_smear": "freeze: smear",
+                 "freeze_pitch": "freeze: pitch", "freeze_a": "freeze: attack",
+                 "freeze_r": "freeze: release",
                  "shader_mix": "shader opacity", "shader_pick": "shader pick",
                  "burst_len": "burst length", "rep_div": "repeat division",
                  "rep_pos": "repeat position", "speed_sync": "speed resync",
@@ -530,6 +593,8 @@ def _knob_label(group, ident, what):
     if group.startswith("audio_") or group.startswith("rack_"):
         return f"rack {what}"                       # "drums: lowpass"
     short = what
+    if group.startswith("mc_"):                     # "M:C track 1 pitch", "M:C delay time"
+        return "M:C " + short[:min(i for i in (short.find(","), short.find(":")) if i > 0)]
     for cut in (",", " (", ":"):
         i = short.find(cut)
         if i > 0:
@@ -540,10 +605,12 @@ def _knob_label(group, ident, what):
 
 # the LFO destinations: (ident, label) for every knob, in table order
 LFO_DESTS = [(ident, _knob_label(group, ident, what)) for group, ident, _k, what in KEYMAP
-             if ident in CONTINUOUS and group not in ("audio_focus", "lfo", "scene")]
+             if ident in CONTINUOUS and group not in ("audio_focus", "lfo", "scene", "mc_focus")]
 # the macro destinations: the same knobs, the macros themselves left out
-# (a macro on a macro would loop)
-MACRO_DESTS = [(ident, label) for ident, label in LFO_DESTS if not ident.startswith("macro_")]
+# (a macro on a macro would loop), plus the LFOs' depths: a macro opening
+# an LFO is the classic pairing (the LFOs do not get them: an LFO on its
+# own depth would chase itself)
+MACRO_DESTS = [(ident, label) for ident, label in LFO_DESTS if not ident.startswith("macro_")]     + [(f"lfo_{_n}_depth", f"LFO {_n} depth") for _n in range(1, LFO_SLOTS + 1)]
 # the quantize grid: what a switch, an event or a burst waits for while a
 # section plays, as a fraction of a bar (0 = at once)
 QUANT_GRIDS = [("off", 0.0), ("1/16", 1 / 16), ("1/8", 1 / 8), ("1/4", 1 / 4),
@@ -568,6 +635,72 @@ FRAG_DEFAULTS = {"div": 16, "size": "1/16", "rate": "dense", "motion": 100, "pit
                  "a": 5, "d": 200, "s": 100, "r": 250}
 
 
+class _ComboSearch(QObject):
+    """The typing side of searchable(): Enter takes the first name that
+    matches what was typed, Escape or leaving with a name that matches
+    nothing puts the chosen one back (an editable combo would otherwise
+    keep the typed text, and a highlight walked with the arrows then
+    Escape would stick)."""
+
+    def __init__(self, combo, comp):
+        super().__init__(combo)
+        self.combo, self.comp, self.le = combo, comp, combo.lineEdit()
+        self.le.returnPressed.connect(self.pick)
+        self.le.editingFinished.connect(self.settle)
+        comp.popup().installEventFilter(self)
+        self.le.installEventFilter(self)
+
+    def chosen(self):
+        return self.combo.itemText(self.combo.currentIndex())
+
+    def pick(self):
+        c = self.combo
+        if c.findText(self.le.text()) < 0 and self.comp.completionCount():
+            i = c.findText(self.comp.currentCompletion())
+            if i >= 0:
+                c.setCurrentIndex(i)
+                self.le.setText(c.itemText(i))
+
+    def settle(self):
+        try:
+            if self.combo.findText(self.le.text()) < 0:
+                self.le.setText(self.chosen())
+        except RuntimeError:                   # the widgets going away
+            pass
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+            QTimer.singleShot(0, self.settle_all)
+        return False
+
+    def settle_all(self):
+        try:
+            self.le.setText(self.chosen())
+        except RuntimeError:
+            pass
+
+
+def searchable(combo):
+    """A combo you can type into: click it, type, and its list narrows to
+    the names holding what you typed (any part, case blind); Enter takes
+    the first, a click any; Escape, or leaving with a name that matches
+    nothing, keeps what was chosen. The arrows and the wheel work as
+    before. For the long lists (the LFO and macro destinations, the M:C
+    menus)."""
+    combo.setEditable(True)
+    combo.setInsertPolicy(QComboBox.NoInsert)
+    comp = QCompleter(combo.model(), combo)
+    comp.setCompletionMode(QCompleter.PopupCompletion)
+    comp.setFilterMode(Qt.MatchContains)
+    comp.setCaseSensitivity(Qt.CaseInsensitive)
+    combo.setCompleter(comp)
+    pop = comp.popup()                 # a window of its own, above a fullscreen picture
+    pop.setWindowFlags(pop.windowFlags() | Qt.WindowStaysOnTopHint)
+    _ComboSearch(combo, comp)
+    combo.setToolTip((combo.toolTip() + " Type to search the list.").strip())
+    return combo
+
+
 def default_midi_map():
     """The bindings before anyone learns their own: one note per button
     action, from C1 (36) up in table order, on channel 1, which is what a
@@ -577,7 +710,9 @@ def default_midi_map():
     buttons; the drum voices on channel 3 the same way, their switches as
     notes from 36 and their racks' knobs on CC 1 upward. Channel 1's notes
     ran out at 127 with the repeat's buttons: the buttons after that go on
-    channel 4 from note 36, and a channel's CCs past 127 the same way. Any
+    channel 4 from note 36, and a channel's CCs past 127 the same way. The
+    Model:Cycles tab's rows come last and take a channel of their own, the
+    one after the last in use by then, notes from 36 and CCs from 1. Any
     controller overwrites these by MIDI learn."""
     out = {}
     # (kind, channel) -> next number; a channel that runs past 127 spills
@@ -587,6 +722,11 @@ def default_midi_map():
     spill = {}
 
     def take(kind, ch):
+        if ch == "mc":                      # the tab's own channel, made on first use
+            if "mc" not in spill:
+                spill["mc"] = max(c for _k, c in nxt) + 1
+                nxt[("note", spill["mc"])], nxt[("cc", spill["mc"])] = 36, 1
+            ch = spill["mc"]
         while nxt[(kind, ch)] > 127:
             if (kind, ch) not in spill:
                 new = max(c for _k, c in nxt) + 1
@@ -600,7 +740,8 @@ def default_midi_map():
         audio = group.startswith("audio")
         voice = group == "voices" or group.startswith("rack_")
         kind = "cc" if ident in CONTINUOUS else "note"
-        out[ident] = take(kind, 3 if voice else 2 if audio else 1)
+        out[ident] = take(kind, "mc" if group.startswith("mc_") else 3 if voice
+                          else 2 if audio else 1)
     return out
 
 
@@ -1919,6 +2060,7 @@ class Main(QMainWindow):
                 1 - self.pitch_mode.currentIndex()),
             "brake": lambda: self._brake_hold("midi", True),
             "brake_len": lambda x: self._combo_frac(self.brake_len, x),
+            "freeze": lambda: self._freeze_hold("midi", True),
             "nudge_down": lambda: self._nudge_hold(-1, "midi", True),
             "nudge_up": lambda: self._nudge_hold(1, "midi", True),
             "rep_earlier": lambda: self.rep_pos.setValue(self.rep_pos.value() - 1),
@@ -1980,6 +2122,7 @@ class Main(QMainWindow):
         self.actions["video_random"] = self._video_random
         self.actions["video_second"] = self.video_second.toggle
         self.actions["midi_out"] = self.midi_out_on.toggle
+        self.actions["metronome"] = self.midi_metro.toggle
         self.actions["video_off"] = self.video_off.toggle
         for n in range(1, VST_KNOBS + 1):
             self.actions[f"vst_{n}"] = lambda x, n=n: self.inserts.knob(n - 1, x)
@@ -2020,6 +2163,11 @@ class Main(QMainWindow):
                             "rev_time": self.rev_time}      # combos read as knobs
         self.actions["rev_fb"] = self._frac_setter(self.rev_fb)
         self.knob_widgets["rev_fb"] = self.rev_fb
+        for ident, w in (("freeze_size", self.freeze_size), ("freeze_smear", self.freeze_smear),
+                         ("freeze_pitch", self.freeze_pitch), ("freeze_a", self.freeze_a),
+                         ("freeze_r", self.freeze_r)):
+            self.actions[ident] = self._frac_setter(w)
+            self.knob_widgets[ident] = w
         for ident, combo in self.frag_combos.items():
             self.actions[ident] = lambda x, c=combo: self._combo_frac(c, x)
         for ident, w in (("frag_motion", self.frag_motion), ("frag_pitch", self.frag_pitch),
@@ -2030,19 +2178,49 @@ class Main(QMainWindow):
             self.knob_widgets[ident] = w
         self.actions["frag_dir"] = lambda: self._combo_next(self.frag_dir)
         self.actions["frag_play"] = lambda: self._combo_next(self.frag_play)
+        # the Model:Cycles tab: every cell, the focused set and its focus
+        # buttons, the retrig holds and the retrig's settings
+        for (t, key), w in self.mc.items():
+            ident = self._mc_ident(t, key)
+            if isinstance(w, QCheckBox):
+                self.actions[ident] = w.toggle
+            elif isinstance(w, QComboBox):
+                self.actions[ident] = lambda x, c=w: self._combo_frac(c, x)
+                self.frag_combos[ident] = w
+            else:
+                self.actions[ident] = self._frac_setter(w)
+                self.knob_widgets[ident] = w
+        for key, *_ in CYCLES_PARAMS:
+            self.actions[f"mc_{key}"] = self._mc_focused(key)
+        for t in MC_TRACKS:
+            self.actions[f"mc_focus_{t}"] = lambda t=t: self.mc_focus.setCurrentIndex(t - 1)
+            self.actions[f"mc_retrig_{t}"] = lambda t=t: self._mc_retrig_hold(t, "midi", True)
+        for ident, c in (("mc_retrig_rate", self.mc_retrig_rate),
+                         ("mc_retrig_len", self.mc_retrig_len)):
+            self.actions[ident] = lambda x, c=c: self._combo_frac(c, x)
+            self.frag_combos[ident] = c
+        for ident, w in (("mc_retrig_fade", self.mc_retrig_fade),
+                         ("mc_retrig_vel", self.mc_retrig_vel)):
+            self.actions[ident] = self._frac_setter(w)
+            self.knob_widgets[ident] = w
         self.releases = {"repeat": lambda: self._rep_hold("midi", False),
                          "brake": lambda: self._brake_hold("midi", False),
+                         "freeze": lambda: self._freeze_hold("midi", False),
                          "frag": lambda: self._frag_hold_pick("midi", False),
                          **{f"frag_{n}": (lambda n=n: self._frag_hold(n, "midi", False))
                             for n in range(1, 17)},
                          "nudge_down": lambda: self._nudge_hold(-1, "midi", False),
                          "nudge_up": lambda: self._nudge_hold(1, "midi", False)}
         self.holds = {"repeat": self._rep_hold, "brake": self._brake_hold,
+                      "freeze": self._freeze_hold,
                       "frag": self._frag_hold_pick,
                       **{f"frag_{n}": (lambda src, on, n=n: self._frag_hold(n, src, on))
                          for n in range(1, 17)},
                       "nudge_down": lambda src, on: self._nudge_hold(-1, src, on),
                       "nudge_up": lambda src, on: self._nudge_hold(1, src, on)}
+        for t in MC_TRACKS:
+            self.releases[f"mc_retrig_{t}"] = lambda t=t: self._mc_retrig_hold(t, "midi", False)
+            self.holds[f"mc_retrig_{t}"] = lambda src, on, t=t: self._mc_retrig_hold(t, src, on)
         self._hold_keys = {QKeySequence(key).toString(): ident
                            for _g, ident, key, _w in KEYMAP if key and ident in HOLD}
         missing = [ident for _g, ident, _k, _w in KEYMAP if ident not in self.actions]
@@ -2199,6 +2377,7 @@ class Main(QMainWindow):
         tabs.addTab(sections, "Sections")
         tabs.addTab(video, "Video")
         tabs.addTab(self._tab_audio_fx(), "Audio FX")
+        tabs.addTab(self._tab_cycles(), "M:C")
         tabs.addTab(self._tab_video_fx(), "Video FX")
         tabs.addTab(self._tab_lfo(), "LFO")
         tabs.addTab(self._tab_scenes(), "Scenes")
@@ -2215,7 +2394,8 @@ class Main(QMainWindow):
         def set_frac(x):
             lo, hi = widget.minimum(), widget.maximum()
             v = lo + max(0.0, min(1.0, x)) * (hi - lo)
-            widget.setValue(int(round(v)) if isinstance(widget, QSlider) else v)
+            # an integer widget rounds (setValue would truncate 9.99 to 9)
+            widget.setValue(v if isinstance(widget, QDoubleSpinBox) else int(round(v)))
         return set_frac
 
     @staticmethod
@@ -2393,6 +2573,7 @@ class Main(QMainWindow):
         for group in groups:                     # long knob lists: folded at first
             if group in ("grade", "fx", "vfx", "lfo", "scene", "macro") \
                     or group.startswith("rack_") \
+                    or group.startswith("mc_") and group != "mc_focus" \
                     or group.startswith("audio_") and group != "audio_focus":
                 groups[group].setExpanded(False)
         for c in range(3):
@@ -2543,12 +2724,352 @@ class Main(QMainWindow):
         self.midi_out_sync_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         form.addRow("sync", self._row([("", self.midi_out_clock), ("", self.midi_out_transport),
                                        ("", self.midi_out_sync_status)]))
+        # the metronome (gacha_metro): a click on every beat into the mix
+        # (the audio output open), and a note per beat on the port
+        self.midi_metro = QCheckBox("metronome")
+        self.midi_metro.setToolTip(
+            "A click on every beat, higher and louder on the one, into the mix (the audio "
+            "output open, General tab): on the playing section's own beat grid, through the "
+            "gears and a tape stop, or on the live clock (tap, downbeat, BPM box, Link) with "
+            "nothing playing. With the port open every beat also goes out as a note on the "
+            "notes' channel, under the same lead as the hits: the one as the first note "
+            "next to it at velocity 127, beats 2, 3 and 4 as the second at 90. Remembered; "
+            "a MIDI button, metronome in the section engine group.")
+        self.midi_metro_one = QSpinBox(minimum=-1, maximum=127, value=76)
+        self.midi_metro_one.setSpecialValueText("off")
+        self.midi_metro_one.setToolTip("The downbeat's note on the MIDI out (General MIDI: "
+                                       "76, hi wood block); off sends none for the one")
+        self.midi_metro_note = QSpinBox(minimum=-1, maximum=127, value=77)
+        self.midi_metro_note.setSpecialValueText("off")
+        self.midi_metro_note.setToolTip("The note of beats 2, 3 and 4 on the MIDI out (General "
+                                        "MIDI: 77, low wood block); off sends none for them")
+        form.addRow("click", self._row([("", self.midi_metro), ("one", self.midi_metro_one),
+                                        ("beats", self.midi_metro_note)]))
         box.addLayout(form)
         w = QWidget()
         w.setLayout(box)
         if not MIDI_AVAILABLE:
             w.setEnabled(False)
         return w
+
+    # ---------- Model:Cycles ----------
+    def _tab_cycles(self):
+        """The Model:Cycles' sound over CC (gacha_midi.CYCLES_PARAMS): a
+        knob per parameter per track, out on the MIDI out's port on the
+        track's channel, the box's delay and reverb on the FX channel, and a
+        retrig done from here (the box's own has no CC). Every cell is a
+        knob the MIDI map, the LFOs, the macros and the scenes reach."""
+        sv = self.settings.value
+        self.mc = {}                        # (track 1..6 or "fx", key) -> widget
+        self.mc_toggles = {}                # ident -> the switches among them
+        self._mc_retrig_src = {t: set() for t in MC_TRACKS}
+        self._mc_save_timer = QTimer(self)
+        self._mc_save_timer.setSingleShot(True)
+        self._mc_save_timer.setInterval(400)
+        self._mc_save_timer.timeout.connect(self._mc_save)
+        try:
+            saved = json.loads(sv("mc/values", "") or "{}")
+            if not isinstance(saved, dict):
+                saved = {}
+        except (ValueError, TypeError):
+            saved = {}
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        hint = QLabel(
+            "The box's sound from here, over CC on the MIDI out's port (Controls tab, on "
+            "and pointed at the box): a column per track on its channel, 1 to 6, the drum "
+            "the Model:Cycles tick sends there under its number. Every cell is a knob for "
+            "the MIDI map, the LFOs, the macros and the scenes; the box needs RCV CC on. "
+            "Pitch glides on the box (it slews CC), machine and the LFO menus go out as the "
+            "menu's index, to verify by ear. Retrig: hold a track's button, the track's note "
+            "again at the rate below until let go.")
+        hint.setProperty("role", "sub")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+        self.mc_status = QLabel("")
+        self.mc_status.setProperty("role", "sub")
+        self.mc_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.mc_focus = QComboBox()
+        self.mc_focus.addItems([f"T{t} {VOICE_SHORT[MC_ROLE[t]]}" for t in MC_TRACKS])
+        self.mc_focus.setToolTip("The track the focused knob rows of the Controls tab act "
+                                 "on; the focus buttons switch it from a controller")
+        self.mc_fx_channel = QSpinBox(minimum=1, maximum=16)
+        self.mc_fx_channel.setValue(sv("mc/fx_channel", 9, type=int))
+        self.mc_fx_channel.setToolTip("The channel the delay and reverb CCs go out on: the "
+                                      "box's CONFIG > MIDI > IN CHAN > FX IN. Remembered.")
+        self.mc_fx_channel.valueChanged.connect(self._mc_fx_channel_changed)
+        send_btn = QPushButton("send all")
+        send_btn.setToolTip("Every value of the tab to the box again: after it powers up, "
+                            "a pattern change or a knob turned on the box itself")
+        send_btn.clicked.connect(self._mc_send_all)
+        defaults_btn = QPushButton("defaults")
+        defaults_btn.setToolTip("Every cell back to a plain setting (the box's own defaults "
+                                "as far as known) and sent")
+        defaults_btn.clicked.connect(self._mc_defaults)
+        outer.addWidget(self._row([("", self.mc_status), ("focus", self.mc_focus),
+                                   ("FX channel", self.mc_fx_channel), ("", send_btn),
+                                   ("", defaults_btn)]))
+        grid = QGridLayout()
+        grid.setContentsMargins(8, 4, 8, 4)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(3)
+        for c, t in enumerate(MC_TRACKS):
+            hdr = QLabel(f"T{t}  {VOICE_SHORT[MC_ROLE[t]]}")
+            hdr.setAlignment(Qt.AlignCenter)
+            hdr.setToolTip(f"Track {t} of the box, MIDI channel {t}: where the "
+                           f"{DRUM_LABELS[MC_ROLE[t]]} goes with the Model:Cycles tick on")
+            grid.addWidget(hdr, 0, c + 1)
+        for r, (key, cc, label, kind, default, what) in enumerate(CYCLES_PARAMS, start=1):
+            lbl = QLabel(label)
+            lbl.setProperty("role", "sub")
+            lbl.setToolTip(f"CC {cc}: {what}")
+            grid.addWidget(lbl, r, 0)
+            for c, t in enumerate(MC_TRACKS):
+                w = self._mc_cell(t, key, saved.get(f"{t}_{key}"))
+                w.setToolTip(f"Track {t} {label} (CC {cc} on channel {t}): {what}")
+                grid.addWidget(w, r, c + 1)
+        r = len(CYCLES_PARAMS) + 1
+        lbl = QLabel("retrig")
+        lbl.setProperty("role", "sub")
+        lbl.setToolTip("Hold: the track's note (the map in the Controls tab, the root when "
+                       "off) again and again at the retrig rate below, the velocity fading "
+                       "as set, until let go. The box's RETRIG key done from here, since the "
+                       "box takes no CC for it. A MIDI button per track, held.")
+        grid.addWidget(lbl, r, 0)
+        self.mc_retrig_btns = {}
+        for c, t in enumerate(MC_TRACKS):
+            b = QPushButton("hold")
+            b.setCheckable(True)
+            b.setToolTip(f"Track {t} retrig: latched for the mouse; a MIDI note or CC holds "
+                         "it while down")
+            b.toggled.connect(lambda on, t=t: self._mc_retrig_hold(t, "ui", on))
+            self.mc_retrig_btns[t] = b
+            grid.addWidget(b, r, c + 1)
+        grid.setColumnStretch(0, 0)
+        for c in range(len(MC_TRACKS)):
+            grid.setColumnStretch(c + 1, 1)
+        outer.addLayout(grid)
+        form = QFormLayout()
+        form.setContentsMargins(8, 2, 8, 4)
+        form.setVerticalSpacing(2)
+        self.mc_retrig_rate = QComboBox()
+        self.mc_retrig_rate.addItems([name for name, _f in CYCLES_RETRIG_RATES])
+        rate = str(sv("mc/retrig_rate", "1/16"))
+        self.mc_retrig_rate.setCurrentText(
+            rate if self.mc_retrig_rate.findText(rate) >= 0 else "1/16")
+        self.mc_retrig_rate.setToolTip("A note every this much of a bar, at the live tempo: "
+                                       "1/16 one a step, 1/32 two, 1/12 triplets, the box's "
+                                       "own list. Remembered; a MIDI knob.")
+        self.mc_retrig_len = QComboBox()
+        self.mc_retrig_len.addItems([name for name, _f in CYCLES_RETRIG_LENS])
+        ln = str(sv("mc/retrig_len", "1 step"))
+        self.mc_retrig_len.setCurrentText(
+            ln if self.mc_retrig_len.findText(ln) >= 0 else "1 step")
+        self.mc_retrig_len.setToolTip("How long the velocity fade takes, in sixteenth "
+                                      "steps; inf is a flat curve. Remembered; a MIDI knob.")
+        self.mc_retrig_fade = QSpinBox(minimum=-128, maximum=127)
+        self.mc_retrig_fade.setValue(sv("mc/retrig_fade", 0, type=int))
+        self.mc_retrig_fade.setToolTip("The box's FDE: -128 fades the velocity out to "
+                                       "nothing over the length, -64 to half, 0 flat, 64 "
+                                       "fades in from half, 127 from nothing. Remembered; a "
+                                       "MIDI knob.")
+        self.mc_retrig_vel = QSpinBox(minimum=1, maximum=127)
+        self.mc_retrig_vel.setValue(sv("mc/retrig_vel", 100, type=int))
+        self.mc_retrig_vel.setToolTip("The velocity the curve starts from (the box's PAD "
+                                      "menu says what it shapes). Remembered; a MIDI knob.")
+        for w in (self.mc_retrig_rate, self.mc_retrig_len):
+            w.currentIndexChanged.connect(self._mc_retrig_settings_changed)
+        for w in (self.mc_retrig_fade, self.mc_retrig_vel):
+            w.valueChanged.connect(self._mc_retrig_settings_changed)
+        form.addRow("retrig", self._row([("rate", self.mc_retrig_rate),
+                                         ("length", self.mc_retrig_len),
+                                         ("fade", self.mc_retrig_fade),
+                                         ("velocity", self.mc_retrig_vel)]))
+        pairs = []
+        for key, cc, label, kind, default, what in CYCLES_FX_PARAMS:
+            w = self._mc_cell("fx", key, saved.get(f"fx_{key}"))
+            w.setToolTip(f"{label} (CC {cc} on the FX channel): {what}")
+            pairs.append((label, w))
+        form.addRow("delay / reverb", self._row(pairs))
+        outer.addLayout(form)
+        w = QWidget()
+        w.setLayout(outer)
+        if not MIDI_AVAILABLE:
+            w.setEnabled(False)
+        area = self._scrolling(w)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return area
+
+    @staticmethod
+    def _mc_ident(t, key):
+        return f"mc_fx_{key}" if t == "fx" else f"mc_{t}_{key}"
+
+    def _mc_cell(self, t, key, saved):
+        """One cell of the tab: a switch, a menu or a spinbox after the
+        parameter's kind, at its saved value (the default without one)."""
+        _cc, _label, kind, default, _what = MC_PARAM[key]
+        if kind == "on":
+            w = QCheckBox("")
+            w.setChecked(bool(saved) if saved is not None else bool(default))
+            w.toggled.connect(lambda *_a, t=t, key=key: self._mc_changed(t, key))
+            self.mc_toggles[self._mc_ident(t, key)] = w
+        elif kind == "list":
+            w = QComboBox()
+            w.addItems(CYCLES_LISTS[key])
+            if w.count() > 8:
+                searchable(w)
+            try:
+                idx = int(saved) if saved is not None else int(default)
+            except (TypeError, ValueError):
+                idx = int(default)
+            w.setCurrentIndex(max(0, min(w.count() - 1, idx)))
+            w.currentIndexChanged.connect(lambda *_a, t=t, key=key: self._mc_changed(t, key))
+        else:
+            lo, hi = CYCLES_RANGES[kind]
+            w = QSpinBox(minimum=lo, maximum=hi)
+            if kind in ("pct", "swing"):
+                w.setSuffix(" %")
+            elif kind == "semi":
+                w.setSuffix(" st")
+            w.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            try:
+                v = int(saved) if saved is not None else int(default)
+            except (TypeError, ValueError):
+                v = int(default)
+            w.setValue(max(lo, min(hi, v)))
+            w.valueChanged.connect(lambda *_a, t=t, key=key: self._mc_changed(t, key))
+        self.mc[(t, key)] = w
+        return w
+
+    def _mc_value(self, t, key):
+        """A cell's value as the tab shows it (a switch as a bool, a menu
+        as its index)."""
+        w = self.mc[(t, key)]
+        if isinstance(w, QCheckBox):
+            return w.isChecked()
+        if isinstance(w, QComboBox):
+            return w.currentIndex()
+        return w.value()
+
+    def _mc_changed(self, t, key):
+        self._mc_save_timer.start()
+        self._mc_send(t, key)
+
+    def _mc_send(self, t, key, force=False):
+        """A cell to the box: its CC on the track's channel (the FX channel
+        for the delay and reverb); the LFO depth's fine LSB as 0."""
+        mo = getattr(self, "midi_out", None)
+        if mo is None or not mo.is_open:
+            return
+        cc, _label, kind, _default, _what = MC_PARAM[key]
+        ch = self.mc_fx_channel.value() if t == "fx" else t
+        mo.cc(ch, cc, cycles_cc_value(kind, self._mc_value(t, key)), force)
+        if key == "lfo_depth":
+            mo.cc(ch, 110, 0, force)
+
+    def _mc_send_all(self):
+        if not self.midi_out.is_open:
+            self.log.appendPlainText("m:c: the MIDI out is closed, nothing sent")
+            return
+        for t, key in self.mc:
+            self._mc_send(t, key, force=True)
+        self.log.appendPlainText(f"m:c: every value sent to {self.midi_out.label}")
+
+    def _mc_defaults(self):
+        for (t, key), w in self.mc.items():
+            default = MC_PARAM[key][3]
+            if isinstance(w, QCheckBox):
+                w.setChecked(bool(default))
+            elif isinstance(w, QComboBox):
+                w.setCurrentIndex(int(default))
+            else:
+                w.setValue(int(default))
+
+    def _mc_save(self):
+        values = {("fx_" if t == "fx" else f"{t}_") + key: self._mc_value(t, key)
+                  for t, key in self.mc}
+        self.settings.setValue("mc/values", json.dumps(values))
+
+    def _mc_fx_channel_changed(self, ch):
+        self.settings.setValue("mc/fx_channel", int(ch))
+        for key, *_ in CYCLES_FX_PARAMS:
+            self._mc_send("fx", key, force=True)
+        self._mc_status()
+
+    def _mc_focused(self, key):
+        """An action on the focused track's cell `key`: a knob's 0..1 for
+        a spinbox or a menu, a toggle for a switch."""
+        kind = MC_PARAM[key][2]
+
+        def act(x=None):
+            w = self.mc[(self.mc_focus.currentIndex() + 1, key)]
+            if kind == "on":
+                w.toggle()
+            elif kind == "list":
+                self._combo_frac(w, x)
+            else:
+                self._frac_setter(w)(x)
+        return act
+
+    def _mc_retrig_hold(self, t, source, on):
+        """Track t's retrig held (`on`) or let go by `source`: "midi" or
+        "ui" (the latching button). It runs while any of them holds it; a
+        new hold restarts the velocity curve."""
+        srcs = self._mc_retrig_src[t]
+        if on:
+            srcs.add(source)
+        else:
+            srcs.discard(source)
+        held = bool(srcs)
+        b = self.mc_retrig_btns[t]
+        if b.isChecked() != held:
+            b.blockSignals(True)
+            b.setChecked(held)
+            b.blockSignals(False)
+        if held:
+            self._mc_retrig_start(t)
+        else:
+            self.midi_out.retrig_stop(t)
+        self._mc_status()
+
+    def _mc_retrig_start(self, t):
+        note = self.midi_out_notes[MC_ROLE[t]].value()
+        if note < 0:
+            note = CYCLES_ROOT
+        bar_s = 240.0 / max(1e-6, self.tempo.bpm)
+        rate = dict(CYCLES_RETRIG_RATES).get(self.mc_retrig_rate.currentText(), 1 / 16)
+        steps = dict(CYCLES_RETRIG_LENS).get(self.mc_retrig_len.currentText(), 1.0)
+        self.midi_out.retrig_start(t, note, self.mc_retrig_vel.value(), rate * bar_s,
+                                   steps * bar_s / 16.0, self.mc_retrig_fade.value())
+
+    def _mc_retrig_release_all(self):
+        """Every retrig let go (the port closing)."""
+        for t in MC_TRACKS:
+            if self._mc_retrig_src[t]:
+                self._mc_retrig_src[t].clear()
+                self._mc_retrig_hold(t, "ui", False)
+
+    def _mc_retrig_settings_changed(self, *_a):
+        self.settings.setValue("mc/retrig_rate", self.mc_retrig_rate.currentText())
+        self.settings.setValue("mc/retrig_len", self.mc_retrig_len.currentText())
+        self.settings.setValue("mc/retrig_fade", self.mc_retrig_fade.value())
+        self.settings.setValue("mc/retrig_vel", self.mc_retrig_vel.value())
+        for t in MC_TRACKS:                 # a held one takes the new settings
+            if self._mc_retrig_src[t] and self.midi_out.is_open:
+                self._mc_retrig_start(t)
+
+    def _mc_status(self):
+        mo = getattr(self, "midi_out", None)
+        if not MIDI_AVAILABLE:
+            text = "mido / python-rtmidi missing"
+        elif mo is None or not mo.is_open:
+            text = "MIDI out closed (Controls tab): nothing leaves"
+        else:
+            held = [str(t) for t in MC_TRACKS if self._mc_retrig_src[t]]
+            text = (f"{mo.label}: tracks on channels 1-6, FX on {self.mc_fx_channel.value()}, "
+                    f"{mo.ccs} CCs sent" + (", retrig T" + " T".join(held) if held else ""))
+        self.mc_status.setText(text)
 
     # ---------- MIDI ----------
     def _midi_out_setup(self):
@@ -2567,6 +3088,13 @@ class Main(QMainWindow):
         self.midi_out_clock.setChecked(self.settings.value("midi/out_clock", False, type=bool))
         self.midi_out_transport.setChecked(
             self.settings.value("midi/out_transport", False, type=bool))
+        self.midi_metro.setChecked(self.settings.value("midi/metro", False, type=bool))
+        self.midi_metro_one.setValue(self.settings.value("midi/metro_one", 76, type=int))
+        # the beats' note; before the one had its own, one note (76) did both
+        beats = self.settings.value("midi/metro_note", 77, type=int)
+        if beats == 76 and not self.settings.contains("midi/metro_one"):
+            beats = 77
+        self.midi_metro_note.setValue(beats)
         saved = self.settings.value("midi/out_notes", "")
         if saved:
             try:
@@ -2585,6 +3113,9 @@ class Main(QMainWindow):
         self.midi_out_follow.toggled.connect(self._midi_out_apply)
         self.midi_out_cycles.toggled.connect(self._midi_out_cycles_toggled)
         self.midi_out_clock.toggled.connect(self._midi_out_apply)
+        self.midi_metro.toggled.connect(self._midi_out_apply)
+        self.midi_metro_note.valueChanged.connect(self._midi_out_apply)
+        self.midi_metro_one.valueChanged.connect(self._midi_out_apply)
         self.midi_out_transport.toggled.connect(self._midi_out_apply)
         for sp in self.midi_out_notes.values():
             sp.valueChanged.connect(self._midi_out_apply)
@@ -2659,6 +3190,7 @@ class Main(QMainWindow):
             if not self.midi_out.is_open:
                 self._midi_out_open()           # else say why not
         else:
+            self._mc_retrig_release_all()
             self.midi_out.close_port()              # note offs for what sounds
             self.midi_out_status.setText("off")
             self.log.appendPlainText("midi out: off")
@@ -2686,6 +3218,7 @@ class Main(QMainWindow):
                 parts.append("running" if mo.running else "stopped")
             text = ", ".join(parts)
         self.midi_out_sync_status.setText(text)
+        self._mc_status()
 
     def _midi_out_channels_text(self):
         if self.midi_out_cycles.isChecked():
@@ -2716,6 +3249,9 @@ class Main(QMainWindow):
         self.settings.setValue("midi/out_clock", self.midi_out_clock.isChecked())
         self.settings.setValue("midi/out_transport", self.midi_out_transport.isChecked())
         self.settings.setValue("midi/out_notes", json.dumps(notes))
+        self.settings.setValue("midi/metro", self.midi_metro.isChecked())
+        self.settings.setValue("midi/metro_note", self.midi_metro_note.value())
+        self.settings.setValue("midi/metro_one", self.midi_metro_one.value())
         if self.midi_out.clock_on != self.midi_out_clock.isChecked():
             self.midi_out.clock_on = self.midi_out_clock.isChecked()
         self.midi_out.transport_on = self.midi_out_transport.isChecked()
@@ -2733,6 +3269,9 @@ class Main(QMainWindow):
         la.midi_notes = notes
         la.midi_drums_only = self.midi_out_only.isChecked()
         la.midi_follow_mutes = self.midi_out_follow.isChecked()
+        la.metro.on = self.midi_metro.isChecked()
+        la.metro.note = self.midi_metro_note.value()
+        la.metro.note_one = self.midi_metro_one.value()
 
     def _midi_setup(self):
         """Load the map and the ticked ports, open them, start watching for
@@ -3780,6 +4319,50 @@ class Main(QMainWindow):
         form.addRow("Reverse delay", self._row([("time", self.rev_time),
                                                 ("feedback", self.rev_fb)]))
         self._rev_changed()
+        # the freeze (gacha_freeze): the whole mix held on the instant of
+        # the press, on the master, the picture on its frame
+        self._freeze_sources = set()
+        self.freeze_btn = QPushButton("freeze (Z)")
+        self.freeze_btn.setCheckable(True)
+        self.freeze_btn.setToolTip(
+            "Hold Z (or the MIDI note): the whole mix as heard (the tape through, the "
+            "section, the song, the bursts, after the racks) is held on the instant of the "
+            "press, a drone of grains read from that spot, the live mix fading out under "
+            "it over the attack while the transport runs on; let go, the mix comes back "
+            "over the release right where the loop is. The picture holds its frame. The "
+            "MIDI out's hits pause under it. This button latches it for the mouse.")
+        self.freeze_btn.toggled.connect(lambda on: self._freeze_hold("ui", on))
+        self.freeze_size = QSpinBox(minimum=20, maximum=250, suffix=" ms")
+        self.freeze_size.setValue(sv("perform/freeze_size", 80, type=int))
+        self.freeze_size.setToolTip("A grain's length: short is a buzz at the grain's pitch, "
+                                    "long keeps the moment's texture. Remembered; a MIDI knob.")
+        self.freeze_smear = QSpinBox(minimum=0, maximum=100, suffix=" %")
+        self.freeze_smear.setValue(sv("perform/freeze_smear", 0, type=int))
+        self.freeze_smear.setToolTip(
+            "0 is the instant itself, a clean drone (the grains lined up in phase); up to "
+            "half it jitters the spot (up to half a second back), detunes a little and "
+            "sprays the stereo; past half, octave and fifth scatter and reversed grains, a "
+            "cloud. Remembered; a MIDI knob.")
+        self.freeze_pitch = QSpinBox(minimum=-24, maximum=24, suffix=" st")
+        self.freeze_pitch.setValue(sv("perform/freeze_pitch", 0, type=int))
+        self.freeze_pitch.setToolTip("The drone's pitch, two octaves either way. "
+                                     "Remembered; a MIDI knob.")
+        self.freeze_a = QSpinBox(minimum=1, maximum=2000, suffix=" ms")
+        self.freeze_a.setValue(sv("perform/freeze_a", 10, type=int))
+        self.freeze_a.setToolTip("The live mix out and the drone in, on the press. "
+                                 "Remembered; a MIDI knob.")
+        self.freeze_r = QSpinBox(minimum=1, maximum=4000, suffix=" ms")
+        self.freeze_r.setValue(sv("perform/freeze_r", 250, type=int))
+        self.freeze_r.setToolTip("The drone out and the live mix back, on the let-go. "
+                                 "Remembered; a MIDI knob.")
+        for w in (self.freeze_size, self.freeze_smear, self.freeze_pitch, self.freeze_a,
+                  self.freeze_r):
+            w.valueChanged.connect(self._freeze_changed)
+        form.addRow("Freeze", self._row([("", self.freeze_btn), ("size", self.freeze_size),
+                                         ("smear", self.freeze_smear),
+                                         ("pitch", self.freeze_pitch), ("A", self.freeze_a),
+                                         ("R", self.freeze_r)]))
+        self._freeze_changed()
         burst_btn = QPushButton("burst (B)")
         burst_btn.setToolTip(
             "A slice of the material from a random spot, right now, at the "
@@ -4150,6 +4733,7 @@ class Main(QMainWindow):
             dest.setToolTip("The knob this LFO moves: any knob of the Controls tab. The "
                             "knob's own value is the centre; turn it, or its CC, while the "
                             "LFO runs and that is the new centre.")
+            searchable(dest)
             shape = QComboBox()
             shape.addItems(LFO_SHAPES)
             shape.setToolTip("sine, triangle, saw up, saw down, square; random step (a new "
@@ -4292,6 +4876,11 @@ class Main(QMainWindow):
             return (self.rep_div.currentIndex() + 0.5) / n
         if ident.startswith("vst_"):
             return self.inserts.knob_value(int(ident[4:]) - 1)
+        if ident.startswith("lfo_") and ident.endswith("_depth"):   # a macro on an LFO's depth
+            try:
+                return abs(self.lfo_rows[int(ident[4:-6]) - 1]["depth"].value()) / 100.0
+            except (ValueError, IndexError):
+                return None
         return None
 
     def _lfo_set(self, ident, x):
@@ -4419,6 +5008,7 @@ class Main(QMainWindow):
             dest.setMinimumContentsLength(20)
             dest.setToolTip("A knob this macro moves: any knob of the Controls tab but the "
                             "macros themselves")
+            searchable(dest)
             lo = QSpinBox()
             lo.setRange(0, 100)
             lo.setToolTip("Where the knob sits with the macro at 0, as a percentage of the "
@@ -4570,7 +5160,10 @@ class Main(QMainWindow):
                     "lfo": "the eight LFO rows, on states included",
                     "video": "the source grade, every effect strength, the shader, its "
                              "opacity and blend, video-only, the picture mode and the "
-                             "dissolve"}[g] + "; unticked, a load leaves it alone (a save "
+                             "dissolve",
+                    "mc": "the Model:Cycles tab: every track's knobs, menus and switches, "
+                          "the delay and reverb, the retrig's settings (sent to the box as "
+                          "they land)"}[g] + "; unticked, a load leaves it alone (a save "
                                               "keeps everything)")
                 cb.toggled.connect(lambda on, i=i, g=g: self._scene_tick_changed(i, g, on))
                 ticks[g] = cb
@@ -4671,12 +5264,17 @@ class Main(QMainWindow):
                     + ["volume", "sync", "ab", "burst_len"]
                     + list(self.frag_combos) + ["frag_motion", "frag_pitch", "frag_speed",
                                                 "frag_repeats", "frag_shape", "frag_a",
-                                                "frag_d", "frag_s", "frag_r", "rev_fb"]
+                                                "frag_d", "frag_s", "frag_r", "rev_fb",
+                                                "freeze_size", "freeze_smear", "freeze_pitch",
+                                                "freeze_a", "freeze_r"]
                     + [f"vst_{n}" for n in range(1, VST_KNOBS + 1)]
                     + [f"macro_{n}" for n in range(1, MACRO_SLOTS + 1)])
         if g == "video":
             return ([f"grade_{k}" for k, *_ in VIDEO_GRADE]
                     + [f"fx_{k}" for k, *_ in VIDEO_EFFECTS] + ["shader_mix"])
+        if g == "mc":
+            return ([self._mc_ident(t, key) for (t, key), w in self.mc.items()
+                     if not isinstance(w, QCheckBox)] + list(MC_RETRIG_KNOBS))
         return []
 
     def _scene_knob(self, ident):
@@ -4698,6 +5296,8 @@ class Main(QMainWindow):
             return sw
         if g == "lfo":
             return {"lfo_rows": [self._lfo_row_settings(j) for j in range(LFO_SLOTS)]}
+        if g == "mc":
+            return {ident: cb.isChecked() for ident, cb in self.mc_toggles.items()}
         if g == "video":
             return {"shader": self.shader.currentText(),
                     "shader_blend": self.shader_blend.currentText(),
@@ -4751,6 +5351,8 @@ class Main(QMainWindow):
         elif ident == "dissolve":
             if self.perf_dissolve.findText(str(val)) >= 0:
                 self.perf_dissolve.setCurrentText(str(val))
+        elif ident in self.mc_toggles:
+            self.mc_toggles[ident].setChecked(bool(val))
 
     def _scene_apply_lfo_rows(self, rows):
         """The LFO rows of a scene onto the tab: the widgets quietly, then
@@ -6929,6 +7531,44 @@ class Main(QMainWindow):
         self.settings.setValue("perform/rev_time", self.rev_time.currentText())
         self.settings.setValue("perform/rev_fb", int(self.rev_fb.value()))
 
+    def _freeze_changed(self, *_a):
+        """The Freeze row into the master freeze, and remembered."""
+        FREEZE["size_ms"] = float(self.freeze_size.value())
+        FREEZE["smear"] = self.freeze_smear.value() / 100.0
+        FREEZE["pitch"] = float(self.freeze_pitch.value())
+        FREEZE["attack"] = self.freeze_a.value() / 1000.0
+        FREEZE["release"] = self.freeze_r.value() / 1000.0
+        st = self.settings.setValue
+        for name, w in (("size", self.freeze_size), ("smear", self.freeze_smear),
+                        ("pitch", self.freeze_pitch), ("a", self.freeze_a),
+                        ("r", self.freeze_r)):
+            st(f"perform/freeze_{name}", int(w.value()))
+
+    def _freeze_hold(self, source, on):
+        """The freeze held (`on`) or let go by `source`: "key", "midi" or
+        "ui" (the latching button). It holds while any of them holds it;
+        the audio stream's master freeze and the picture both read it."""
+        if on:
+            self._freeze_sources.add(source)
+        else:
+            self._freeze_sources.discard(source)
+        held = bool(self._freeze_sources)
+        if self.freeze_btn.isChecked() != held:
+            self.freeze_btn.blockSignals(True)
+            self.freeze_btn.setChecked(held)
+            self.freeze_btn.blockSignals(False)
+        la = self.through
+        if la is not None:
+            la.freeze.held = held
+
+    def _freeze_state(self):
+        """The master freeze sounding, for the picture (see
+        gacha_freeze.Freeze.state), or None."""
+        la = self.through
+        if la is None or not la.running or not la.freeze.active:
+            return None
+        return la.freeze.state()
+
     def _frag_hold(self, key, source, on):
         """Slice `key` (1..32, or 0 for the slice under the playhead) held
         (`on`) or let go by `source`: "key", "midi" or "ui". The voice
@@ -7023,6 +7663,18 @@ class Main(QMainWindow):
             heads.append((x0, w, hx, 0.5 - 0.5 * math.cos(2 * math.pi * ph)))
         return heads
 
+    def _freeze_heads(self, fz):
+        """The granular picture's bands for the master freeze: its grains
+        over the last GRAN_VIEW_S seconds of the mix, the frozen spot near
+        the right edge (see _gran_heads)."""
+        heads = []
+        for back, length, ph, rev in fz["heads"][:GRAN_HEADS]:
+            w = length / GRAN_VIEW_S
+            x0 = min(1.0 - w, max(0.0, 1.0 - back / GRAN_VIEW_S))
+            hx = x0 + (1.0 - ph if rev else ph) * w
+            heads.append((x0, w, hx, 0.5 - 0.5 * math.cos(2 * math.pi * ph)))
+        return heads
+
     def _speed_note(self, pl):
         """The speed for the status: '' or ' · half time', ' · tape stop
         42 %', ' · nudge +4 %', ' · 126/120 bpm'."""
@@ -7037,6 +7689,8 @@ class Main(QMainWindow):
         nf = self._nudge_factor()
         if nf != 1.0:
             parts.append(f"nudge {'+' if nf > 1 else '-'}{self.nudge_pct.value()} %")
+        if self._freeze_sources:
+            parts.append("frozen")
         if abs(self.tempo.bpm - pl.bpm) > 0.05:
             parts.append(f"{self.tempo.bpm:.0f}/{pl.bpm:.0f} bpm")
         if parts and pl.locked and hs["mode"] != "brake":
@@ -7538,6 +8192,7 @@ class Main(QMainWindow):
                                  exclusive=self.through_excl.isChecked(),
                                  api=self.through_api.currentText() or None)
         self.through.gain = self.vol.value() / 100
+        self.through.freeze.held = bool(self._freeze_sources)
         self.through.delay_ms = self.through_sync.value()
         self.through.ab = self.perf_ab.value() / 100.0
         self.through.hold_tape = self._webcam_b()
@@ -7583,6 +8238,8 @@ class Main(QMainWindow):
         # the racks' delays follow the playing song, else the live clock
         song_on = self.player.streaming and self.player.playbackState() == QMediaPlayer.PlayingState
         la.beat_s = (self._beat_ms if song_on else self.tempo.beat_ms) / 1000.0
+        la.metro.beat_s = self.tempo.beat_ms / 1000.0     # the metronome: the live clock
+        la.metro.anchor = self.tempo.anchor
         self._through_ticks += 1
         if self._through_ticks % 10 == 0:
             s = la.stats()
@@ -8071,8 +8728,8 @@ class Main(QMainWindow):
         live = self._live_active()
         idle = not live and self.player.playbackState() != QMediaPlayer.PlayingState
         section = idle and self._perf_sounding
-        if idle and not section and not any(cb.isChecked() for cb in self.vfx_on.values()):
-            return None                         # the clip as it is
+        if idle and not section and not self._freeze_sources                 and not any(cb.isChecked() for cb in self.vfx_on.values()):
+            return None                         # the clip as it is (a freeze holds it)
         head_speed = None                       # a file tape's speed under the section's head
         if live or idle:
             now = time.monotonic()
@@ -8210,17 +8867,21 @@ class Main(QMainWindow):
             # sounding (alone at the knob's strength with none), its clock
             # one grain per grain length, the frame held while frozen
             gs = self._gran_state()
+            fz = self._freeze_state() if gs is None else None   # the master freeze's grains
             size = max(0.005, FRAGMENTS["size"] * 4 * beat_ms / 1000.0)
             tnow = time.monotonic()
             if self._gran_t is not None:
                 self._gran_clock += max(0.0, min(0.2, tnow - self._gran_t)) / size
             self._gran_t = tnow
-            amt = v["gran"] * ((0.6 + 0.4 * gs["level"]) if gs else 0.7)
+            loud = gs or fz
+            amt = v["gran"] * ((0.6 + 0.4 * loud["level"]) if loud else 0.7)
             frozen = gs is not None and gs["speed"] == 0.0
-            st["gran"] = {"amt": min(1.0, amt), "freeze": frozen,
-                          "heads": self._gran_heads(gs, size)}
+            st["gran"] = {"amt": min(1.0, amt), "freeze": frozen or fz is not None,
+                          "heads": self._freeze_heads(fz) if fz else self._gran_heads(gs, size)}
             if frozen:
                 st["freeze"] = True
+        if self._freeze_sources:                     # the freeze: the picture on its frame
+            st["freeze"] = True
         if self.video_plain.isChecked() or (self._clean_on and in_bar < beat_ms / 4):
             st["clean"] = True
             if fade < 1.0:

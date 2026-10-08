@@ -57,6 +57,17 @@ millisecond before the tick at `due`, which is then placed exactly there,
 so the receiver's step 1 is our downbeat; stop() sends Stop (0xFC) at once,
 and so do close_port() and all_off() while a Start is out.
 
+Control change out, for the Model:Cycles tab (the box's sound over CC,
+CYCLES_PARAMS below): cc(channel, cc, value) leaves on the same port and
+thread. CCs are gathered for a couple of ms and go out together, one value
+per controller (the last one wins, a repeat of the value last sent is
+dropped), and a controller gets a new value every CC_MIN_S at most: the DIN
+wire takes a millisecond per message, and an LFO on a knob would otherwise
+drown the notes. retrig_start(channel, note, velocity, period_s, length_s,
+fade) is the box's RETRIG function done from here, since it has no CC: the
+note again every period until retrig_stop(channel), the velocity fading in
+(fade > 0) or out (fade < 0) over length_s like the box's FDE and LEN.
+
 Built on mido over python-rtmidi; without them everything here is inert and
 MIDI_AVAILABLE is False.
 """
@@ -91,6 +102,114 @@ DRUM_LABELS = {"kick": "kick", "snare": "snare", "hihat": "closed hat", "ohat": 
 # AUTO channel, notes 12 to 60, is a different mapping; 36 was tried first)
 CYCLES_CHANNELS = {"kick": 1, "snare": 2, "hihat": 3, "ohat": 4, "ride": 5, "glitch": 6}
 CYCLES_ROOT = 60
+# the box's sound over CC, Appendix A of the manual (MODEL_CYCLES_MIDI.md):
+# (key, cc, label, kind, default, what) per track, on the track's channel.
+# kind: "u" 0..127 sent as is; "b" -64..63, sent + 64; "semi" -24..+24
+# semitones spread over 0..127 (64 = 0); "pct" 0..100 % over 0..127;
+# "swing" 50..80 % over 0..127; "on" a switch, 0 or 127; "list" a menu,
+# its index sent (the menu's order, 0 first: the manual gives no values,
+# verify on the box); "dt" the delay time 1..128 in 128ths, sent - 1
+CYCLES_MACHINES = ["kick", "snare", "metal", "perc", "tone", "chord"]
+CYCLES_LFO_WAVES = ["tri", "sine", "square", "saw", "env", "ramp", "random"]
+CYCLES_LFO_DESTS = ["none", "pitch", "fine tune", "decay", "color", "shape", "sweep",
+                    "contour", "delay send", "reverb send", "vol + dist", "pan", "punch",
+                    "gate"]
+# the multiplier: the tempo-synced set (x the tempo) then the fixed one
+# (x 120 BPM, free of the tempo); the box's own order to verify
+_MULTS = ("1", "2", "4", "8", "16", "32", "64", "128", "256", "512", "1k", "2k")
+CYCLES_LFO_MULTS = [f"x{m}" for m in _MULTS] + [f"{m} fixed" for m in _MULTS]
+CYCLES_PARAMS = [
+    ("machine", 70, "machine", "list", 0,
+     "the FM machine the track runs: kick, snare, metal, perc, tone, chord (OS 1.13 "
+     "takes it over CC; the menu order is a guess, verify on the box)"),
+    ("pitch", 65, "pitch", "semi", 0,
+     "tuning, -24 to +24 semitones; the box slews a CC jump into a glide, a firmware "
+     "quirk with no switch, so a step sounds as a portamento"),
+    ("decay", 80, "decay", "u", 64, "the amp envelope's decay, 0 to 127"),
+    ("color", 16, "color", "u", 64, "machine dependent: kick punch, snare noise..."),
+    ("shape", 17, "shape", "u", 64, "machine dependent; chord: picks the chord"),
+    ("sweep", 18, "sweep", "u", 64, "machine dependent: a pitch or filter sweep"),
+    ("contour", 19, "contour", "u", 64, "machine dependent: the sweep's envelope"),
+    ("volume", 7, "vol + dist", "u", 60,
+     "level of the sound, 60 clean unity, above it distorts up to 127"),
+    ("pan", 10, "pan", "b", 0, "left to right, 0 in the middle"),
+    ("dsend", 12, "delay send", "u", 0, "into the box's delay, 0 off"),
+    ("rsend", 13, "reverb send", "u", 0, "into the box's reverb, 0 off"),
+    ("level", 95, "level", "u", 100, "the track's LEVEL knob, 0 to 127"),
+    ("chance", 14, "chance", "pct", 100,
+     "the odds a trig of the box's own pattern plays, 0 to 100 % (our notes always "
+     "play; a trig condition on the box overrides it)"),
+    ("swing", 15, "swing", "swing", 50,
+     "the swing of the box's own pattern, 50 % straight to 80 %"),
+    ("punch", 66, "punch", "on", False,
+     "punch: pseudo-compression and distortion, an accent, off or on"),
+    ("gate", 67, "gate", "on", False,
+     "gate: the envelope holds at full until the note off (our gate time) then decays; "
+     "off, it decays from the note on and ignores the note off"),
+    ("mute", 94, "mute", "on", False,
+     "the track muted on the box (its notes and ours), off or on; the polarity, 0 "
+     "unmuted and 127 muted, to verify"),
+    ("lfo_speed", 102, "LFO speed", "b", 16,
+     "-64 to 63; negative runs the cycle backwards; 8, 16, 32 sit on straight beats"),
+    ("lfo_mult", 103, "LFO mult", "list", 4,
+     "the speed times this: x the tempo (clocked, follows our MIDI clock) or a fixed "
+     "120 BPM; the menu order to verify"),
+    ("lfo_fade", 104, "LFO fade", "b", 0,
+     "-64 to 63: negative fades the modulation in from the trig, positive fades it out"),
+    ("lfo_dest", 105, "LFO dest", "list", 0,
+     "what the LFO moves (Appendix B); the menu order, none first, to verify"),
+    ("lfo_wave", 106, "LFO wave", "list", 0,
+     "triangle, sine, square, saw, envelope (a one-shot from the trig, the speed its "
+     "decay), ramp, random"),
+    ("lfo_phase", 107, "LFO phase", "u", 0,
+     "where the cycle starts at a trig, 0 the beginning, 64 the middle"),
+    ("lfo_reset", 108, "LFO reset", "on", False,
+     "off free-running, on restarts the cycle at every note"),
+    ("lfo_depth", 109, "LFO depth", "b", 0,
+     "-64 to 63, negative inverts, 0 none (the fine LSB, CC 110, goes out as 0)"),
+]
+CYCLES_FX_PARAMS = [
+    ("delay_time", 85, "delay time", "dt", 48,
+     "1 to 128 in 128ths of a whole note, following the tempo: 32 a quarter, 48 a "
+     "dotted eighth, 64 a half"),
+    ("delay_fb", 86, "delay feedback", "u", 64, "0 one echo to 127 forever"),
+    ("rev_size", 87, "reverb size", "u", 64, "the space, 1 to 126, 127 infinite"),
+    ("rev_tone", 88, "reverb tone", "b", 0,
+     "-64 to 63: negative damps the highs, positive the lows"),
+]
+CYCLES_LISTS = {"machine": CYCLES_MACHINES, "lfo_mult": CYCLES_LFO_MULTS,
+                "lfo_dest": CYCLES_LFO_DESTS, "lfo_wave": CYCLES_LFO_WAVES}
+CYCLES_RANGES = {"u": (0, 127), "b": (-64, 63), "semi": (-24, 24), "pct": (0, 100),
+                 "swing": (50, 80), "dt": (1, 128)}
+# the retrig done from here (the box's own has no CC): the rate as a
+# fraction of a whole note (a bar in 4/4), the box's own list; the length
+# of the velocity curve in sixteenth steps, 0 = infinite (a flat curve)
+CYCLES_RETRIG_RATES = [(f"1/{n}", 1.0 / n) for n in (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24,
+                                                    32, 40, 48, 64, 80)]
+CYCLES_RETRIG_LENS = [("1/8 step", 0.125), ("1/4 step", 0.25), ("1/2 step", 0.5),
+                      ("1 step", 1.0), ("2 steps", 2.0), ("4 steps", 4.0), ("8 steps", 8.0),
+                      ("16 steps", 16.0), ("inf", 0.0)]
+
+
+def cycles_cc_value(kind, v):
+    """A panel value of this kind as the 0..127 the box takes."""
+    if kind == "u":
+        x = v
+    elif kind == "b":
+        x = v + 64
+    elif kind == "semi":
+        x = 64 + v * 64.0 / 24.0
+    elif kind == "pct":
+        x = v * 127.0 / 100.0
+    elif kind == "swing":
+        x = (v - 50) * 127.0 / 30.0
+    elif kind == "on":
+        x = 127 if v else 0
+    elif kind == "dt":
+        x = v - 1
+    else:                                 # a list: its index
+        x = v
+    return max(0, min(127, int(round(x))))
 
 
 def port_label(name):
@@ -223,6 +342,8 @@ class MidiOut:
     The same thread runs the MIDI clock and the transport (module note)."""
 
     SPIN_S = 0.002                    # sleep up to here before the due time, then spin
+    CC_GATHER_S = 0.002               # CCs from one moment leave together, this much later
+    CC_MIN_S = 0.010                  # between two values of one controller (DIN: 1 ms a message)
     SLEW = 0.1                        # of a tick period, the most one grid() moves the clock
     START_AHEAD_S = 0.0005            # Start leaves this long before the downbeat's tick
     PPQN = 24
@@ -246,6 +367,14 @@ class MidiOut:
         self._running = False         # a Start went out and no Stop since
         self.ticks = 0
         self.bpm = 120.0              # what the ticks say, for the status line
+        # control changes: gathered, one value per controller, paced
+        self._cc_pending = {}         # (channel, cc) -> value waiting to leave
+        self._cc_last = {}            # (channel, cc) -> the value last sent
+        self._cc_ok_at = {}           # (channel, cc) -> when the next may leave
+        self._cc_due = None           # the next flush, None while nothing waits
+        self.ccs = 0                  # CCs that left, for the status line
+        # retrigs: channel -> [note, velocity, period, length, fade, t0, next]
+        self._retrigs = {}
 
     @property
     def is_open(self):
@@ -287,6 +416,7 @@ class MidiOut:
             old = self._port
             self._all_off_locked(old)
             self._port, self.label = port, label
+            self._cc_last.clear()               # a new port knows nothing yet
             if self._thread is None:
                 self._stop = False
                 self._thread = threading.Thread(target=self._run, name="gacha-midi-out",
@@ -316,6 +446,51 @@ class MidiOut:
             self._push(due, "on", channel, note, velocity)
             self._push(due + gate, "off", channel, note, 0)
             self._cond.notify()
+
+    def cc(self, channel, cc, value, force=False):
+        """A control change, out within a few ms: the last value given for
+        a controller is the one that leaves, a value equal to the one last
+        sent on it is dropped unless `force`, and a controller gets a new
+        value every CC_MIN_S at most (the rest wait their turn)."""
+        if self._port is None or not 0 <= cc <= 127:
+            return
+        value = max(0, min(127, int(round(value))))
+        with self._cond:
+            key = (channel, cc)
+            if force:
+                self._cc_last.pop(key, None)
+            self._cc_pending[key] = value
+            if self._cc_due is None:
+                self._cc_due = time.perf_counter() + self.CC_GATHER_S
+            self._cond.notify()
+
+    def retrig_start(self, channel, note, velocity, period_s, length_s=0.0, fade=0):
+        """The note on `channel` again every `period_s` from now until
+        retrig_stop(channel): the velocity runs from `velocity` scaled by the
+        fade (-128..127, the box's FDE: negative fades out, positive in, both
+        complete at the ends) over `length_s`, then stays; 0 = infinite, a
+        flat curve. A retrig already on the channel starts over."""
+        if self._port is None or not 0 <= note <= 127 or period_s <= 0:
+            return
+        now = time.perf_counter()
+        with self._cond:
+            self._retrigs[channel] = [int(note), max(1, min(127, int(velocity))),
+                                      float(period_s), max(0.0, float(length_s)),
+                                      max(-128, min(127, int(fade))), now, now]
+            self._cond.notify()
+
+    def retrig_stop(self, channel=None):
+        """The retrig on `channel` over, or every one; the note sounding
+        gets its off as scheduled."""
+        with self._cond:
+            if channel is None:
+                self._retrigs.clear()
+            else:
+                self._retrigs.pop(channel, None)
+
+    @property
+    def retrigging(self):
+        return bool(self._retrigs)
 
     # ---- clock and transport (audio thread)
     def grid(self, beat_t, beat_s):
@@ -362,6 +537,9 @@ class MidiOut:
 
     def _all_off_locked(self, port):
         self._heap.clear()
+        self._retrigs.clear()
+        self._cc_pending.clear()
+        self._cc_due = None
         for ch, n in list(self._sounding):
             self._send(port, mido.Message("note_off", channel=ch - 1, note=n, velocity=0))
         self._sounding.clear()
@@ -399,6 +577,49 @@ class MidiOut:
         except Exception:
             pass
 
+    def _cc_flush_locked(self, port, now):
+        """Every pending CC whose controller is free to take one, the
+        rest wait until the first of them is."""
+        later = math.inf
+        for key, val in list(self._cc_pending.items()):
+            ok = self._cc_ok_at.get(key, 0.0)
+            if ok > now:
+                later = min(later, ok)
+                continue
+            del self._cc_pending[key]
+            if self._cc_last.get(key) == val:
+                continue
+            self._cc_last[key] = val
+            self._cc_ok_at[key] = now + self.CC_MIN_S
+            if port is not None:
+                self._send(port, mido.Message("control_change", channel=key[0] - 1,
+                                              control=key[1], value=val))
+                self.ccs += 1
+        self._cc_due = later if later < math.inf else None
+
+    def _retrig_fire_locked(self, port, now):
+        """The retrigs whose next note is due: the note on now, its off
+        half a period later (50 ms at most), the next one a period on."""
+        for ch, r in self._retrigs.items():
+            note, vel, per, length, fade, t0, nxt = r
+            if nxt > now + 0.0005:
+                continue
+            frac = min(1.0, (nxt - t0) / length) if length > 0 else 0.0
+            if fade > 0:                            # in: from what the fade leaves, up to full
+                v = vel * ((1.0 - fade / 128.0) + fade / 128.0 * frac)
+            else:                                   # out: from full, down by the fade
+                v = vel * (1.0 + fade / 128.0 * frac)
+            v = max(1, min(127, int(round(v))))
+            if port is not None:
+                self._send(port, mido.Message("note_on", channel=ch - 1, note=note, velocity=v))
+                self._sounding.add((ch, note))
+                self.sent += 1
+                self._push(nxt + min(0.05, per / 2), "off", ch, note, 0)
+            nxt += per
+            while nxt < now - per:                  # a stall: skip the notes missed
+                nxt += per
+            r[6] = nxt
+
     def _run(self):
         if sys.platform == "win32":        # 1 ms scheduler ticks while we send
             try:
@@ -409,12 +630,15 @@ class MidiOut:
         try:
             while True:
                 with self._cond:
-                    while not self._stop and not self._heap and self._tick_due is None:
+                    while not self._stop and not self._heap and self._tick_due is None \
+                            and self._cc_due is None and not self._retrigs:
                         self._cond.wait()
                     if self._stop:
                         return
                     tick = self._tick_due if self._tick_due is not None else math.inf
-                    due = min(self._heap[0][0] if self._heap else math.inf, tick)
+                    ccd = self._cc_due if self._cc_due is not None else math.inf
+                    rt = min((r[6] for r in self._retrigs.values()), default=math.inf)
+                    due = min(self._heap[0][0] if self._heap else math.inf, tick, ccd, rt)
                     wait = due - time.perf_counter()
                     if wait > self.SPIN_S:
                         self._cond.wait(wait - self.SPIN_S)
@@ -430,6 +654,12 @@ class MidiOut:
                         if port is not None:
                             self._send(port, mido.Message("clock"))
                             self.ticks += 1
+                        continue
+                    if rt <= due:                    # a retrig's note, before any CC
+                        self._retrig_fire_locked(port, time.perf_counter())
+                        continue
+                    if ccd <= due:
+                        self._cc_flush_locked(port, time.perf_counter())
                         continue
                     due, _seq, kind, ch, note, vel = heapq.heappop(self._heap)
                     if kind == "on":

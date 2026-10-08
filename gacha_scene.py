@@ -3,14 +3,16 @@
 gacha_scene.py — the scenes: eight snapshots of the whole live state, each
 recalled at once or morphed into over a few bars.
 
-A scene is what the Perform, Audio FX, LFO and Video tabs hold at the
-moment you press save, in four groups a scene can carry or leave alone:
+A scene is what the Perform, Audio FX, LFO, Video and M:C tabs hold at the
+moment you press save, in five groups a scene can carry or leave alone:
 "audio" (the twelve racks and their volumes, the main volume, the sync
 delay, the A/B pedal, the burst length, the eight VST knobs and the inserts
 bypass), "voices" (the drum voices in or out, the solos, the stems, the
 quantize grid), "lfo" (the eight LFO rows) and "video" (the source grade,
 every effect strength, the shader, its opacity and blend, video-only, the
-picture mode and the dissolve). Saving captures every group; loading
+picture mode and the dissolve) and "mc" (the Model:Cycles tab: every
+track's cells, the delay and reverb, the retrig's settings). Saving
+captures every group; loading
 applies the ticked ones only, so a scene with only video ticked is a look
 that leaves the sound alone.
 
@@ -33,8 +35,9 @@ value the LFO did not write: its new centre).
 import json
 import time
 
-GROUPS = ["audio", "voices", "lfo", "video"]
-GROUP_LABELS = {"audio": "audio", "voices": "voices", "lfo": "LFOs", "video": "video"}
+GROUPS = ["audio", "voices", "lfo", "video", "mc"]
+GROUP_LABELS = {"audio": "audio", "voices": "voices", "lfo": "LFOs", "video": "video",
+                "mc": "M:C"}
 MORPH_BARS = [("1/4", 0.25), ("1/2", 0.5), ("1 bar", 1.0), ("2 bars", 2.0),
               ("4 bars", 4.0), ("8 bars", 8.0), ("16 bars", 16.0), ("32 bars", 32.0)]
 MORPH_DEFAULT = "1 bar"
