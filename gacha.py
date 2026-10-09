@@ -74,7 +74,9 @@ from gacha_frag import (FRAG_DIRS, FRAG_DIVS, FRAG_PLAYS, FRAG_RATES, FRAG_UNITS
                         MAX_VOICES)
 from gacha_fx import (ALL_CHANNELS, AUDIO_FX, BIPOLAR, CHANNELS, FX_SET, FX_SETTINGS,
                       VOICE_LABELS, VOICES)
-from gacha_erae import ERAE_AVAILABLE, PORT as ERAE_PORT, EraeSurface
+from gacha_erae import (ERAE_AVAILABLE, PORT as ERAE_PORT, EraeSurface, PAGES as ERAE_PAGES,
+                        DEFAULT_PAGES as ERAE_DEFAULT_PAGES, SETUP_DOC as ERAE_SETUP_DOC,
+                        make_page as erae_make_page, W as ERAE_W, H as ERAE_H)
 from gacha_vst import KNOBS as VST_KNOBS, InsertChain, place_editor_window, scan_plugins
 from gacha_lfo import (LfoEngine, SHAPES as LFO_SHAPES, RATES as LFO_RATES,
                        RATE_DEFAULT as LFO_RATE_DEFAULT, MODES as LFO_MODES, N_SLOTS as LFO_SLOTS)
@@ -405,6 +407,12 @@ for _v in VOICES:
 KEYMAP += [("audio_focus", f"focus_{_v}", "",
             f"focus the {VOICE_LABELS[_v]} voice for the knobs above")
            for _v in VOICES]
+# the drum pads: a voice's hit from the material, now, with a velocity (a
+# pad's note velocity, the Erae's pressure); the Model:Cycles plays it too
+KEYMAP += [("pads", f"hit_{_v}", "", f"{VOICE_LABELS[_v]} hit: the voice's sample from the "
+                                      "material, on the quantize grid, through its rack, "
+                                      "and its note to the MIDI out, at the pad's velocity")
+           for _v in DRUM_ROLES]
 # the repeat: a cell of the bar held over the running section (Perform tab)
 KEYMAP += [("section", "repeat", "H", "repeat (hold): the cell of the bar playing at the "
                                      "press loops while the key or the note is down, at "
@@ -554,6 +562,8 @@ MC_CONTINUOUS = {f"mc_{_t}_{k}" for _t in MC_TRACKS for k in _MC_KNOBS} \
     | {f"mc_{k}" for k in _MC_KNOBS} \
     | {f"mc_fx_{key}" for key, _cc, _l, kind, *_ in CYCLES_FX_PARAMS if kind != "on"} \
     | set(MC_RETRIG_KNOBS)
+# ids that take a velocity (0..1) from a note's velocity or a pad's pressure
+VELOCITY = {f"hit_{_v}" for _v in DRUM_ROLES}
 # ids held rather than pressed: the key's or the note's release matters too
 # (no QShortcut, the event filter sees both; a CC's falling edge releases)
 HOLD = {"repeat", "brake", "nudge_down", "nudge_up", "frag", "freeze"} \
@@ -583,7 +593,7 @@ KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
                  "audio_focus": "audio racks: focused channel",
                  "fxset": "audio racks: effect settings",
                  "vst": "master inserts (VST3)", "vfx": "video fx: the pool",
-                 "voices": "drum voices", "lfo": "LFOs", "scene": "scenes",
+                 "voices": "drum voices", "pads": "drum pads", "lfo": "LFOs", "scene": "scenes",
                  "macro": "macros", "frag": "fragments: the sliced bar",
                  **{f"audio_{_ch}": f"audio rack: {_ch}" for _ch in CHANNELS},
                  **{f"rack_{_v}": f"audio rack: {VOICE_LABELS[_v]} voice" for _v in VOICES},
@@ -1591,6 +1601,99 @@ class LfoBar(QWidget):
         p.drawRect(QRectF(mid - 0.5, 0, 1, h))
 
 
+class EraeMirror(QWidget):
+    """The page the Erae shows, as the app draws it: the surface's last
+    frame scaled up, the fingers on it, and the control under the mouse
+    named through `hovered`. `surface` is the EraeSurface, or None."""
+
+    hovered = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.surface = None
+        self.fingers = {}                # (zone, fid) -> (x, y, z)
+        self.setMinimumSize(ERAE_W * 7, ERAE_H * 7)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.update)
+        self._timer.start(100)
+        self._bound = None
+
+    def _geometry(self):
+        cell = min(self.width() / ERAE_W, (self.height() - 18) / ERAE_H)
+        x0 = (self.width() - cell * ERAE_W) / 2
+        y0 = 18 + (self.height() - 18 - cell * ERAE_H) / 2
+        return cell, x0, y0
+
+    def _on_finger(self, zone, code, fid, x, y, z):
+        if code == 2:
+            self.fingers.pop((zone, fid), None)
+        else:
+            self.fingers[(zone, fid)] = (x, y, z)
+
+    def _bind(self):
+        surf = self.surface
+        if surf is self._bound:
+            return
+        if self._bound is not None:
+            try:
+                self._bound.finger.disconnect(self._on_finger)
+            except (RuntimeError, TypeError):
+                pass
+        if surf is not None:
+            surf.finger.connect(self._on_finger)
+        self._bound = surf
+        self.fingers.clear()
+
+    def paintEvent(self, _event):
+        self._bind()
+        surf = self.surface
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(12, 10, 10))
+        cell, x0, y0 = self._geometry()
+        frame = surf.last_frame() if surf is not None else None
+        zone = surf.active_zone() if surf is not None else None
+        if frame is None:
+            p.setPen(QColor(242, 233, 229, 110))
+            p.drawText(self.rect(), Qt.AlignCenter,
+                       "no page" if surf is not None else "surface off")
+            return
+        for row, cells in enumerate(frame):
+            yy = y0 + (ERAE_H - 1 - row) * cell
+            for col, (r, g, b) in enumerate(cells):
+                if (r, g, b) == (0, 0, 0):
+                    c = QColor(22, 20, 20)
+                else:                    # the LEDs read brighter than their numbers
+                    c = QColor(*(int(255 * (v / 127.0) ** 0.6) for v in (r, g, b)))
+                p.fillRect(QRectF(x0 + col * cell + 0.5, yy + 0.5, cell - 1, cell - 1), c)
+        p.setPen(QPen(QColor(255, 255, 255, 220), 2))
+        p.setBrush(Qt.NoBrush)
+        for (z, _fid), (fx, fy, fz) in self.fingers.items():
+            if z != zone:
+                continue
+            r = cell * (0.6 + 2.0 * min(1.0, fz / 0.25))
+            p.drawEllipse(QPointF(x0 + fx * cell, y0 + (ERAE_H - fy) * cell), r, r)
+        pg = surf.active_page()
+        if pg is not None:
+            p.setPen(QColor(242, 233, 229, 160))
+            p.drawText(QRectF(x0, 0, cell * ERAE_W, 16), Qt.AlignLeft | Qt.AlignVCenter,
+                       f"N{surf.active + 1}  {pg.title}")
+
+    def mouseMoveEvent(self, event):
+        surf = self.surface
+        pg = surf.active_page() if surf is not None else None
+        if pg is None:
+            self.hovered.emit("")
+            return
+        cell, x0, y0 = self._geometry()
+        pos = event.position()
+        fx = (pos.x() - x0) / cell
+        fy = ERAE_H - (pos.y() - y0) / cell
+        wd = pg.widget_at(fx, fy)
+        self.hovered.emit("" if wd is None else f"{wd.label}: " + ", ".join(wd.idents()))
+
+
 class PerfMeter(QWidget):
     """The section at a glance, big enough to read from the pedals: what
     plays (kind, root, tempo) in large type, and the loop's bars as a row of
@@ -1748,6 +1851,8 @@ class DragSpin(QObject):
         t = event.type()
         if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
             box = self._spin_of(obj)
+            if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
+                box = None                 # a Ctrl- or Alt-click: the MIDI learn's, not a drag
             if box is not None and box.isEnabled() and not box.isReadOnly():
                 self._box, self._armed = box, False
                 self._y0 = event.globalPosition().y()
@@ -1940,6 +2045,8 @@ class Main(QMainWindow):
         # the live section engine: material carved from the takes, sections
         # rendered on a thread, played by the audio thread's SectionPlayer
         self._perf_material = None                  # (key, Material)
+        self._pad_rr = {}                            # the drum pads: round-robin per role
+        self._pad_cache = {}                         # (material, role, variant, layer, sr) -> clip
         self._burst = None                          # (t0, until, take, off): a burst's picture
         self._perf_hold = None                      # the last take frame shown: held over gaps
         self._head_tape = False
@@ -2182,6 +2289,8 @@ class Main(QMainWindow):
             self.actions[f"voice_{v}"] = self.perf_voices[v].toggle
             self.actions[f"solo_{v}"] = self.perf_solos[v].toggle
         self.actions["voices_reset"] = self._voices_reset
+        for v in DRUM_ROLES:
+            self.actions[f"hit_{v}"] = lambda vel=1.0, v=v: self.perform_hit(v, vel)
         self.actions["quant_next"] = lambda: self._combo_next(self.perf_quant)
         # MIDI-only buttons
         self.actions.update({
@@ -2369,6 +2478,7 @@ class Main(QMainWindow):
             self.through_block.blockSignals(False)
         self._io_ready = True
         self._keys_into_tips()                  # "(N)" off the buttons, into the tips
+        self._live_defaults = self._live_state()  # as built: the values-only reset's target
         self._live_restore()                    # the knobs as they were left
         self._live_timer = QTimer(self)         # and kept from then on, every few seconds
         self._live_timer.setInterval(3000)
@@ -2498,6 +2608,7 @@ class Main(QMainWindow):
         tabs.addTab(self._tab_macros(), "Macros")
         tabs.addTab(scenes, "Scenes")
         tabs.addTab(cycles, "M:C")
+        tabs.addTab(self._tab_erae(), "Erae")
         tabs.addTab(self._tab_controls(), "Controls")
         tabs.addTab(general, "Settings")
         tabs.addTab(self._tab_log(), "Log")
@@ -2611,11 +2722,7 @@ class Main(QMainWindow):
         self.midi_last = QLabel("no MIDI yet" if MIDI_AVAILABLE else
                                 "MIDI off: pip install mido python-rtmidi")
         self.midi_last.setProperty("role", "sub")
-        # two columns: the MIDI inputs on the left, the Erae 2 on the right
-        left = QVBoxLayout()
-        left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(4)
-        left.addWidget(QLabel("MIDI inputs"))
+        outer.addWidget(QLabel("MIDI inputs"))
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.addWidget(self.midi_ports, stretch=1)
@@ -2623,40 +2730,8 @@ class Main(QMainWindow):
         side.addWidget(rescan)
         side.addStretch(1)
         top.addLayout(side)
-        left.addLayout(top)
-        left.addWidget(self.midi_last)
-        # the Erae 2's API zones as a drawn control surface (gacha_erae.py);
-        # on, this owns the Erae's port and forwards its pads' notes and CCs
-        self.erae_on = QCheckBox("Erae 2 surface")
-        self.erae_on.setToolTip(
-            "Needs an Erae 2 with API zones in its layout (Erae Lab), and Erae "
-            "Lab closed. The zones are taken in id order: main volume, A/B, "
-            "the section pads, stems and clock, picture glitch x rgb, the "
-            "focused rack's lowpass / delay / reverb / drive, shader pick x "
-            "mix, focus and switches (the order is the ROLES list in "
-            "gacha_erae.py). The rest of the layout still reaches the map "
-            "below as plain MIDI. Remembered.")
-        self.erae_status = QLabel("")
-        self.erae_status.setProperty("role", "sub")
-        self.erae_status.setWordWrap(True)
-        if not ERAE_AVAILABLE:
-            self.erae_on.setEnabled(False)
-            self.erae_status.setText("python-rtmidi missing")
-        erae_hint = self._info("the layout's API zones become faders, pads and X/Y pads, "
-                           "lit with the app's state")
-        right = QVBoxLayout()
-        right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(4)
-        right.addWidget(self.erae_on)
-        right.addWidget(erae_hint)
-        right.addWidget(self.erae_status)
-        right.addStretch(1)
-        cols = QHBoxLayout()
-        cols.setContentsMargins(0, 0, 0, 0)
-        cols.setSpacing(12)
-        cols.addLayout(left, stretch=9)      # the inputs: a bit under half the width
-        cols.addLayout(right, stretch=11)
-        outer.addLayout(cols)
+        outer.addLayout(top)
+        outer.addWidget(self.midi_last)
         outer.addWidget(self._midi_out_panel())
 
         tree = QTreeWidget()
@@ -2713,7 +2788,13 @@ class Main(QMainWindow):
         defaults_btn.clicked.connect(self._midi_defaults)
         hint = self._info("none of these bring the hidden interface back; a button "
                       "fires on note on, program change or a CC going above 63; "
-                      "a knob row takes a CC over the widget's whole range")
+                      "a knob row takes a CC over the widget's whole range. "
+                      "Learn from the interface: Ctrl-click any knob, switch, menu or "
+                      "slider, then move or press the controller; this adds to what the "
+                      "controller drives already, so one knob can turn several cells "
+                      "(a shared row shows (+1), its tooltip names the others). "
+                      "Alt-click a control to unbind its row. The MIDI cell here still "
+                      "replaces: it takes the controller away from its other rows.")
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(hint, stretch=1)
@@ -3459,6 +3540,8 @@ class Main(QMainWindow):
         self.midi = MidiIn(self)
         self.midi.message.connect(self._on_midi)
         self._midi_learn = None                 # ident being learnt, or None
+        self._midi_learn_add = False            # that learn leaves the control's other rows
+        self._pad_learn = None                  # the pad rows still to learn in a row, or None
         self._midi_cc_last = {}                 # (ch, cc) -> last value, for edges
         self.midi_map = default_midi_map()
         saved = self.settings.value("midi/map", "")
@@ -3472,12 +3555,12 @@ class Main(QMainWindow):
         ticked = self.settings.value("midi/ports", None)
         self._midi_ticked = set(ticked) if ticked is not None else None   # None: first run
         self._midi_refresh_tree()
+        self._midi_out_setup()                  # first: the Erae mirrors its clock
         self.erae = None                        # EraeSurface while the Erae row is on
         self.erae_on.toggled.connect(self._erae_toggled)
         if ERAE_AVAILABLE and self.settings.value("erae/on", False, type=bool):
             self.erae_on.setChecked(True)       # before the MIDI ports open: the port is the surface's
         self._midi_refresh_ports()
-        self._midi_out_setup()
         self._midi_timer = QTimer(self)
         self._midi_timer.timeout.connect(self._midi_refresh_ports)
         self._midi_timer.timeout.connect(self._midi_out_refresh_ports)
@@ -3548,12 +3631,101 @@ class Main(QMainWindow):
                 item.setForeground(3, QColor(242, 233, 229, 230 if text else 90))
             b = parse_binding(text)
             if b:
-                rev[b] = ident
+                rev.setdefault(b, []).append(ident)
+        for b, idents in rev.items():
+            if len(idents) > 1:                 # one control, several rows: each says so
+                for ident in idents:
+                    item = self.midi_items[ident]
+                    item.setText(3, f"{self.midi_map[ident]}  (+{len(idents) - 1})")
+                    item.setToolTip(3, "also drives: " + ", ".join(i for i in idents if i != ident))
+            else:
+                self.midi_items[idents[0]].setToolTip(3, "")
         self._midi_rev = rev
         self.controls_tree.resizeColumnToContents(3)
 
     def _midi_save(self):
         self.settings.setValue("midi/map", json.dumps(self.midi_map))
+
+    def _learn_widgets(self):
+        """Widget -> action id for every control with a row in the Controls
+        tab, read off the actions themselves (the widget a setter closes
+        over, a toggle's own widget, a combo passed as a default)."""
+        m = getattr(self, "_learn_map", None)
+        if m is not None:
+            return m
+        m = {}
+        for ident, fn in self.actions.items():
+            if ident not in self.midi_items:
+                continue
+            found = [getattr(fn, "__self__", None)]
+            for cell in getattr(fn, "__closure__", None) or ():
+                try:
+                    found.append(cell.cell_contents)
+                except ValueError:
+                    pass
+            found.extend(getattr(fn, "__defaults__", None) or ())
+            for w in found:
+                if isinstance(w, QWidget) and w is not self and not w.isWindow() \
+                        and w not in m:
+                    m[w] = ident
+                    break
+        self._learn_map = m
+        return m
+
+    def _learn_click(self, obj):
+        """A Ctrl-click on a control: its row in the Controls tab learns
+        the next MIDI message (a second Ctrl-click, or a click in the tree,
+        cancels). True when the click landed on a control."""
+        m = self._learn_widgets()
+        w, ident = obj, None
+        for _ in range(5):
+            if w is None:
+                break
+            ident = m.get(w)
+            if ident is not None:
+                break
+            w = w.parentWidget()
+        if ident is None:
+            return False
+        self._midi_learn = None if self._midi_learn == ident else ident
+        self._midi_learn_add = True             # on top of what the control drives already
+        if self._midi_learn:
+            what = "move a knob or a pedal" if ident in CONTINUOUS \
+                else "press the switch or hit the pad"
+            self.midi_last.setText(f"learning {ident}: {what}; Ctrl-click again to cancel")
+            self.log.appendPlainText(f"midi: learning {ident} ({what}), added to the control's rows")
+            self.controls_tree.scrollToItem(self.midi_items[ident])
+        else:
+            self.midi_last.setText(f"learning {ident}: cancelled")
+        self._midi_refresh_tree()
+        return True
+
+    def _learn_clear_click(self, obj):
+        """An Alt-click on a control: its row's binding goes. True when the
+        click landed on a control."""
+        m = self._learn_widgets()
+        w, ident = obj, None
+        for _ in range(5):
+            if w is None:
+                break
+            ident = m.get(w)
+            if ident is not None:
+                break
+            w = w.parentWidget()
+        if ident is None:
+            return False
+        text = self.midi_map.get(ident, "")
+        if self._midi_learn == ident:
+            self._midi_learn = None
+        if text:
+            self.midi_map[ident] = ""
+            self._midi_save()
+            self.midi_last.setText(f"{ident}: {text} unbound")
+            self.log.appendPlainText(f"midi: {ident}: {text} unbound")
+        else:
+            self.midi_last.setText(f"{ident}: nothing bound")
+        self._midi_refresh_tree()
+        return True
 
     def _midi_tree_clicked(self, item, column):
         ident = item.data(0, Qt.UserRole)
@@ -3565,6 +3737,7 @@ class Main(QMainWindow):
                 self._midi_refresh_tree()
             return
         self._midi_learn = None if self._midi_learn == ident else ident
+        self._midi_learn_add = False
         if self._midi_learn:
             what = "move a knob or a pedal" if ident in CONTINUOUS \
                 else "press the switch or hit the pad"
@@ -3590,15 +3763,156 @@ class Main(QMainWindow):
         self.log.appendPlainText("midi: default map")
 
     # ------------------------------------------------------------ Erae 2 surface
+    def _tab_erae(self):
+        """The Erae 2: the surface's switch and status, the clock and the
+        transport to the device, which page sits on each N button, a
+        mirror of the page on screen naming the control under the mouse,
+        and the documentation of every page."""
+        outer = QVBoxLayout()
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+        self.erae_on = QCheckBox("Erae 2 surface")
+        self.erae_on.setToolTip(
+            "Needs an Erae 2 whose eight layouts each hold one API zone over the "
+            "whole surface (Erae Lab: zone index 0 on N1 up to 7 on N8), and Erae "
+            "Lab closed. Each layout becomes the page chosen below, drawn and read "
+            "from here; the layout's own pads and faders still reach the Controls "
+            "tab's map as plain MIDI. Remembered.")
+        self.erae_status = QLabel("off")
+        self.erae_status.setProperty("role", "sub")
+        self.erae_status.setWordWrap(True)
+        if not ERAE_AVAILABLE:
+            self.erae_on.setEnabled(False)
+            self.erae_status.setText("python-rtmidi missing")
+        sv = self.settings.value
+        self.erae_clock = QCheckBox("MIDI clock to the Erae")
+        self.erae_clock.setToolTip(
+            "The app's MIDI clock (24 ticks a beat: the section's grid while one "
+            "plays, the live clock otherwise) on the Erae's port, so its looper "
+            "locks to the show. On the device: Settings > MIDI clock > clock source "
+            "= USB device. Runs whether or not the MIDI out panel's own clock is on.")
+        self.erae_clock.setChecked(sv("erae/clock", True, type=bool))
+        self.erae_transport = QCheckBox("transport")
+        self.erae_transport.setToolTip(
+            "Start to the Erae on the live clock's next downbeat when this goes on, "
+            "again at D (downbeat) and with every section's first bar, so the "
+            "device's loop starts on our one. Nothing stops it when a section ends "
+            "unless the next tick says so.")
+        self.erae_transport.setChecked(sv("erae/transport", True, type=bool))
+        self.erae_stop = QCheckBox("stop with the section")
+        self.erae_stop.setToolTip("Stop to the Erae when a section clears: its looper "
+                                  "stops and starts from the top at the next Start")
+        self.erae_stop.setChecked(sv("erae/stop", False, type=bool))
+        for cb in (self.erae_clock, self.erae_transport, self.erae_stop):
+            cb.toggled.connect(self._erae_sync_apply)
+        self.erae_learn = QPushButton("learn the pads")
+        self.erae_learn.setCheckable(True)
+        self.erae_learn.setToolTip(
+            "The device's own pads (a layout built in Erae Lab) to the drum rows in one go: "
+            "click, then tap the pads in this order: kick, snare, closed hat, open hat, ride, "
+            "hat stutter, burst, event. Click again to stop early and keep what was learned.")
+        self.erae_learn.toggled.connect(self._pad_learn_toggled)
+        outer.addWidget(self._row([("", self.erae_on), ("", self.erae_clock),
+                                   ("", self.erae_transport), ("", self.erae_stop),
+                                   ("", self.erae_learn)]))
+        outer.addWidget(self.erae_status)
+        # the pages on the N buttons on the left, the mirror on the right
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(3)
+        self.erae_page_combos = []
+        names = self._erae_pages()
+        for i in range(8):
+            lbl = QLabel(f"N{i + 1}")
+            lbl.setProperty("role", "sub")
+            combo = QComboBox()
+            for key in ERAE_PAGES:
+                combo.addItem(erae_make_page(key).title, key)
+            combo.setCurrentIndex(max(0, combo.findData(names[i])))
+            combo.currentIndexChanged.connect(self._erae_pages_changed)
+            combo.setToolTip("The page this layout button shows; the documentation "
+                             "below says what is on it")
+            grid.addWidget(lbl, i, 0)
+            grid.addWidget(combo, i, 1)
+            self.erae_page_combos.append(combo)
+        grid.setColumnStretch(1, 1)
+        left = QVBoxLayout()
+        left.setContentsMargins(0, 0, 0, 0)
+        left.addWidget(QLabel("pages"))
+        left.addLayout(grid)
+        left.addStretch(1)
+        self.erae_mirror = EraeMirror()
+        self.erae_hover = QLabel("hover the page: the control under the mouse")
+        self.erae_hover.setWordWrap(True)
+        self.erae_hover.setMinimumHeight(44)
+        self.erae_hover.setStyleSheet(
+            "QLabel { background: rgb(28, 22, 20); color: rgb(242, 233, 229); "
+            "font-size: 17px; padding: 6px 10px; border-radius: 4px; }")
+        self.erae_mirror.hovered.connect(
+            lambda t: self.erae_hover.setText(t or "hover the page: the control under the mouse"))
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.addWidget(QLabel("on screen"))
+        right.addWidget(self.erae_mirror, stretch=1)
+        right.addWidget(self.erae_hover)
+        cols = QHBoxLayout()
+        cols.setContentsMargins(0, 0, 0, 0)
+        cols.setSpacing(12)
+        cols.addLayout(left, stretch=2)
+        cols.addLayout(right, stretch=3)
+        outer.addLayout(cols, stretch=2)
+        self.erae_doc = QPlainTextEdit()
+        self.erae_doc.setReadOnly(True)
+        self.erae_doc.setPlainText(self._erae_doc_text())
+        outer.addWidget(QLabel("documentation"))
+        outer.addWidget(self.erae_doc, stretch=1)
+        w = QWidget()
+        w.setLayout(outer)
+        return w
+
+    def _erae_pages(self):
+        """The page names on N1..N8, from the settings (the catalogue's
+        defaults where nothing is saved)."""
+        try:
+            names = json.loads(self.settings.value("erae/pages", "") or "[]")
+        except (TypeError, ValueError):
+            names = []
+        names = [n if n in ERAE_PAGES else "empty" for n in names][:8]
+        return names + ERAE_DEFAULT_PAGES[len(names):]
+
+    def _erae_pages_changed(self, *_a):
+        names = [c.currentData() for c in self.erae_page_combos]
+        self.settings.setValue("erae/pages", json.dumps(names))
+        if self.erae is not None:
+            self.erae.set_pages(names)
+        self.erae_doc.setPlainText(self._erae_doc_text())
+
+    def _erae_doc_text(self):
+        names = [c.currentData() for c in self.erae_page_combos]
+        parts = [ERAE_SETUP_DOC, ""]
+        for i, name in enumerate(names):
+            parts.append(f"N{i + 1}  " + erae_make_page(name).describe())
+            parts.append("")
+        return "\n".join(parts)
+
+    def _erae_page_changed(self, k):
+        pg = self.erae.active_page() if self.erae is not None else None
+        if pg is not None:
+            self.midi_last.setText(f"erae: N{k + 1} {pg.title}")
+
     def _erae_toggled(self, on):
-        """The Controls tab's Erae row: the surface takes the Erae's port
-        (the MIDI list lets go of it first) and paints the zones; off, it
-        blanks them, leaves API mode, and the port is a plain input again."""
+        """The Erae tab's switch: the surface takes the Erae's port (the
+        MIDI list lets go of it first), draws the pages and gets the clock;
+        off, it blanks them, leaves API mode, and the port is a plain input
+        again."""
         self.settings.setValue("erae/on", on)
         if on and self.erae is None:
-            self.erae = EraeSurface(self._erae_read, parent=self)
+            self.erae = EraeSurface(self._erae_read, pages=self._erae_pages(), parent=self)
             self.erae.action.connect(self._erae_action)
+            self.erae.hold.connect(self._erae_hold)
             self.erae.midi.connect(self._on_midi)
+            self.erae.page.connect(self._erae_page_changed)
             self.erae.log.connect(self.log.appendPlainText)
             self.erae.log.connect(self.erae_status.setText)
             if self._midi_ticked is not None:
@@ -3614,7 +3928,12 @@ class Main(QMainWindow):
             else:
                 self.erae_status.setText("joining: asking the zones their size...")
                 self.log.appendPlainText(f"erae: on, {self.erae.label}")
+                self.erae_mirror.surface = self.erae
+                self._erae_sync_apply()
+                self._erae_start()
         elif not on and self.erae is not None:
+            self.midi_out.mirror(self.erae, False, False)
+            self.erae_mirror.surface = None
             self.erae.close()
             self.erae = None
             self.erae_status.setText("off")
@@ -3622,17 +3941,109 @@ class Main(QMainWindow):
             if self._midi_ticked is not None:
                 self._midi_open()               # the port is a plain input again, if ticked
 
+    def _erae_sync_apply(self, *_a):
+        """The clock and transport ticks to the settings and the mirror."""
+        clock = self.erae_clock.isChecked()
+        transport = self.erae_transport.isChecked()
+        stop = self.erae_stop.isChecked()
+        self.settings.setValue("erae/clock", clock)
+        self.settings.setValue("erae/transport", transport)
+        self.settings.setValue("erae/stop", stop)
+        if self.erae is None:
+            return
+        was = self.midi_out.mirrored
+        self.midi_out.mirror(self.erae, clock=clock, transport=transport, stop=stop)
+        if transport and not was:
+            self._erae_start()
+
+    def _erae_start(self, at_next_bar=True):
+        """Start to the Erae on the live clock's next downbeat (or now),
+        so the device's loop begins on our one."""
+        if self.erae is None or not self.erae_transport.isChecked():
+            return
+        bar_s = 4 * 60.0 / max(1e-6, self.tempo.bpm)
+        now_m = time.monotonic()
+        due_m = now_m
+        if at_next_bar:
+            n = math.ceil((now_m - self.tempo.anchor) / bar_s - 1e-6)
+            due_m = self.tempo.anchor + n * bar_s
+        self.midi_out.start(time.perf_counter() + max(0.0, due_m - now_m))
+
+    PAD_LEARN = ["hit_kick", "hit_snare", "hit_hihat", "hit_ohat", "hit_ride", "hit_glitch",
+                 "burst", "event"]
+
+    def _pad_learn_toggled(self, on):
+        """The pads in a row: each note that comes in maps the next row of
+        PAD_LEARN; off (or the end) keeps what was learned so far."""
+        if on:
+            self._midi_learn = None
+            self._midi_refresh_tree()
+            self._pad_learn = list(self.PAD_LEARN)
+            self._pad_learn_prompt()
+        else:
+            if self._pad_learn is not None:
+                done = len(self.PAD_LEARN) - len(self._pad_learn)
+                self._pad_learn = None
+                self.erae_status.setText(f"pads: {done} learned")
+                self.log.appendPlainText(f"pads: {done} of {len(self.PAD_LEARN)} learned")
+
+    def _pad_learn_prompt(self):
+        ident = self._pad_learn[0]
+        n = len(self.PAD_LEARN) - len(self._pad_learn) + 1
+        name = VOICE_LABELS.get(ident[4:], ident) if ident.startswith("hit_") else ident
+        self.erae_status.setText(f"pads: tap the pad for {name} ({n} of {len(self.PAD_LEARN)}), "
+                                 "click the button again to stop here")
+
+    def _pad_learn_note(self, port, kind, ch, num, val):
+        """A message while the pads are being learned: True when it was taken."""
+        if kind != "note" or val == 0:
+            return kind == "note"               # releases: eaten, the rest passes
+        text = format_binding(kind, ch, num)
+        ident = self._pad_learn[0]
+        done = self.PAD_LEARN[:len(self.PAD_LEARN) - len(self._pad_learn)]
+        if any(i in done for i in self._midi_rev.get((kind, ch, num), ())):
+            return True                         # the same pad again: a double hit
+        for other in self._midi_rev.get((kind, ch, num), ()):
+            if other != ident:
+                self.midi_map[other] = ""
+                self.log.appendPlainText(f"midi: {text} taken from {other}")
+        self.midi_map[ident] = text
+        self._midi_save()
+        self._midi_refresh_tree()
+        self.log.appendPlainText(f"midi: {ident} <- {text} ({port})")
+        self._pad_learn.pop(0)
+        if self._pad_learn:
+            self._pad_learn_prompt()
+        else:
+            self._pad_learn = None
+            self.erae_learn.setChecked(False)
+            self.erae_status.setText(f"pads: all {len(self.PAD_LEARN)} learned")
+            self.log.appendPlainText("pads: all learned")
+        return True
+
     def _erae_action(self, ident, value):
-        """A zone asked for an action: buttons call, knobs get 0..1."""
+        """A page asked for an action: a knob gets 0..1, a button a call."""
         fn = self.actions.get(ident)
         if fn is None:
             return
-        if ident in CONTINUOUS:
-            fn(float(value if value is not None else 0.0))
+        if value is not None:
+            fn(float(value))
             self.midi_last.setText(f"last: erae {ident} = {float(value):.2f}")
         else:
             fn()
             self.midi_last.setText(f"last: erae {ident}")
+
+    def _erae_hold(self, ident, down):
+        """A page's held action going down or up; an action without a
+        hold handler is pressed on the down."""
+        h = self.holds.get(ident)
+        if h is not None:
+            h("erae", down)
+        elif down:
+            fn = self.actions.get(ident)
+            if fn is not None:
+                fn()
+        self.midi_last.setText(f"last: erae {ident} {'down' if down else 'up'}")
 
     @staticmethod
     def _frac_of(widget):
@@ -3640,27 +4051,79 @@ class Main(QMainWindow):
         lo, hi = widget.minimum(), widget.maximum()
         return 0.0 if hi <= lo else (widget.value() - lo) / (hi - lo)
 
+    @staticmethod
+    def _combo_at(combo):
+        return (combo.currentIndex() + 0.5) / max(1, combo.count())
+
     def _erae_read(self, ident):
         """The app's state for the LEDs: 0..1 for a knob, True/False for a
-        switch, the beat phase for "beat" while a section plays, None when
-        there is nothing to show."""
-        if ident == "volume":
-            return self._frac_of(self.vol)
+        switch, the clock's phases, the section, the scenes and the
+        fragments for the strips, None when there is nothing to show."""
         if ident == "ab":
             return self._frac_of(self.perf_ab)
-        if ident == "shader_mix":
-            return self._frac_of(self.shader_mix)
-        if ident == "shader_pick":
-            files = self._shader_pool()
-            name = self.shader.currentText()
-            idx = next((i + 1 for i, p in enumerate(files) if p.stem == name), 0)
-            return (idx + 0.5) / (len(files) + 1)
-        if ident.startswith("fx_"):
-            sp = self.vfx.get(ident[3:])
-            return None if sp is None else self._frac_of(sp)
-        if ident.startswith("afx_") and ident.count("_") == 1:      # the focused rack
-            sp = self.afx.get((self.afx_focus.currentText(), ident[4:]))
-            return None if sp is None else self._frac_of(sp)
+        if ident == "beat":
+            la = self.through
+            if la is not None and la.running and la.player.playing:
+                return ((time.monotonic() - self.tempo.anchor) / (60.0 / self.tempo.bpm)) % 1.0
+            return None
+        if ident == "bar":
+            pos = self.perf_meter.pos
+            if pos is not None:
+                return pos % 1.0
+            return ((time.monotonic() - self.tempo.anchor) / (240.0 / self.tempo.bpm)) % 1.0
+        if ident == "pos":
+            return self.perf_meter.pos
+        if ident == "bars":
+            return self.perf_meter.bars
+        if ident == "kind":
+            sec = self._perf_playing
+            return sec.kind if sec is not None and self.perf_meter.pos is not None else None
+        if ident == "level":
+            la = self.through
+            return min(1.0, float(getattr(la, "out_peak", 0.0))) if la is not None else None
+        if ident == "scene_cur":
+            return self.scenes.current
+        if ident.startswith("scene_empty_"):
+            return self.scenes.slots[int(ident[12:]) - 1].empty
+        if ident == "morph":
+            return None if self.scene_morph is None else self.scene_morph.frac
+        if ident == "frag_divs":
+            return int(self.frag_div.currentText() or 16)
+        if ident == "frag_held":
+            return {k for k, srcs in self._frag_sources.items() if srcs}
+        if ident == "frag_slice":
+            pl = self._player()
+            st = pl.frag_state() if pl is not None else None
+            return st["slice"] if st else None
+        if ident == "repeat":
+            return bool(self._rep_sources)
+        if ident == "brake":
+            return bool(self._brake_sources)
+        if ident == "freeze":
+            return bool(self._freeze_sources)
+        if ident == "nudge_down":
+            return bool(self._nudge_sources[-1])
+        if ident == "nudge_up":
+            return bool(self._nudge_sources[1])
+        if ident.startswith("frag_") and ident[5:].isdigit():
+            return bool(self._frag_sources.get(int(ident[5:])))
+        if ident.startswith("mc_retrig_") and ident[10:].isdigit():
+            return bool(self._mc_retrig_src.get(int(ident[10:])))
+        switches = {"through": self.through_on, "video_only": self.video_plain,
+                    "video_off": self.video_off, "video_second": self.video_second,
+                    "link": self.link_on, "midi_out": self.midi_out_on,
+                    "metronome": self.midi_metro, "scene_morph": self.scene_morph_on,
+                    "rep_rev": self.rep_rev, "half": self.half_btn, "double": self.double_btn,
+                    "live": self.live_on, "inserts": self.vst_bypass}
+        w = switches.get(ident)
+        if w is not None:
+            return w.isChecked()
+        if ident == "record":
+            return self.takes.recording
+        if ident == "shader":
+            return self.shader.currentText() != "off"
+        if ident == "pitch_lock":
+            return self.pitch_mode.currentIndex() == 1
         if ident.startswith("stem_"):
             cb = self.perf_stems.get(ident[5:])
             return None if cb is None else cb.isChecked()
@@ -3672,41 +4135,41 @@ class Main(QMainWindow):
             return None if b is None else b.isChecked()
         if ident.startswith("focus_"):
             return self.afx_focus.currentText() == ident[6:]
-        if ident == "record":
-            return self.takes.recording
-        if ident == "shader":
-            return self.shader.currentText() != "off"
-        if ident == "video_only":
-            return self.video_plain.isChecked()
-        if ident == "through":
-            return self.through_on.isChecked()
-        if ident == "link":
-            return self.link_on.isChecked()
-        if ident == "midi_out":
-            return self.midi_out_on.isChecked()
-        if ident == "video_off":
-            return self.video_off.isChecked()
-        if ident == "beat":
-            la = self.through
-            if la is not None and la.running and la.player.playing:
-                return ((time.monotonic() - self.tempo.anchor) / (60.0 / self.tempo.bpm)) % 1.0
-            return None
-        return None
+        if ident.startswith("mc_focus_") and ident[9:].isdigit():
+            return self.mc_focus.currentIndex() == int(ident[9:]) - 1
+        if ident.startswith("lfo_") and ident[4:].isdigit():
+            return self.lfo_rows[int(ident[4:]) - 1]["on"].isChecked()
+        if ident.startswith("afx_") and ident.count("_") == 1:      # the focused rack
+            sp = self.afx.get((self.afx_focus.currentText(), ident[4:]))
+            return None if sp is None else self._frac_of(sp)
+        if ident == "avol":
+            sp = self.afx.get((self.afx_focus.currentText(), "vol"))
+            return None if sp is None else self._frac_of(sp)
+        if ident == "brake_len":
+            return self._combo_at(self.brake_len)
+        if ident == "speed_sync":
+            return self._combo_at(self.speed_sync)
+        return self._lfo_get(ident)
 
     def _on_midi(self, port, kind, ch, num, val):
         """Every message from every ticked controller, on the GUI thread."""
         text = format_binding(kind, ch, num)
         self.midi_last.setText(f"last: {text} = {val} from {port}")
+        if self._pad_learn is not None and self._pad_learn_note(port, kind, ch, num, val):
+            return
         if self._midi_learn is not None:
             ident = self._midi_learn
             if ident in CONTINUOUS and kind != "cc":
                 return                          # a pedal, not a switch
             if kind == "note" and val == 0:
                 return                          # a release, not a press
-            other = self._midi_rev.get((kind, ch, num))
-            if other and other != ident:
-                self.midi_map[other] = ""       # one control, one action
-                self.log.appendPlainText(f"midi: {text} taken from {other}")
+            others = [i for i in self._midi_rev.get((kind, ch, num), ()) if i != ident]
+            if others and not self._midi_learn_add:
+                for other in others:
+                    self.midi_map[other] = ""   # one control, one action
+                self.log.appendPlainText(f"midi: {text} taken from {', '.join(others)}")
+            elif others:
+                self.log.appendPlainText(f"midi: {text} also drives {', '.join(others)}")
             self.midi_map[ident] = text
             self._midi_learn = None
             self._midi_save()
@@ -3716,15 +4179,27 @@ class Main(QMainWindow):
             if kind == "cc":
                 self._midi_cc_last[(ch, num)] = val   # no trigger from the learn press
             return
-        ident = self._midi_rev.get((kind, ch, num))
-        if ident is None:
+        idents = self._midi_rev.get((kind, ch, num))
+        if not idents:
             return
+        prev = None
+        if kind == "cc":                        # the edge is read once for every row
+            prev = self._midi_cc_last.get((ch, num), 0)
+            self._midi_cc_last[(ch, num)] = val
+        for ident in list(idents):
+            self._midi_fire(ident, kind, val, prev)
+
+    def _midi_fire(self, ident, kind, val, prev):
+        """One row's action from a message bound to it (`prev`: the CC's
+        value before this one)."""
         if ident in CONTINUOUS:
             self.actions[ident](val / 127.0)
             return
+        if ident in VELOCITY and kind == "note":   # a pad: its velocity, no release
+            if val > 0:
+                self.actions[ident](val / 127.0)
+            return
         if kind == "cc":                        # a switch on a CC: rising edge only
-            prev = self._midi_cc_last.get((ch, num), 0)
-            self._midi_cc_last[(ch, num)] = val
             if ident in HOLD:                   # and the falling edge lets go
                 if val >= 64 and prev < 64:
                     self.actions[ident]()
@@ -4291,8 +4766,8 @@ class Main(QMainWindow):
             mine.currentTextChanged.connect(theirs.setCurrentText)
             theirs.currentTextChanged.connect(
                 lambda t, m=mine: m.setCurrentText(t) if m.findText(t) >= 0 else None)
-        form.addRow("Shapes", self._row([("intro", self.perf_intro), ("outro", self.perf_outro),
-                                         ("drums", self.perf_drum_style)]))
+        form.addRow("Shapes", self._row([("intro", self.perf_intro), ("drums", self.perf_drum_style),
+                                         ("outro", self.perf_outro)]))
         self.perf_material = QComboBox()
         self.perf_material.addItems(["takes, else ticked samples", "takes only",
                                      "ticked samples"])
@@ -6271,22 +6746,24 @@ class Main(QMainWindow):
                              "defaults; asks first. Samples, videos, takes, renders and "
                              "plugins on disk are untouched.")
         reset_btn.clicked.connect(self._reset_settings)
-        # the same without the hardware: the values, the LFOs, the macros,
-        # the scenes, the M:C tab and the racks go, the sound card, the MIDI
-        # map and ports, the Erae, Link, the video inputs and the pools stay
+        # the same without the hardware and without a restart: the values,
+        # the LFOs, the macros, the scenes, the M:C tab and the racks go
+        # live, the sound card, the MIDI map and ports, the Erae, Link, the
+        # video inputs and the pools stay
         values_btn = QPushButton("forget the values only...")
         values_btn.setObjectName("small")
         values_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         values_btn.setToolTip("A clean slate without touching the hardware: every knob, "
                               "tick and menu, the effect settings, the LFOs, the macros, "
                               "the scenes, the M:C tab, the VST inserts and the takes' "
-                              "settings are forgotten and the app restarts with their "
-                              "defaults; the sound card, the MIDI map and ports, the MIDI "
+                              "settings are forgotten, every knob lands on its default and the "
+                              "MIDI map goes back to the stock one, here and now; the sound "
+                              "card, the MIDI ports, the MIDI "
                               "out, the Erae, Link, the video inputs and the ticked samples "
                               "and videos stay; asks first.")
         values_btn.clicked.connect(lambda: self._reset_settings(values_only=True))
         # a set: the same values and the pools in a JSON file, for another
-        # day or another machine; loading one restarts the app on it
+        # day or another machine; loading one lands it live
         save_btn = QPushButton("save set...")
         save_btn.setObjectName("small")
         save_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -6341,13 +6818,14 @@ class Main(QMainWindow):
             self._live_saved = text
             self.settings.setValue("live/state", text)
 
-    def _live_restore(self):
-        """The remembered live state onto the widgets, the way a scene
-        lands: at launch and when a set is loaded."""
-        try:
-            state = json.loads(self.settings.value("live/state", "") or "{}")
-        except (ValueError, TypeError):
-            state = {}
+    def _live_restore(self, state=None):
+        """The remembered live state (or `state`) onto the widgets, the way
+        a scene lands: at launch, when a set is loaded, on a values reset."""
+        if state is None:
+            try:
+                state = json.loads(self.settings.value("live/state", "") or "{}")
+            except (ValueError, TypeError):
+                state = {}
         if not isinstance(state, dict):
             return
         self._live_restoring = True
@@ -6588,20 +7066,21 @@ class Main(QMainWindow):
         self._flush_settings()
 
     def _reset_settings(self, values_only=False):
-        """A confirmation, then the settings cleared on the way out and the
-        app started again (closing writes settings, so the wipe is last):
-        every one, or with values_only the values alone, the groups in
+        """A confirmation, then: every setting cleared on the way out and
+        the app started again (closing writes settings, so the wipe is
+        last), or with values_only the values alone, live, the groups in
         KEEP_GROUPS (the sound card, MIDI, the Erae, Link, the video inputs,
         the pools) staying."""
         ask = QMessageBox(self)
         ask.setIcon(QMessageBox.Warning)
         if values_only:
             ask.setWindowTitle("Forget the values?")
-            ask.setText("Forget every saved value and restart Gacha with its defaults?")
+            ask.setText("Forget every saved value and put every knob at its default?")
             ask.setInformativeText("Every knob, tick and menu, the effect settings, the "
                                    "LFOs, the macros, the scenes, the M:C tab, the VST "
-                                   "inserts and the takes' settings are forgotten. The "
-                                   "sound card, the MIDI map and ports, the MIDI out, the "
+                                   "inserts and the takes' settings are forgotten, and the "
+                                   "MIDI map goes back to the stock one. The "
+                                   "sound card, the MIDI ports, the MIDI out, the "
                                    "Erae, Link, the video inputs and the ticked samples and "
                                    "videos stay, and so do the files on disk.")
         else:
@@ -6614,10 +7093,29 @@ class Main(QMainWindow):
         ask.setDefaultButton(QMessageBox.Cancel)
         if ask.exec() != QMessageBox.Yes:
             return
-        self._wipe_settings = "values" if values_only else "all"
-        what = "the values" if values_only else "everything"
-        self.log.appendPlainText(f"settings: {what} forgotten on the way out, restarting")
+        if values_only:
+            self._reset_values()
+            return
+        self._wipe_settings = "all"
+        self.log.appendPlainText("settings: everything forgotten on the way out, restarting")
         self.close()
+
+    def _reset_values(self):
+        """The values-only reset, live: every key outside KEEP_GROUPS goes,
+        every remembered widget reads its default again (as a set loads),
+        the live knobs and switches land on what they were at build, and
+        the MIDI map goes back to the stock one (the ports stay)."""
+        for key in self.settings.allKeys():
+            if key.split("/")[0] not in self.KEEP_GROUPS:
+                self.settings.remove(key)
+        self.settings.sync()
+        self._restore_values()
+        self._live_restore(self._live_defaults)
+        self._midi_defaults()                   # the map too; the ports stay
+        self._live_save(force=True)
+        self.settings.sync()
+        self.log.appendPlainText("settings: the values forgotten, every knob at its default, "
+                                 "the stock MIDI map")
 
     def _live_clock_rows(self, form):
         """The one BPM: the live clock. It runs the visuals, the racks' delays
@@ -8008,6 +8506,49 @@ class Main(QMainWindow):
         self.log.appendPlainText(f"{source}: the section starts again")
         return True
 
+    PAD_ROLL = 4                   # a hat stutter pad: this many hits, a 1/32 apart
+
+    def perform_hit(self, role, vel=1.0):
+        """A drum pad: `role`'s hit from the material (the kit the sections
+        are carved from), at `vel` 0..1 (the velocity layer and the gain),
+        into its voice's rack on the quantize grid, over the tape whatever
+        the pedal says, and its note to the MIDI out at the same instant.
+        No material: the note alone (a Model:Cycles plays it)."""
+        la = self.through
+        if la is None or not la.running:
+            self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
+            return
+        vel = max(0.0, min(1.0, float(vel)))
+        clip = None
+        mat = self._perf_material[1] if self._perf_material else None
+        kit = (mat.kit if mat is not None else {}) or {}
+        src = "hihat" if role == "glitch" else role
+        variants = kit.get(src) or []
+        if variants:
+            rr = self._pad_rr.get(src, 0)
+            self._pad_rr[src] = rr + 1
+            layer = 0 if vel < 0.5 else 1 if vel < 0.85 else 2
+            key = (id(mat), src, rr % len(variants), layer, la.sr)
+            clip = self._pad_cache.get(key)
+            if clip is None:
+                hit = variants[rr % len(variants)][layer]
+                if la.sr != E.SR:
+                    hit = resample_poly(hit, la.sr // 300, E.SR // 300, axis=0)
+                clip = np.ascontiguousarray(hit.T.astype(np.float32))
+                if role == "glitch":                   # the stutter: a short roll of the hat
+                    step = int(la.sr * 60.0 / max(1e-6, self.tempo.bpm) / 8)
+                    n = clip.shape[1] + step * (self.PAD_ROLL - 1)
+                    roll = np.zeros((2, n), np.float32)
+                    for k in range(self.PAD_ROLL):
+                        roll[:, k * step:k * step + clip.shape[1]] += clip * (0.9 ** k)
+                    clip = roll
+                if len(self._pad_cache) > 64:
+                    self._pad_cache.clear()
+                self._pad_cache[key] = clip
+            clip = clip * (0.4 + 0.6 * vel)
+        la.pad_hit(role, clip, vel)
+        self.perf_status.setText(f"{VOICE_LABELS.get(role, role)} hit, {vel:.2f}")
+
     def perform_event(self):
         """E: a one-shot from the material, on the quantize grid."""
         if self.through is None or not self.through.running:
@@ -9108,8 +9649,9 @@ class Main(QMainWindow):
             self._link_push(self.tempo.bpm)
 
     def live_downbeat(self):
-        """D: the bar starts now, tempo unchanged."""
+        """D: the bar starts now, tempo unchanged; the Erae's loop with it."""
         self.tempo.downbeat()
+        self._erae_start(at_next_bar=False)
 
     # ------------------------------------------------------------ Ableton Link
     def _link_active(self):
@@ -9864,6 +10406,11 @@ class Main(QMainWindow):
                 and isinstance(obj, QWidget):
             # only the widget-level copy: the same press also arrives on the
             # native QWindow object, which would count it twice
+            if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                mods = event.modifiers()
+                if (mods == Qt.ControlModifier and self._learn_click(obj)) \
+                        or (mods == Qt.AltModifier and self._learn_clear_click(obj)):
+                    return True             # the control keeps its value
             if t == QEvent.KeyPress and event.key() == Qt.Key_Escape \
                     and self._fullscreen and not event.isAutoRepeat():
                 self.toggle_fullscreen()
@@ -9959,12 +10506,7 @@ class Main(QMainWindow):
             QApplication.instance().aboutToQuit.connect(self._wipe_and_restart)
 
     def _wipe_and_restart(self):
-        if self._wipe_settings == "all":
-            self.settings.clear()
-        else:
-            for key in self.settings.allKeys():
-                if key.split("/")[0] not in self.KEEP_GROUPS:
-                    self.settings.remove(key)
+        self.settings.clear()
         self.settings.sync()
         subprocess.Popen([sys.executable, *sys.argv], cwd=str(Path.cwd()),
                          close_fds=True)                  # a fresh Gacha with the defaults

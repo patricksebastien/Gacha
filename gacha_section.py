@@ -310,6 +310,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
             clip = clip[::-1].copy(); ops.append("rev"); rev = True
         if rng.random() < k.stretch_chance and len(clip) > SR:
             import librosa
+            import warnings
+            warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")   # librosa 1.0's own deprecations, inside phase_vocoder
             n_target_bars = rng.choice([1, 2, 4])
             target = int(n_target_bars * bar * SR)
             chunk = clip[: min(len(clip), target * 2)]

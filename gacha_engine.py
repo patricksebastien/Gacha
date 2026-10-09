@@ -31,6 +31,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import librosa
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")   # librosa 1.0's own deprecations, inside phase_vocoder
 from scipy.signal import butter, resample_poly, sosfilt
 from pedalboard import (
     Pedalboard, Reverb, Delay, Distortion, Chorus, Phaser, Compressor,

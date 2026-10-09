@@ -384,6 +384,8 @@ class MidiOut:
     CC_GATHER_S = 0.002               # CCs from one moment leave together, this much later
     CC_MIN_S = 0.010                  # between two values of one controller (DIN: 1 ms a message)
     SLEW = 0.1                        # of a tick period, the most one grid() moves the clock
+    PULL = 0.1                        # of the phase error one grid() takes up: the callback's
+                                      # own timing wobble is smoothed out of the ticks
     START_AHEAD_S = 0.0005            # Start leaves this long before the downbeat's tick
     PPQN = 24
 
@@ -414,6 +416,8 @@ class MidiOut:
         self.ccs = 0                  # CCs that left, for the status line
         # retrigs: channel -> [note, velocity, period, length, fade, t0, next]
         self._retrigs = {}
+        # mirrors: other ports (the Erae's) given the clock and the transport
+        self._sinks = {}              # sink -> {"clock": bool, "transport": bool, "stop": bool}
 
     @property
     def is_open(self):
@@ -427,8 +431,59 @@ class MidiOut:
     def clock_on(self, on):
         with self._cond:
             self._clock_on = bool(on)
-            self._tick_due = time.perf_counter() if on else None
+            self._retick_locked()
             self._cond.notify()
+
+    def _wants(self, what):
+        return any(f[what] for f in self._sinks.values())
+
+    def _retick_locked(self):
+        """The ticks run while the port wants them or a mirror does; a
+        clock already running keeps its phase."""
+        if self._clock_on or self._wants("clock"):
+            if self._tick_due is None:
+                self._tick_due = time.perf_counter()
+        else:
+            self._tick_due = None
+
+    @property
+    def mirrored(self):
+        """A mirror is listening (the grid and the transport matter even
+        with no port open)."""
+        return bool(self._sinks)
+
+    def mirror(self, sink, clock=False, transport=False, stop=False):
+        """Give `sink` (anything with realtime(byte)) the clock ticks and
+        the Start / Stop bytes too, from the sender thread, whatever the
+        panel's own ticks say; `stop` False keeps the Stops from it (a
+        looper that should run on when a section clears). Both False
+        forgets the sink."""
+        with self._cond:
+            if clock or transport:
+                self._sinks[sink] = {"clock": bool(clock), "transport": bool(transport),
+                                     "stop": bool(stop)}
+            else:
+                self._sinks.pop(sink, None)
+            self._retick_locked()
+            self._cond.notify()
+        self._ensure_thread()
+
+    def _fan(self, byte, what):
+        """A realtime byte to every mirror that asked for `what`."""
+        for sink, flags in list(self._sinks.items()):
+            if flags[what]:
+                try:
+                    sink.realtime(byte)
+                except Exception:
+                    pass
+
+    def _ensure_thread(self):
+        with self._cond:
+            if self._thread is None:
+                self._stop = False
+                self._thread = threading.Thread(target=self._run, name="gacha-midi-out",
+                                                daemon=True)
+                self._thread.start()
 
     @property
     def running(self):
@@ -456,14 +511,9 @@ class MidiOut:
             self._all_off_locked(old)
             self._port, self.label = port, label
             self._cc_last.clear()               # a new port knows nothing yet
-            if self._thread is None:
-                self._stop = False
-                self._thread = threading.Thread(target=self._run, name="gacha-midi-out",
-                                                daemon=True)
-                self._thread.start()
-            if self._clock_on:
-                self._tick_due = time.perf_counter()
+            self._retick_locked()
             self._cond.notify()
+        self._ensure_thread()
         if old is not None:
             try:
                 old.close()
@@ -536,8 +586,11 @@ class MidiOut:
         """The beat grid the clock follows: `beat_s` seconds per beat and,
         `beat_t` given, the perf_counter moment of a beat (any beat) the
         ticks should fall on; None keeps them free-running at that tempo.
-        Called every block; the phase is pulled over by SLEW of a tick at
-        most each time."""
+        Called every block; the phase is pulled over by PULL of the error
+        each time, SLEW of a tick at most, a lock with a time constant of
+        ten blocks: the block's own lateness (a few ms either way) would
+        otherwise land in the ticks as jitter, and a receiver reading the
+        tempo off short windows shows it a beat or so high."""
         if beat_s <= 0:
             return
         with self._cond:
@@ -547,13 +600,13 @@ class MidiOut:
                 per = self._period
                 target = beat_t + round((self._tick_due - beat_t) / per) * per
                 err = target - self._tick_due
-                self._tick_due += max(-self.SLEW * per, min(self.SLEW * per, err))
+                self._tick_due += max(-self.SLEW * per, min(self.SLEW * per, self.PULL * err))
             self._cond.notify()
 
     def start(self, due):
         """Start at `due` (perf_counter): the message just before, the tick
         exactly there, so the receiver's first step is that moment."""
-        if self._port is None or not self.transport_on:
+        if not (self._port is not None and self.transport_on) and not self._wants("transport"):
             return
         with self._cond:
             self._push(due - self.START_AHEAD_S, "start")
@@ -564,7 +617,7 @@ class MidiOut:
     def stop(self):
         """Stop, now, if a Start went out."""
         with self._cond:
-            if self._running and self._port is not None:
+            if self._running:
                 self._push(time.perf_counter(), "stop")
                 self._cond.notify()
 
@@ -583,7 +636,9 @@ class MidiOut:
             self._send(port, mido.Message("note_off", channel=ch - 1, note=n, velocity=0))
         self._sounding.clear()
         if self._running:
-            self._send(port, mido.Message("stop"))
+            if self.transport_on:
+                self._send(port, mido.Message("stop"))
+            self._fan(0xFC, "stop")
             self._running = False
 
     def close_port(self):
@@ -690,9 +745,10 @@ class MidiOut:
                         self._tick_due = tick + self._period
                         if self._tick_due < now - self._period:   # far behind (a stall): skip ahead
                             self._tick_due = now + self._period
-                        if port is not None:
+                        if port is not None and self._clock_on:
                             self._send(port, mido.Message("clock"))
-                            self.ticks += 1
+                        self._fan(0xF8, "clock")
+                        self.ticks += 1
                         continue
                     if rt <= due:                    # a retrig's note, before any CC
                         self._retrig_fire_locked(port, time.perf_counter())
@@ -711,11 +767,17 @@ class MidiOut:
                         msg = mido.Message("note_off", channel=ch - 1, note=note, velocity=0)
                         self._sounding.discard((ch, note))
                     elif kind == "start":
-                        msg = mido.Message("start")
                         self._running = True
+                        if self.transport_on:
+                            self._send(port, mido.Message("start"))
+                        self._fan(0xFA, "transport")
+                        continue
                     else:
-                        msg = mido.Message("stop")
                         self._running = False
+                        if self.transport_on:
+                            self._send(port, mido.Message("stop"))
+                        self._fan(0xFC, "stop")
+                        continue
                     self._send(port, msg)
         finally:
             if sys.platform == "win32":

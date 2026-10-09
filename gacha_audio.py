@@ -1410,6 +1410,11 @@ class LiveAudio:
         # the drum voices: in or out, and soloed (then every other voice is
         # out); set through switch(), which lands them on the grid
         self.voice_on = {v: True for v in VOICES}
+        # the drum pads (pad_hit): hits waiting for the grid, the samples
+        # sounding per voice, the notes for the MIDI out this block
+        self.pad_queue = []                   # [(role, clip (2, n) | None, vel)]
+        self.pad_shots = {}                   # role -> [(clip, played)]
+        self.pad_hits = []                    # [(block offset, role, vel)]
         self.voice_solo = set()
         self.quant = 0.0                     # the grid, a fraction of a bar (1/8 = eighths); 0 = at once
         self._sw_req = []                    # (kind, key, on) asked, under _sw_lock
@@ -1461,6 +1466,13 @@ class LiveAudio:
         frame on."""
         with self._sw_lock:
             self._sw_req.append((kind, key, bool(on)))
+
+    def pad_hit(self, role, clip, vel=1.0):
+        """A drum pad (any thread): `clip` ((2, n) float32 at sr, or None
+        for the note alone) into voice `role`'s rack on the next line of
+        the quantize grid (at once with no section playing), and the
+        role's note to the MIDI out then, at `vel` 0..1."""
+        self.pad_queue.append((role, clip, max(0.0, min(1.0, float(vel)))))
 
     def _audible(self):
         """The roles whose hits go out: every role unless the notes follow
@@ -1983,13 +1995,27 @@ class LiveAudio:
         t_block = time.perf_counter()
         sec = self.player.block(bs, now, ramp)
         song = self.song.block(bs)
+        # the drum pads: on the quantize grid like a one-shot while a
+        # section plays, at once otherwise; the sample into its voice below,
+        # the note to the MIDI out at the same instant
+        self.pad_hits = []
+        if self.pad_queue:
+            q, self.pad_queue = self.pad_queue, []
+            o = self.player.grid_off if self.player.playing else 0
+            if o is None:                          # no grid line this block: wait
+                self.pad_queue = q + self.pad_queue
+            else:
+                for role, clip, vel in q:
+                    if clip is not None:
+                        self.pad_shots.setdefault(role, []).append((clip, -o))
+                    self.pad_hits.append((o - L, role, vel))
         sec_w = np.sqrt(a)
         # the switches land on the grid line of this block, if any; the hits
         # before it keep what was audible, those from it on take the new state
         sw_off = self._land_switches(self.player.grid_off)
-        if midi:
+        if midi or (mo is not None and mo.mirrored):   # a mirror (the Erae) wants the grid too
             self._midi_sync(mo, t_block + out_lat - lead_s, sr)
-        if midi and (self.player.hits or self.song.hits):
+        if midi and (self.player.hits or self.song.hits or self.pad_hits):
             aud_after, aud_before = self._audible(), self._aud_before
             base = t_block + out_lat - lead_s + L / sr        # >= t_block by the choice of L
             gate = self.midi_gate_ms / 1000.0
@@ -2008,6 +2034,12 @@ class LiveAudio:
                     mo.note(chans.get(role, ch), note, round(127 * vel * scale),
                             base + off / sr, gate)
                     self.midi_sent += 1
+            for off, role, vel in self.pad_hits:          # the pads: muted or not, the hit was asked
+                note = notes.get(role, -1)
+                if frozen or note is None or note < 0:
+                    continue
+                mo.note(chans.get(role, ch), note, max(1, round(127 * vel)), base + off / sr, gate)
+                self.midi_sent += 1
         # the drum voices: each gated (mute, solo; the receiver's kit
         # replacing ours leaves the sub) before its own rack, summed into
         # the drums stem; a rack with a tail rings on after its mute
@@ -2022,16 +2054,25 @@ class LiveAudio:
             g = 1.0 if on else 0.0
             cur = self._voice_gain.get(v, 1.0)        # every voice starts in
             rack = self.racks[v]
+            pad = None                                # the pads' hits: after the mute, not
+            ps = self.pad_shots.get(v)                # under the pedal (a hit over the tape)
+            if ps:
+                pad, ps = self.player._sum_clips(ps, bs)
+                self.pad_shots[v] = ps
+                if drums_only and v != "sub":         # the box plays the kit: the note went
+                    pad = None
             if g != cur:
                 blk = np.zeros((2, bs), np.float32) if blk is None else blk * sec_w
                 blk = blk * self._gate(cur, g, bs, sw_off)
                 self._voice_gain[v] = g
             elif blk is None or not g:
-                if rack.idle:
+                if rack.idle and pad is None:
                     continue
                 blk = np.zeros((2, bs), np.float32)
             else:
                 blk = blk * sec_w
+            if pad is not None:
+                blk = blk + pad
             blk = rack.process(blk)
             bus = blk if bus is None else bus + blk
         burst = sec.get("burst")                    # the bursts: into the events
