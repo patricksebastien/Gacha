@@ -721,8 +721,13 @@ class MidiOut:
                 ctypes.windll.winmm.timeBeginPeriod(1)
             except Exception:
                 pass
+        spin = None                        # a due moment to spin up to, lock let go
         try:
             while True:
+                if spin is not None:           # the last ms or two, outside the lock:
+                    while time.perf_counter() < spin:   # the audio thread takes it every
+                        pass                   # block (grid(), note()) and must not wait here
+                    spin = None
                 with self._cond:
                     while not self._stop and not self._heap and self._tick_due is None \
                             and self._cc_due is None and not self._retrigs:
@@ -737,8 +742,9 @@ class MidiOut:
                     if wait > self.SPIN_S:
                         self._cond.wait(wait - self.SPIN_S)
                         continue                     # something newer may be first now
-                    while time.perf_counter() < due:  # the last ms or two
-                        pass
+                    if wait > 0:
+                        spin = due                   # spin without the lock, then look again
+                        continue
                     port = self._port
                     if tick <= due:                  # the tick first: it moves the receiver's step
                         now = time.perf_counter()

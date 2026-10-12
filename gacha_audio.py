@@ -125,9 +125,72 @@ assert VOICES[:len(DRUM_ROLES)] == DRUM_ROLES      # one voice per MIDI role, th
 SR = 48000
 PREFERRED_APIS = ("ASIO", "Windows WASAPI", "ALSA", "Core Audio",
                   "Windows DirectSound", "MME")
-SWITCH_INTERVAL = 0.001          # s; Python's default 5 ms lets the GUI hold
-                                 # the GIL for one whole block
+SWITCH_INTERVAL = 0.0005         # s; Python's default 5 ms lets the GUI hold the
+                                 # GIL for two whole 128-frame blocks, and a block
+                                 # asks for it back many times (every plugin call
+                                 # lets it go): measured with a busy Python thread
+                                 # beside it, a 128-frame block takes 11 ms at 5 ms,
+                                 # 4 ms at 1 ms and under 1 ms at 0.5 ms
 MAX_DELAY_MS = 2000              # the sync delay's ring
+
+
+def power_hints(on):
+    """Windows, while the stream is open: the process out of power
+    throttling (the EcoQoS that parks a process on the efficiency cores
+    and lowers its clocks; a hybrid CPU would leave the driver's thread
+    there, 10 ms late) and the scheduler's timer at 1 ms. Returns what
+    took, for the status; undone with `on` False."""
+    if sys.platform != "win32":
+        return ""
+    import ctypes
+    took = []
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p        # a 64-bit handle, not an int
+        k32.SetProcessInformation.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                              ctypes.c_void_p, ctypes.c_ulong)
+
+        class Throttling(ctypes.Structure):
+            _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong),
+                        ("StateMask", ctypes.c_ulong)]
+        # PROCESS_POWER_THROTTLING_EXECUTION_SPEED | ..._IGNORE_TIMER_RESOLUTION,
+        # both in the control mask and off in the state mask = disabled;
+        # an empty control mask hands the choice back to the system
+        p = Throttling(1, (0x1 | 0x4) if on else 0, 0)
+        if k32.SetProcessInformation(k32.GetCurrentProcess(), 4,   # ProcessPowerThrottling
+                                     ctypes.byref(p), ctypes.sizeof(p)):
+            took.append("no power throttling")
+    except Exception:
+        pass
+    try:
+        winmm = ctypes.windll.winmm
+        if (winmm.timeBeginPeriod(1) if on else winmm.timeEndPeriod(1)) == 0:
+            took.append("1 ms timer")
+    except Exception:
+        pass
+    return ", ".join(took)
+
+
+def thread_no_throttle():
+    """Windows: this thread out of power throttling (on a hybrid CPU, a
+    performance core and full clocks for it), for the audio thread."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentThread.restype = ctypes.c_void_p
+        k32.SetThreadInformation.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                             ctypes.c_void_p, ctypes.c_ulong)
+
+        class Throttling(ctypes.Structure):
+            _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong),
+                        ("StateMask", ctypes.c_ulong)]
+        p = Throttling(1, 0x1, 0)                   # THREAD_POWER_THROTTLING_EXECUTION_SPEED off
+        return bool(k32.SetThreadInformation(k32.GetCurrentThread(), 3,   # ThreadPowerThrottling
+                                             ctypes.byref(p), ctypes.sizeof(p)))
+    except Exception:
+        return False
 
 
 def _api_has_devices(idx, devs):
@@ -898,6 +961,7 @@ class SectionPlayer:
         self.pending = (stems, events, bpm, bars, bar_t0, drum_table(events, self.sr),
                         int(start_bar))
         self._pend_covered = 0
+        self.frag.prepare(stems)             # its stacked copy, here and not on the audio thread
 
     def waiting_for(self):
         """The bar time a queued section waits for, or None."""
@@ -1452,8 +1516,13 @@ class LiveAudio:
         self.load = 0.0                      # DSP time / block time, smoothed
         self.dropped = 0                     # input overflows (blocks lost to late reads)
         self.underruns = 0                   # output underflows (the device starved)
-        self.late = 0                        # loop rounds slower than 2 blocks
+        self.late = 0                        # blocks that came more than 2 blocks apart
+                                             # (the driver's callback stalled: a glitch)
+        self.peak = 0.0                      # the worst block of the last second or so
+        self.gap_ms = 0.0                    # the longest wait between two callbacks, lately
         self.rounds = 0
+        self._cb_last = None                 # perf_counter of the last callback's start
+        self._old_switch = None              # the switch interval before start(), callback mode
         self.buffer_ms = 2000.0 * self.block / self.sr
         self.out_latency_ms = 1000.0 * self.block / self.sr   # what is written but not yet heard
 
@@ -1522,12 +1591,18 @@ class LiveAudio:
             try:
                 src, snk = self._open(callback=True)
                 self._dsp_init()
+                # the driver's thread fights the GUI for the GIL on every
+                # block: a short switch interval, as the blocking loop sets
+                # (process-wide; put back in stop())
+                self._old_switch = sys.getswitchinterval()
+                sys.setswitchinterval(SWITCH_INTERVAL)
+                hints = power_hints(True)
                 snk.start()
                 lat = snk.latency
                 self.out_latency_ms = 1000.0 * float(lat[1] if isinstance(lat, tuple) else lat)
                 self.buffer_ms = 1000.0 * float(sum(lat) if isinstance(lat, tuple) else lat)
                 self._cb_stream = snk
-                self.mode += " callback"
+                self.mode += " callback" + (f", {hints}" if hints else "")
                 self.running = True
             except Exception as e:
                 self.error = self._explain(e)
@@ -1546,6 +1621,9 @@ class LiveAudio:
     def _cb_process(self, indata, outdata, frames, status):
         """One driver buffer in, one out, on the driver's thread."""
         try:
+            if self._cb_last is None:                # the driver's thread, named for the logs
+                threading.current_thread().name = "gacha-asio"
+                thread_no_throttle()                 # and on a performance core, full clocks
             if status:
                 if status.input_overflow:
                     self.dropped += 1
@@ -1553,6 +1631,16 @@ class LiveAudio:
                     self.underruns += 1
             now = time.monotonic()
             t0 = time.perf_counter()
+            # the cadence: a block more than two blocks after the last one
+            # came late (the thread waited, for the GIL most likely), which
+            # the driver has already played as a gap; ASIO reports no
+            # underflow flag, so this is the count to watch
+            last, self._cb_last = self._cb_last, t0
+            if last is not None:
+                gap = t0 - last
+                if gap > 2.0 * frames / self.sr:
+                    self.late += 1
+                self.gap_ms = max(1000.0 * gap, self.gap_ms * (1.0 - 2.0 * frames / self.sr))
             if indata is None:
                 x = np.zeros((2, frames), np.float32)
             else:
@@ -1567,8 +1655,9 @@ class LiveAudio:
             else:
                 y = self._dsp_block(x, now)
             outdata[:] = y.T
-            dsp = time.perf_counter() - t0
-            self.load = 0.9 * self.load + 0.1 * (dsp / (frames / self.sr))
+            r = (time.perf_counter() - t0) / (frames / self.sr)
+            self.load = 0.9 * self.load + 0.1 * r
+            self.peak = max(r, self.peak * (1.0 - 4.0 * frames / self.sr))   # ~1/e in 250 ms
             self.rounds += 1
         except Exception as e:                       # never let the driver see one
             self.error = f"audio callback: {e}"
@@ -1625,6 +1714,10 @@ class LiveAudio:
                     op()
                 except Exception:
                     pass
+            if self._old_switch is not None:
+                sys.setswitchinterval(self._old_switch)
+                self._old_switch = None
+                power_hints(False)
         if self._thread is not None:
             self._thread.join(3.0)
         self.running = False
@@ -1688,7 +1781,8 @@ class LiveAudio:
 
     def stats(self):
         return {"in_peak": self.in_peak, "out_peak": self.out_peak,
-                "load": self.load, "dropped": self.dropped, "late": self.late,
+                "load": self.load, "peak": self.peak, "gap_ms": self.gap_ms,
+                "dropped": self.dropped, "late": self.late,
                 "underruns": self.underruns, "buffer_ms": self.buffer_ms,
                 "delay_ms": float(self.delay_ms), "mode": self.mode}
 
@@ -1802,6 +1896,10 @@ class LiveAudio:
             return
         sys.setswitchinterval(SWITCH_INTERVAL)
         self._boost_priority()
+        thread_no_throttle()
+        hints = power_hints(True)
+        if hints:
+            self.mode += f", {hints}"
         bs, sr = self.block, self.sr
         block_s = bs / sr
         self._dsp_init()
@@ -1833,8 +1931,9 @@ class LiveAudio:
                     now = time.monotonic()
                     t0 = time.perf_counter()
                     y = self._dsp_block(x, now)
-                    dsp = time.perf_counter() - t0
-                    self.load = 0.9 * self.load + 0.1 * (dsp / block_s)
+                    r = (time.perf_counter() - t0) / block_s
+                    self.load = 0.9 * self.load + 0.1 * r
+                    self.peak = max(r, self.peak * (1.0 - 4.0 * block_s))
                     if snk.write(np.ascontiguousarray(y.T)):
                         self.underruns += 1
                     self.rounds += 1
@@ -1850,6 +1949,7 @@ class LiveAudio:
             self.running = False
             self.ready.set()
             sys.setswitchinterval(old_switch)
+            power_hints(False)
             for st in ({id(x): x for x in (src, snk) if x is not None}.values()):
                 try:
                     st.close()

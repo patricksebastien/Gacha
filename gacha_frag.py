@@ -47,6 +47,7 @@ and `state()` tells the picture and the status what sounds.
     fr.block(stems, n, bar_f, t0, rate, locked, out, bs)   # audio thread, after the render
     fr.release(3)
 """
+import ctypes
 from collections import deque
 
 import numpy as np
@@ -131,10 +132,54 @@ class Fragments:
         self._req = deque()                   # ("on", key) / ("off", key) / ("clear",)
         self.rng = np.random.default_rng()
         self._duck_end = 0.0                  # the duck at the last block's end
-        self._mono = None                     # the stems summed, left, for the alignment
-        self._mono_key = None
+        # the section's stems stacked, (stems, 2, n), so every voice's grains
+        # are one gather for all of them, and summed, left, for the alignment;
+        # built ahead by prepare() (the GUI thread, from the player's queue())
+        self._all = None
+        self._mono = None
+        self._names = ()                      # the stems' order in _all
+        self._key = None                      # id(stems) the two were built from
+        self._next = None                     # (key, names, all, mono, base) prepared ahead
+        self._base = None                     # (stack, mono) buffers behind _all, pooled
+        self._spare = None                    # the buffers behind the stack before, reused
 
     # ---- GUI thread
+    def prepare(self, stems):
+        """A section's stems stacked and summed ahead of its first press:
+        70 MB of copying for 8 bars, which the first block with a voice
+        would otherwise do on the audio thread, a stall of many blocks."""
+        if not stems:
+            return
+        names = tuple(stems)
+        S = len(names)
+        n = next(iter(stems.values())).shape[1]
+        # one np.stack of the lot keeps the GIL for the whole copy (15 ms
+        # measured, the audio callback waiting), and fresh memory costs
+        # as much again while its pages fault in: the copy goes a slice
+        # at a time instead, the GIL let go between the pieces, into
+        # pooled buffers (the ones behind the stack before last, warm)
+        # that only grow when a section longer than any before arrives,
+        # touched first by a memset through ctypes, which lets the GIL go
+        base, self._spare = self._spare, None
+        if base is None or base[0].shape[0] < S or base[0].shape[2] < n:
+            cap = n if base is None else max(n, base[0].shape[2])
+            stack = np.empty((S, 2, cap), np.float32)
+            ctypes.memset(stack.ctypes.data, 0, stack.nbytes)
+            mbuf = np.empty(cap, np.float32)
+            ctypes.memset(mbuf.ctypes.data, 0, mbuf.nbytes)
+            base = (stack, mbuf)
+        allv = base[0][:S, :, :n]
+        step = 24000
+        for i, k in enumerate(names):
+            d = stems[k]
+            for a in range(0, n, step):
+                allv[i, :, a:a + step] = d[:, a:a + step]
+        mono = base[1][:n]
+        mono[:] = 0.0
+        for i in range(S):
+            mono += allv[i, 0]
+        self._next = (id(stems), names, allv, mono, base)
+
     def press(self, key):
         """Slice `key` (1..div) held; 0: the slice under the playhead now."""
         self._req.append(("on", int(key)))
@@ -325,11 +370,7 @@ class Fragments:
             self._duck_end = 0.0
             return 0.0
         sr = self.sr
-        if self._mono_key != id(stems):                        # the stems summed, once a section
-            self._mono_key = id(stems)
-            self._mono = np.zeros(n, np.float32)
-            for data in stems.values():
-                self._mono += data[0]
+        stk = self._stacked(stems)                             # (stems, 2, n)
         size_f = max(32.0, size * bar_f)                       # transport frames
         n_out = max(32, int(round(size_f / rate)))             # output frames per grain
         ratio = 2.0 ** (pitch / 12.0) * (1.0 if locked else rate)
@@ -343,7 +384,7 @@ class Fragments:
         k = np.arange(bs)
         sp = speed * rate                                      # slice frames per output frame
         duck = np.zeros(bs, np.float32)
-        add = {name: np.zeros((2, bs), np.float32) for name in stems}
+        add = np.zeros((len(self._names), 2, bs), np.float32)   # the grains, per stem
         for v in list(self.voices):
             env, gate = self._env(v, bs, A, D, S, R)
             duck = np.maximum(duck, gate)
@@ -411,12 +452,9 @@ class Fragments:
                 i0 = i0.astype(np.int64) % n
                 i1 = (i0 + 1) % n
                 win = (w * on).astype(np.float32) * gain
-                for name, data in stems.items():
-                    blk = add[name]
-                    for ch in range(2):
-                        d = data[ch]
-                        sv = d[i0] * (1.0 - fr) + d[i1] * fr
-                        blk[ch] += np.sum(sv * win * v.g_gain[ch][:, None], axis=0) * env
+                wg = win[None, :, :] * v.g_gain[:, :, None]            # (2, G, bs): the pan in
+                sv = stk[:, :, i0] * (1.0 - fr) + stk[:, :, i1] * fr   # (stems, 2, G, bs), one gather
+                add += (sv * wg[None]).sum(axis=2) * env
                 v.g_age = v.g_age + bs
                 keep = v.g_age < v.g_len
                 if not keep.all():
@@ -428,11 +466,26 @@ class Fragments:
             if v.done:
                 self.voices.remove(v)
         keep_gain = 1.0 - duck
-        for name in stems:
+        for i, name in enumerate(self._names):
             blk = out.get(name)
-            if blk is None:
-                out[name] = add[name]
-            else:
-                out[name] = blk * keep_gain + add[name]
+            out[name] = add[i] if blk is None else blk * keep_gain + add[i]
         self._duck_end = float(duck[-1])
         return self._duck_end
+
+    def _stacked(self, stems):
+        """The stems stacked and summed for this section: what prepare()
+        made, or, unprepared, made here once (a stall; the player's queue()
+        prepares every section)."""
+        key = id(stems)
+        nxt = self._next
+        if nxt is not None and nxt[0] == key:                  # prepared: adopt it
+            if self._base is not None and self._base is not nxt[4]:
+                self._spare = self._base                       # the last one: warm, for the next
+            _k, self._names, self._all, self._mono, self._base = nxt
+            self._next, self._key = None, key
+        elif self._key != key:
+            self._names = tuple(stems)
+            self._all = np.stack([np.asarray(stems[k], np.float32) for k in self._names])
+            self._mono = self._all[:, 0].sum(axis=0, dtype=np.float32)
+            self._key = key
+        return self._all

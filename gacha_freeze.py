@@ -161,8 +161,8 @@ class Freeze:
         rn = self.n
         tpl_i = (int(natural) + np.arange(W)) % rn
         span_i = (int(lo) + np.arange(2 * S + W)) % rn
-        mono = self.ring[0] + self.ring[1]
-        tpl, span = mono[tpl_i], mono[span_i]
+        L, R = self.ring                                       # summed where read only,
+        tpl, span = L[tpl_i] + R[tpl_i], L[span_i] + R[span_i]   # not the whole 4 s ring
         if not tpl.any():
             return start
         c = np.correlate(span, tpl, "valid")

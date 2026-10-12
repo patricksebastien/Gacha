@@ -21,6 +21,7 @@ import math
 import random
 import re
 import subprocess
+import gc
 import sys
 import tempfile
 import time
@@ -70,6 +71,7 @@ from gacha_midi import (CYCLES_CHANNELS, CYCLES_FX_PARAMS, CYCLES_LISTS, CYCLES_
                         cycles_cc_value, format_binding, midi_inputs, midi_outputs,
                         parse_binding)
 from gacha_freeze import FREEZE
+from gacha_gilwatch import GilWatch
 from gacha_frag import (FRAG_DIRS, FRAG_DIVS, FRAG_PLAYS, FRAG_RATES, FRAG_UNITS, FRAGMENTS,
                         MAX_VOICES)
 from gacha_fx import (ALL_CHANNELS, AUDIO_FX, BIPOLAR, CHANNELS, FX_SET, FX_SETTINGS,
@@ -2037,6 +2039,8 @@ class Main(QMainWindow):
         self._live_timer = QTimer(self)             # level meter refresh
         self._live_timer.timeout.connect(self._update_live_meter)
         self.through = None                         # LiveAudio: the audio stream, when open
+        self._gilwatch = None                       # gacha_gilwatch, while the stream is open
+        self._gil_logged_t = 0.0                    # its last log line (one a second at most)
         # moments of the show, in RAM; each one also lands in videos/ as a set
         # folder named after tonight, so tomorrow the takes are backdrops
         self.takes = TakeStore(parent=self, archive_dir=VIDEOS_DIR /
@@ -2131,6 +2135,8 @@ class Main(QMainWindow):
             box.addWidget(status)
             if tree is self.videos_tree:
                 box.addLayout(self._build_fetch_row())
+            else:
+                box.addLayout(self._build_prep_row())
             w = QWidget()
             w.setLayout(box)
             tabs.addTab(w, title)
@@ -2214,6 +2220,7 @@ class Main(QMainWindow):
         self._stats_timer.timeout.connect(self._update_stats)
         self._stats_prev = None                  # (time, paints, video frames)
         self._proc = psutil.Process() if psutil else None
+        self._mem_free = None                       # (monotonic, GB) the last free-memory reading
         if self._proc is not None:
             self._proc.cpu_percent(None)          # prime the counters
             psutil.cpu_percent(None)
@@ -2525,9 +2532,8 @@ class Main(QMainWindow):
             cpu_all = psutil.cpu_percent(None)
             cpu_app = self._proc.cpu_percent(None) / max(1, psutil.cpu_count() or 1)
             parts.append(f"cpu   {cpu_all:5.1f} %  app {cpu_app:5.1f} %")
-            vm = psutil.virtual_memory()
             rss = self._proc.memory_info().rss
-            parts.append(f"mem   {rss / 1e9:5.2f} GB app  {vm.available / 1e9:5.1f} GB free")
+            parts.append(f"mem   {rss / 1e9:5.2f} GB app  {self._free_memory_gb():5.1f} GB free")
             takes = self.takes.nbytes
             if takes:
                 parts[-1] += f"  takes {takes / 1e9:.2f} GB"
@@ -2540,9 +2546,13 @@ class Main(QMainWindow):
             src = f"in {db(st['in_peak'])}" if la.in_name else "no input"
             mode = st.get("mode") or "audio"
             parts.append(f"audio {mode}  {src}  out {db(st['out_peak'])}")
-            parts.append(f"      dsp {100 * st['load']:4.1f} %  buf {st['buffer_ms']:.1f} ms  "
+            parts.append(f"      dsp {100 * st['load']:4.1f} %  peak {100 * st['peak']:4.0f} %  "
+                         f"buf {st['buffer_ms']:.1f} ms  "
                          f"sync {st['delay_ms']:.0f} ms  late {st['late']}  "
-                         f"xruns {st['dropped']}/{st['underruns']}")
+                         f"gap {st['gap_ms']:.1f} ms  xruns {st['dropped']}/{st['underruns']}")
+            w = self._gilwatch
+            if w is not None:
+                parts.append(f"      gil stalls {w.stalls}  worst {w.worst_ms:.1f} ms  (see the log)")
             song = la.song
             if song.loaded and song.state in ("playing", "paused"):
                 stems = "+".join(n[0] for n in song.stems if la.on.get(n, True)) or "none"
@@ -2575,6 +2585,40 @@ class Main(QMainWindow):
         self.hud.setText("\n".join(parts))
         self.hud.adjustSize()
         self.hud.move(self.backdrop.width() - self.hud.width() - 12, 12)
+
+    def _free_memory_gb(self):
+        """The machine's free memory. Not psutil's virtual_memory() on
+        Windows: that call keeps the GIL for 5 ms (measured), twice a
+        second, and the audio callback waited on it every time (a 128-frame
+        block is 2.7 ms); GlobalMemoryStatusEx through ctypes takes 20 us
+        and lets the GIL go. Elsewhere psutil, every few seconds."""
+        now = time.monotonic()
+        if self._mem_free is not None and now - self._mem_free[0] < 2.0:
+            return self._mem_free[1]
+        gb = 0.0
+        try:
+            if sys.platform == "win32":
+                import ctypes
+
+                class MemoryStatusEx(ctypes.Structure):
+                    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                                ("ullTotalPhys", ctypes.c_ulonglong),
+                                ("ullAvailPhys", ctypes.c_ulonglong),
+                                ("ullTotalPageFile", ctypes.c_ulonglong),
+                                ("ullAvailPageFile", ctypes.c_ulonglong),
+                                ("ullTotalVirtual", ctypes.c_ulonglong),
+                                ("ullAvailVirtual", ctypes.c_ulonglong),
+                                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+                m = MemoryStatusEx()
+                m.dwLength = ctypes.sizeof(m)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                    gb = m.ullAvailPhys / 1e9
+            elif psutil is not None:
+                gb = psutil.virtual_memory().available / 1e9
+        except Exception:
+            pass
+        self._mem_free = (now, gb)
+        return gb
 
     def _drain_gl_log(self):
         """GL backdrop messages (shader compile errors) -> render log."""
@@ -8023,6 +8067,32 @@ class Main(QMainWindow):
         self.videos_status.setText(
             f"{n} / {self.videos_tree.total} videos selected, {how}")
 
+    def _build_prep_row(self):
+        """Under the Samples tree: the sample prep tool (gacha_prep.py),
+        which cuts a recording of single notes into a note-named set."""
+        self.prep_window = None
+        btn = QPushButton("Prepare samples…")
+        btn.setObjectName("small")
+        btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        btn.setToolTip("Cut a recording (or a video's sound) into one-shot samples: "
+                       "every note found, cropped, pitched, brought to one loudness "
+                       "and written as a new set here, G2 as G2 in the filename")
+        btn.clicked.connect(self._open_prep)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 4, 0, 0)
+        row.addWidget(btn)
+        row.addStretch(1)
+        return row
+
+    def _open_prep(self):
+        if self.prep_window is None:
+            from gacha_prep import PrepWindow
+            self.prep_window = PrepWindow()
+            self.prep_window.exported.connect(lambda _folder: self.refresh_lists())
+        self.prep_window.show()
+        self.prep_window.raise_()
+        self.prep_window.activateWindow()
+
     def _build_fetch_row(self):
         """Under the Videos tree: a URL and a Fetch button. yt-dlp pulls
         the clip into videos/web/ and gacha_transcode.py makes it seek
@@ -9488,6 +9558,7 @@ class Main(QMainWindow):
             self._through_timer.stop()
             self.through.stop()
             self.through = None
+            self._gilwatch_stop()
         if not out_name:
             why = audio_status() or "no output device chosen"
             self.through_status.setText(f"not open: {why}. Songs play through Qt, no racks")
@@ -9511,6 +9582,9 @@ class Main(QMainWindow):
         self.through.inserts = self.inserts
         self._midi_out_apply()
         self.through.start()
+        if self._gilwatch is None:                  # who holds the GIL when a block comes late
+            self._gilwatch = GilWatch(threshold_ms=4.0)
+            self._gilwatch.start()
         self.through_status.setText("opening...")
         self._through_ticks = 0
         self._through_error = None
@@ -9543,6 +9617,7 @@ class Main(QMainWindow):
         if self._live_active() and self.live.external:
             for block, t in la.drain():
                 self.live.feed(block, t)
+        self._gilwatch_poll()
         # the racks' delays follow the playing song, else the live clock
         song_on = self.player.streaming and self.player.playbackState() == QMediaPlayer.PlayingState
         la.beat_s = (self._beat_ms if song_on else self.tempo.beat_ms) / 1000.0
@@ -9554,15 +9629,41 @@ class Main(QMainWindow):
             db = lambda p: f"{20 * math.log10(max(p, 1e-5)):.0f} dB"
             src = f"in {db(s['in_peak'])}" if la.in_name else "output only"
             mode = f"{s['mode']}  ·  " if s.get("mode") else ""
-            text = (f"{mode}{src}  out {db(s['out_peak'])}  ·  dsp {s['load']:.0%}  ·  "
+            text = (f"{mode}{src}  out {db(s['out_peak'])}  ·  dsp {s['load']:.0%} "
+                    f"peak {s['peak']:.0%}  ·  "
                     f"buffers {s['buffer_ms']:.1f} ms  ·  sync {s['delay_ms']:.0f} ms  ·  "
-                    f"overflows {s['dropped']}  underruns {s['underruns']}  late {s['late']}")
+                    f"overflows {s['dropped']}  underruns {s['underruns']}  late {s['late']}  "
+                    f"gap {s['gap_ms']:.1f} ms")
             src = self.backdrop.live_source()
             lat = src.capture_latency_ms if src is not None else None
             if lat is not None:
                 # what the picture is already late by before paint and display
                 text += f"  ·  picture {lat:.0f} ms + paint + display"
             self.through_status.setText(text)
+
+    def _gilwatch_poll(self):
+        """The GIL watcher's stalls (gacha_gilwatch) into the log: the
+        worst one of the last second and how many there were, so a
+        crackle names the thread and the call that held the audio
+        callback off."""
+        w = self._gilwatch
+        if w is None:
+            return
+        ev = w.drain()
+        if not ev:
+            return
+        now = time.monotonic()
+        if now - self._gil_logged_t < 1.0:
+            return
+        self._gil_logged_t = now
+        _t, ms, what = max(ev, key=lambda e: e[1])
+        more = f" (+{len(ev) - 1} more this second)" if len(ev) > 1 else ""
+        self.log.appendPlainText(f"gil: held {ms:.1f} ms{more}  {what}")
+
+    def _gilwatch_stop(self):
+        w, self._gilwatch = self._gilwatch, None
+        if w is not None:
+            w.stop()
 
     def _update_live_meter(self):
         self.live_level.setValue(int(100 * self.live.loud))
@@ -10481,6 +10582,7 @@ class Main(QMainWindow):
         self._flush_takes()                     # the takes reach the disk now, not during the show
         if self.through is not None:
             self.through.stop()
+        self._gilwatch_stop()
         self._vst_save()
         self._vst_watch_stop.set()
         if getattr(self, "midi", None) is not None:
@@ -10516,4 +10618,13 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = Main()
     win.showMaximized()                         # the whole screen from the start
+    gc.collect()
+    gc.freeze()                                 # the GUI built: out of every later full
+                                                # collection (tens of ms under the GIL, the
+                                                # audio callback waiting while it walks)...
+    gc.set_threshold(700, 10, 10000)            # ...and full collections rare: with the
+                                                # frozen heap out of the count, the rule of a
+                                                # quarter more long-lived objects would run one
+                                                # at nearly every middle collection (7 ms each,
+                                                # seen); this one runs about once an hour
     sys.exit(app.exec())
