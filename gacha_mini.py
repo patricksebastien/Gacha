@@ -22,6 +22,11 @@ of the things suspected of crackling can be switched on one at a time:
                  engine runs at 0.5 ms)
   gc off         gc.disable(), in case a collection is the stall
   Pro Audio      the driver's thread in the MMCSS "Pro Audio" class
+  high priority  the whole process in HIGH_PRIORITY_CLASS, as DAWs run
+  core           the driver's thread pinned: any core, the P-cores only,
+                 or one P-core (a hybrid CPU parks threads on E-cores)
+
+The stats also say which CPUs the callback actually ran on, P or E.
 
 What it shows, ten times a second: the DSP time per block (smoothed and
 the worst lately), the gap between callbacks (the one number that is a
@@ -38,6 +43,7 @@ import ctypes
 import gc
 import math
 import os
+import struct
 import sys
 import threading
 import time
@@ -59,7 +65,61 @@ SOURCES = ("silence", "tone 220 Hz", "input through", "engine idle (gacha_audio 
 SWITCHES = (("5 ms (Python default)", 0.005), ("1 ms", 0.001),
             ("0.5 ms (the engine)", 0.0005), ("0.1 ms", 0.0001))
 BLOCKS = ("64", "128", "256", "512", "driver's own")
+CORES = ("any core", "P-cores only", "one P-core")
 RING = 4096
+_K32 = ctypes.windll.kernel32 if sys.platform == "win32" else None
+
+
+def cpu_topology():
+    """Windows: {efficiency class: mask of logical CPUs} from
+    GetLogicalProcessorInformationEx; the highest class is the P-cores.
+    {} when it cannot be read (one processor group assumed)."""
+    if _K32 is None:
+        return {}
+    try:
+        n = ctypes.c_ulong(0)
+        _K32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(n))   # RelationProcessorCore
+        buf = ctypes.create_string_buffer(n.value)
+        if not _K32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(n)):
+            return {}
+        raw, off, classes = buf.raw, 0, {}
+        while off < n.value:
+            rel, size = struct.unpack_from("<II", raw, off)
+            if rel == 0:
+                eff = raw[off + 9]                                 # EfficiencyClass
+                groups, = struct.unpack_from("<H", raw, off + 30)
+                for g in range(groups):
+                    mask, grp = struct.unpack_from("<QH", raw, off + 32 + 16 * g)
+                    if grp == 0:
+                        classes[eff] = classes.get(eff, 0) | mask
+            off += size
+        return classes
+    except Exception:
+        return {}
+
+
+def _mask_text(mask):
+    cpus = [i for i in range(64) if mask >> i & 1]
+    if not cpus:
+        return "-"
+    runs, start = [], cpus[0]
+    for a, b in zip(cpus, cpus[1:] + [None]):
+        if b != a + 1:
+            runs.append(f"{start}-{a}" if a != start else str(start))
+            start = b
+    return ",".join(runs)
+
+
+def set_process_priority(high):
+    """HIGH_PRIORITY_CLASS for the process (what DAWs run at), or normal."""
+    if _K32 is None:
+        return False
+    try:
+        _K32.GetCurrentProcess.restype = ctypes.c_void_p
+        _K32.SetPriorityClass.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+        return bool(_K32.SetPriorityClass(_K32.GetCurrentProcess(), 0x80 if high else 0x20))
+    except Exception:
+        return False
 
 
 class Probe:
@@ -74,6 +134,9 @@ class Probe:
         self.source = source                    # index into SOURCES, changed live
         self.fake_load = 0.0                    # share of the block to spin, 0..1.5
         self.pro_audio = False                  # MMCSS on the driver's thread, once
+        self.affinity = 0                       # CPU mask for the driver's thread, 0 = any
+        self._aff_done = None
+        self.cpu_hist = np.zeros(64, np.int64)  # which CPU each callback ran on
         self.mode = ""
         self.error = None
         self.running = False
@@ -178,6 +241,11 @@ class Probe:
             if self.pro_audio and not self._pro_done:
                 self._pro_done = True
                 self._set_pro_audio()
+            if self.affinity != self._aff_done:        # pin (or free) the driver's thread
+                self._aff_done = self.affinity
+                self._set_affinity(self.affinity)
+            if _K32 is not None:
+                self.cpu_hist[_K32.GetCurrentProcessorNumber() & 63] += 1
             if status:
                 if status.output_underflow:
                     self.underruns += 1
@@ -264,6 +332,38 @@ class Probe:
             ctypes.windll.avrt.AvSetMmThreadCharacteristicsW("Pro Audio", ctypes.byref(task))
         except Exception:
             pass
+
+    @staticmethod
+    def _set_affinity(mask):
+        """This thread on the CPUs of `mask`; 0 = every CPU the process may use."""
+        if _K32 is None:
+            return
+        try:
+            if not mask:
+                pm, sm = ctypes.c_size_t(0), ctypes.c_size_t(0)
+                _K32.GetCurrentProcess.restype = ctypes.c_void_p
+                _K32.GetProcessAffinityMask(_K32.GetCurrentProcess(), ctypes.byref(pm), ctypes.byref(sm))
+                mask = pm.value or (1 << os.cpu_count()) - 1
+            _K32.GetCurrentThread.restype = ctypes.c_void_p
+            _K32.SetThreadAffinityMask.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+            _K32.SetThreadAffinityMask(_K32.GetCurrentThread(), ctypes.c_size_t(mask))
+        except Exception:
+            pass
+
+    def cpu_text(self, classes):
+        """'cpu 2 (93 %) P, 14 (7 %) E' for the CPUs the callback ran on."""
+        tot = int(self.cpu_hist.sum())
+        if not tot:
+            return "-"
+        p_mask = classes[max(classes)] if classes else 0
+        parts = []
+        for i in np.argsort(-self.cpu_hist)[:4]:
+            c = int(self.cpu_hist[i])
+            if not c:
+                break
+            kind = ("P" if p_mask >> int(i) & 1 else "E") if classes else ""
+            parts.append(f"{int(i)} ({100 * c / tot:.0f} %){kind}")
+        return ", ".join(parts)
 
     def cpu_load(self):
         try:
@@ -404,6 +504,14 @@ class Mini(QMainWindow):
         self.gcoff.toggled.connect(lambda on: gc.disable() if on else gc.enable())
         self.pro = QCheckBox("Pro Audio (MMCSS) on the driver's thread")
         self.pro.setChecked(self.settings.value("pro", False, type=bool))
+        self.classes = cpu_topology()                  # {efficiency class: cpu mask}
+        self.hiprio = QCheckBox("process high priority (as DAWs run)")
+        self.hiprio.toggled.connect(self._hiprio)
+        self.core = QComboBox()
+        self.core.addItems(CORES)
+        self.core.currentIndexChanged.connect(self._core)
+        if not self.classes:
+            self.core.setEnabled(False)
         r = 0
         for label, w in (("host API", self.api), ("input", self.inp), ("output", self.out),
                          ("block", self.blk), ("source", self.src)):
@@ -423,6 +531,10 @@ class Mini(QMainWindow):
         g.addWidget(self.gcoff, r, 2)
         r += 1
         g.addWidget(self.paint, r, 0, 1, 2)
+        g.addWidget(self.hiprio, r, 2)
+        r += 1
+        g.addWidget(QLabel("driver's thread on"), r, 0)
+        g.addWidget(self.core, r, 1)
         self.stats = QLabel("not open")
         self.stats.setFont(QFont("Consolas", 10))
         self.stats.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -460,6 +572,13 @@ class Mini(QMainWindow):
             self._log(why)
         self._log(f"python {sys.version.split()[0]}  sounddevice {sd.__version__ if sd else '-'}  "
                   f"switch interval now {1000 * sys.getswitchinterval():.2f} ms")
+        if self.classes:
+            top = max(self.classes)
+            self._log("cpus: " + "  ".join(
+                f"{'P' if k == top else 'E'}-cores {_mask_text(m)}" for k, m in
+                sorted(self.classes.items(), reverse=True)))
+        else:
+            self._log("cpus: topology not readable, the core choice is off")
 
     # ---- controls
     def _fill_devices(self):
@@ -495,6 +614,7 @@ class Mini(QMainWindow):
                            self.excl.isChecked(), self.src.currentIndex())
         self.probe.fake_load = self.load.value() / 100.0
         self.probe.pro_audio = self.pro.isChecked()
+        self.probe.affinity = self._core_mask(self.core.currentIndex())
         self.trace.probe = self.probe
         self._switch(self.sw.currentIndex())
         self.probe.start()
@@ -566,6 +686,25 @@ class Mini(QMainWindow):
             self._burn_thread = None
             self._log("GUI burn off")
 
+    def _hiprio(self, on):
+        ok = set_process_priority(on)
+        self._log(f"process priority {'high' if on else 'normal'}{'' if ok else ' (refused)'}")
+
+    def _core_mask(self, i):
+        if not self.classes or i == 0:
+            return 0
+        p_mask = self.classes[max(self.classes)]
+        if i == 1:
+            return p_mask
+        cpus = [c for c in range(64) if p_mask >> c & 1]
+        return 1 << cpus[min(2, len(cpus) - 1)]       # not CPU 0, where the interrupts land
+
+    def _core(self, i):
+        mask = self._core_mask(i)
+        if self.probe is not None:
+            self.probe.affinity = mask
+        self._log(f"driver's thread on {CORES[i]}" + (f" (cpus {_mask_text(mask)})" if mask else ""))
+
     def _paint(self, on):
         self.burner.on = on
         if on:
@@ -626,7 +765,8 @@ class Mini(QMainWindow):
             f"driver underruns {pr.underruns}   overflows {pr.overflows}   "
             f"in {db(pr.in_peak)}   out {db(pr.out_peak)}   "
             f"gil stalls {w.stalls if w else 0}   worst {w.worst_ms if w else 0:.1f} ms   "
-            f"switch {1000 * sys.getswitchinterval():.2f} ms   gc {'off' if not gc.isenabled() else 'on'}"
+            f"switch {1000 * sys.getswitchinterval():.2f} ms   gc {'off' if not gc.isenabled() else 'on'}\n"
+            f"callback ran on cpu {pr.cpu_text(self.classes)}"
             f"{cadence}")
         self.trace.update()
 
