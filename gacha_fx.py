@@ -74,7 +74,7 @@ AUDIO_FX = [
                                       "the time and the feedback in the settings, this knob "
                                       "the wet mix, only echoes at full"),
     ("reverb", "reverb", 0.0, "Reverb at the size, damping and width settings; this knob "
-                              "the wet mix, a wash at full"),
+                              "the wet mix, gentle over its first half, a wash at full"),
 ]
 BIPOLAR = {"pitch"}                      # -1..1 knobs, off at 0 in the middle
 CHANNELS = ("live", "drums", "layers", "chops", "events")   # live = the input through
@@ -367,7 +367,10 @@ class Rack:
             elif key == "reverse":
                 p = ReverseDelay(sr)
             elif key == "reverb":
-                p = Reverb(room_size=0.6, damping=0.5, wet_level=1.0, dry_level=0.0, width=1.0)
+                # wet_level 1 is Freeverb's +3.5 dB on noise and +8 dB on a kick
+                # pattern (the tail fills the gaps): 0.3 puts the full wash
+                # about 3 dB under the dry
+                p = Reverb(room_size=0.6, damping=0.5, wet_level=0.3, dry_level=0.0, width=1.0)
             self._plug[key] = p
         return p
 
@@ -463,6 +466,8 @@ class Rack:
             wet = self._fit(key, self._wet(key, np.ascontiguousarray(y, dtype=np.float32), a), y)
             if bipolar:                                    # wet share fades in over ~3 st
                 w_t, w_n = min(1.0, abs(target) * 4.0), min(1.0, abs(now) * 4.0)
+            elif key == "reverb":                          # squared: the first half of the
+                w_t, w_n = target * target, now * now      # knob a room, not a wash
             else:
                 w_t, w_n = target, now
             if w_t != w_n:
