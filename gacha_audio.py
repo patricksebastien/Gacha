@@ -394,6 +394,7 @@ class SectionPlayer:
         self.pos = 0                         # play position in frames
         self.pending = None                  # (stems, events, bpm, bars, bar_t0) for the next bar
         self._lead = 0                       # frames of silence before a timed start
+        self.out_lat = 0.0                   # s from a block's `now` to its first frame heard
         self.on = {"drums": True, "layers": True, "chops": True, "events": True}
         self._gain_now = {}                  # stem -> gain reached (ramps)
         self.quant = 0.0                     # the grid, a fraction of a bar; 0 = at once
@@ -954,8 +955,12 @@ class SectionPlayer:
     def queue(self, stems, events, bpm, bars, bar_t0=None, start_bar=0):
         """The next section: on the loop's next bar while one plays, else
         from the next block, or, `bar_t0` given (monotonic seconds, the
-        Link session's bar), exactly then: silence up to it inside the
-        block, or, when it has just passed, the loop entered that far in.
+        Link session's bar), exactly then as heard: the block's `now` is
+        when it is rendered, its sound leaves `out_lat` later (the
+        driver's output latency, a buffer or two), and the peers put their
+        downbeat on the bar as heard, so the bar is placed against the
+        heard time: silence up to it inside the block, or, when it has
+        just passed, the loop entered that far in.
         `start_bar`: the loop entered that many bars in (an outro, from
         its second half)."""
         self.pending = (stems, events, bpm, bars, bar_t0, drum_table(events, self.sr),
@@ -1028,10 +1033,11 @@ class SectionPlayer:
         self._covered = start
         self.loop_t0 = (time.monotonic() if now is None else now) - start / self.sr
         if bar_t0 is not None and from_silence and now is not None:
-            if bar_t0 > now:                          # inside this block: silence first
-                self._lead = min(bs, int(round((bar_t0 - now) * self.sr)))
+            heard = now + self.out_lat                # this block's first frame, at the speaker
+            if bar_t0 > heard:                        # inside this block: silence first
+                self._lead = min(bs, int(round((bar_t0 - heard) * self.sr)))
             else:                                     # the bar just passed: enter late
-                self.pos = (start + int((now - bar_t0) * self.sr)) % self.n
+                self.pos = (start + int((heard - bar_t0) * self.sr)) % self.n
                 self._covered = self.pos
             self.loop_t0 = now + (self._lead - self.pos) / self.sr
         if from_silence:
@@ -1131,7 +1137,7 @@ class SectionPlayer:
         breaking = self.fill_armed or self._fill is not None
         if self.pending is not None and (self.stems is None or (self.pos == 0 and not breaking)):
             wait = self.waiting_for()
-            if wait is None or now + bs / self.sr >= wait:   # a timed start: not yet
+            if wait is None or now + self.out_lat + bs / self.sr >= wait:   # a timed start: not yet
                 self._swap(now, bs)
         if self._fill is not None:
             self._rep_anchor, self._heard = None, None   # a break wins; a held repeat re-anchors after
@@ -2092,6 +2098,7 @@ class LiveAudio:
         L = int(math.ceil(max(0.0, lead_s - out_lat) * sr)) if midi else 0
         self.player.lookahead = self.song.lookahead = L
         self.player.quant = self.quant
+        self.player.out_lat = out_lat                 # a Link bar is placed as heard
         t_block = time.perf_counter()
         sec = self.player.block(bs, now, ramp)
         song = self.song.block(bs)
