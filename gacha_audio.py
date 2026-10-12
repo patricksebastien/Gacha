@@ -193,6 +193,43 @@ def thread_no_throttle():
         return False
 
 
+def set_process_priority(high):
+    """Windows: the whole process in HIGH_PRIORITY_CLASS (what DAWs run
+    at: the scheduler takes it before the desktop) or back to normal."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.SetPriorityClass.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+        return bool(k32.SetPriorityClass(k32.GetCurrentProcess(), 0x80 if high else 0x20))
+    except Exception:
+        return False
+
+
+def thread_pro_audio(on, handle=None):
+    """Windows: this thread into (or out of) the MMCSS "Pro Audio" class,
+    the scheduling DAWs give their audio threads. Returns the task handle
+    while in, None while out; call it on the thread itself."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        avrt = ctypes.windll.avrt
+        if on and handle is None:
+            avrt.AvSetMmThreadCharacteristicsW.restype = ctypes.c_void_p
+            idx = ctypes.c_ulong(0)
+            return avrt.AvSetMmThreadCharacteristicsW("Pro Audio", ctypes.byref(idx)) or None
+        if not on and handle is not None:
+            avrt.AvRevertMmThreadCharacteristics.argtypes = (ctypes.c_void_p,)
+            avrt.AvRevertMmThreadCharacteristics(handle)
+            return None
+    except Exception:
+        pass
+    return handle
+
+
 def _api_has_devices(idx, devs):
     return any(d["hostapi"] == idx and (d["max_input_channels"] > 0 or
                                         d["max_output_channels"] > 0) for d in devs)
@@ -1495,6 +1532,8 @@ class LiveAudio:
         self.freeze = Freeze(self.sr)        # the master freeze (gacha_freeze): .held from any thread
         self.metro = Metronome(self.sr)      # the metronome (gacha_metro): .on, .note, .anchor, .beat_s
         self.inserts = None                  # gacha_vst.InsertChain on the master, or None
+        self.pro_audio = False               # the driver's thread in MMCSS "Pro Audio" (set any time)
+        self._mmcss = None                   # its task handle while it is (the driver's thread)
         # the drum hits as MIDI notes (see the module note): a gacha_midi.MidiOut
         self.midi_out = None
         self.midi_channel = 10
@@ -1630,6 +1669,8 @@ class LiveAudio:
             if self._cb_last is None:                # the driver's thread, named for the logs
                 threading.current_thread().name = "gacha-asio"
                 thread_no_throttle()                 # and on a performance core, full clocks
+            if self.pro_audio != (self._mmcss is not None):   # the Settings tick, on this thread
+                self._mmcss = thread_pro_audio(self.pro_audio, self._mmcss)
             if status:
                 if status.input_overflow:
                     self.dropped += 1
