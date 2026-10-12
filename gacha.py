@@ -677,7 +677,9 @@ class _ComboSearch(QObject):
     matches what was typed, Escape or leaving with a name that matches
     nothing puts the chosen one back (an editable combo would otherwise
     keep the typed text, and a highlight walked with the arrows then
-    Escape would stick)."""
+    Escape would stick). A combo with the "clearable" property has no
+    empty entry in its list: an empty field is "nothing", and deleting
+    the name then Enter, or leaving, clears it (index -1)."""
 
     def __init__(self, combo, comp):
         super().__init__(combo)
@@ -690,8 +692,17 @@ class _ComboSearch(QObject):
     def chosen(self):
         return self.combo.itemText(self.combo.currentIndex())
 
+    def clear_if_empty(self):
+        if self.combo.property("clearable") and not self.le.text().strip():
+            self.combo.setCurrentIndex(-1)
+            self.le.setText("")
+            return True
+        return False
+
     def pick(self):
         c = self.combo
+        if self.clear_if_empty():
+            return
         if c.findText(self.le.text()) < 0 and self.comp.completionCount():
             i = c.findText(self.comp.currentCompletion())
             if i >= 0:
@@ -700,6 +711,8 @@ class _ComboSearch(QObject):
 
     def settle(self):
         try:
+            if self.clear_if_empty():
+                return
             if self.combo.findText(self.le.text()) < 0:
                 self.le.setText(self.chosen())
         except RuntimeError:                   # the widgets going away
@@ -5536,8 +5549,7 @@ class Main(QMainWindow):
             on.setFixedWidth(36)
             on.setToolTip(f"LFO {r} in or out; out, its knob goes back where you set it. "
                           "Remembered. A MIDI button in the Controls tab's LFOs group.")
-            dest = QComboBox()
-            dest.addItem("(none)", "")
+            dest = QComboBox()                # a knob always: off is the "on" button
             for ident, label in LFO_DESTS:
                 dest.addItem(label, ident)
             dest.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -5810,15 +5822,17 @@ class Main(QMainWindow):
         for j in range(MACRO_ROWS):
             num = QLabel(str(j + 1))
             num.setProperty("role", "sub")
-            dest = QComboBox()
-            dest.addItem("(none)", "")
+            dest = QComboBox()                # empty = no knob on this row
             for ident, label in MACRO_DESTS:
                 dest.addItem(label, ident)
+            dest.setProperty("clearable", True)
             dest.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             dest.setMinimumContentsLength(20)
             dest.setToolTip("A knob this macro moves: any knob of the Controls tab but the "
-                            "macros themselves")
+                            "macros themselves. Delete the name and press Enter to drop "
+                            "the knob from the row.")
             searchable(dest)
+            dest.setCurrentIndex(-1)
             lo = QSpinBox()
             lo.setRange(0, 100)
             lo.setToolTip("Where the knob sits with the macro at 0, as a percentage of the "
@@ -5907,7 +5921,7 @@ class Main(QMainWindow):
             for w in widgets:
                 w.blockSignals(True)
             try:
-                r["dest"].setCurrentIndex(max(0, r["dest"].findData(d.ident)))
+                r["dest"].setCurrentIndex(r["dest"].findData(d.ident))   # -1: no knob
                 r["lo"].setValue(int(round(100 * d.lo)))
                 r["hi"].setValue(int(round(100 * d.hi)))
             finally:
