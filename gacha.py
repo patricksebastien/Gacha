@@ -71,7 +71,6 @@ from gacha_midi import (CYCLES_CHANNELS, CYCLES_FX_PARAMS, CYCLES_LISTS, CYCLES_
                         cycles_cc_value, format_binding, midi_inputs, midi_outputs,
                         parse_binding)
 from gacha_freeze import FREEZE
-from gacha_gilwatch import GilWatch
 from gacha_frag import (FRAG_DIRS, FRAG_DIVS, FRAG_PLAYS, FRAG_RATES, FRAG_UNITS, FRAGMENTS,
                         MAX_VOICES)
 from gacha_fx import (ALL_CHANNELS, AUDIO_FX, BIPOLAR, CHANNELS, FX_SET, FX_SETTINGS,
@@ -2039,8 +2038,6 @@ class Main(QMainWindow):
         self._live_timer = QTimer(self)             # level meter refresh
         self._live_timer.timeout.connect(self._update_live_meter)
         self.through = None                         # LiveAudio: the audio stream, when open
-        self._gilwatch = None                       # gacha_gilwatch, while the stream is open
-        self._gil_logged_t = 0.0                    # its last log line (one a second at most)
         # moments of the show, in RAM; each one also lands in videos/ as a set
         # folder named after tonight, so tomorrow the takes are backdrops
         self.takes = TakeStore(parent=self, archive_dir=VIDEOS_DIR /
@@ -2550,9 +2547,6 @@ class Main(QMainWindow):
                          f"buf {st['buffer_ms']:.1f} ms  "
                          f"sync {st['delay_ms']:.0f} ms  late {st['late']}  "
                          f"gap {st['gap_ms']:.1f} ms  xruns {st['dropped']}/{st['underruns']}")
-            w = self._gilwatch
-            if w is not None:
-                parts.append(f"      gil stalls {w.stalls}  worst {w.worst_ms:.1f} ms  (see the log)")
             song = la.song
             if song.loaded and song.state in ("playing", "paused"):
                 stems = "+".join(n[0] for n in song.stems if la.on.get(n, True)) or "none"
@@ -9558,7 +9552,6 @@ class Main(QMainWindow):
             self._through_timer.stop()
             self.through.stop()
             self.through = None
-            self._gilwatch_stop()
         if not out_name:
             why = audio_status() or "no output device chosen"
             self.through_status.setText(f"not open: {why}. Songs play through Qt, no racks")
@@ -9582,9 +9575,6 @@ class Main(QMainWindow):
         self.through.inserts = self.inserts
         self._midi_out_apply()
         self.through.start()
-        if self._gilwatch is None:                  # who holds the GIL when a block comes late
-            self._gilwatch = GilWatch(threshold_ms=4.0)
-            self._gilwatch.start()
         self.through_status.setText("opening...")
         self._through_ticks = 0
         self._through_error = None
@@ -9617,7 +9607,6 @@ class Main(QMainWindow):
         if self._live_active() and self.live.external:
             for block, t in la.drain():
                 self.live.feed(block, t)
-        self._gilwatch_poll()
         # the racks' delays follow the playing song, else the live clock
         song_on = self.player.streaming and self.player.playbackState() == QMediaPlayer.PlayingState
         la.beat_s = (self._beat_ms if song_on else self.tempo.beat_ms) / 1000.0
@@ -9640,30 +9629,6 @@ class Main(QMainWindow):
                 # what the picture is already late by before paint and display
                 text += f"  ·  picture {lat:.0f} ms + paint + display"
             self.through_status.setText(text)
-
-    def _gilwatch_poll(self):
-        """The GIL watcher's stalls (gacha_gilwatch) into the log: the
-        worst one of the last second and how many there were, so a
-        crackle names the thread and the call that held the audio
-        callback off."""
-        w = self._gilwatch
-        if w is None:
-            return
-        ev = w.drain()
-        if not ev:
-            return
-        now = time.monotonic()
-        if now - self._gil_logged_t < 1.0:
-            return
-        self._gil_logged_t = now
-        _t, ms, what = max(ev, key=lambda e: e[1])
-        more = f" (+{len(ev) - 1} more this second)" if len(ev) > 1 else ""
-        self.log.appendPlainText(f"gil: held {ms:.1f} ms{more}  {what}")
-
-    def _gilwatch_stop(self):
-        w, self._gilwatch = self._gilwatch, None
-        if w is not None:
-            w.stop()
 
     def _update_live_meter(self):
         self.live_level.setValue(int(100 * self.live.loud))
@@ -10582,7 +10547,6 @@ class Main(QMainWindow):
         self._flush_takes()                     # the takes reach the disk now, not during the show
         if self.through is not None:
             self.through.stop()
-        self._gilwatch_stop()
         self._vst_save()
         self._vst_watch_stop.set()
         if getattr(self, "midi", None) is not None:
