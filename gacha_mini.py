@@ -507,7 +507,9 @@ class Mini(QMainWindow):
         self._log(f"open: {inp or 'output only'} -> {out}, block {blk}, {self.probe.mode}, "
                   f"switch {1000 * sys.getswitchinterval():.2f} ms, "
                   f"source '{SOURCES[self.src.currentIndex()]}'")
-        thr = max(1.0, 0.75 * 1000.0 * (block or 128) / ga.SR)
+        # under 2 ms the watcher's own 1 ms sleep waking late (Windows'
+        # scheduler) reads as holds of the idle main thread: noise
+        thr = max(2.0, 0.75 * 1000.0 * (block or 128) / ga.SR)
         self.gilwatch = GilWatch(threshold_ms=thr)
         self.gilwatch.start()
         self._log(f"gil watch: a hold over {thr:.1f} ms is a stall")
