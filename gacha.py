@@ -5017,6 +5017,7 @@ class Main(QMainWindow):
         self.perf_gap.toggled.connect(self._perf_gap_changed)
         form.addRow("Break", self._row([("", glitch_btn), ("", break_btn), ("", self.perf_gap)]))
         form.addRow("Stems", stems_row)
+        drums_at = form.rowCount()                     # the Drums row goes right under
         # the repeat: held from a key, a note or this latching button
         self._rep_sources = set()
         self.rep_btn = QPushButton("repeat (H)")
@@ -5333,7 +5334,7 @@ class Main(QMainWindow):
             so.toggled.connect(lambda on, v=v: self._perf_solo(v, on))
             self.perf_voices[v], self.perf_solos[v] = cb, so
             pairs.append(("", self._pair(cb, so)))
-        form.addRow("Drums", self._row(pairs))
+        form.insertRow(drums_at, "Drums", self._row(pairs))   # under the Stems row
         self.perf_quant = QComboBox()
         self.perf_quant.addItems([name for name, _f in QUANT_GRIDS])
         self.perf_quant.setToolTip(
