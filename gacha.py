@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gacha_gl import (BG_MODES, BLEND_MODES, CANVAS_FITS, GLBackdrop, KEEP_FX,
+from gacha_gl import (BG_MODES, BLEND_MODES, CANVAS_FITS, GLBackdrop, KEEP_FX, PIC_BLENDS,
                       gl_available, shader_files)
 from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES,
                           sample_name)
@@ -309,6 +309,12 @@ CANVAS_KNOBS = [
     ("tilt_y", "tilt y", (-60.0, 60.0, 1.0, 0.0), "\u00b0",
      "Keystone: the picture tilted about its vertical axis, in degrees; positive "
      "sends the right edge away (narrower), negative the left edge"),
+    ("mix", "mix", (0.0, 100.0, 1.0, 100.0), " %",
+     "The video's opacity over the background, in its blend mode: 100 the video, 0 "
+     "the background alone"),
+    ("feather", "feather", (0.0, 50.0, 0.5, 0.0), " %",
+     "A soft edge: the video fades into the background over this much of its height, "
+     "on every side; 0 a hard edge"),
 ]
 # every action the performer has, in one table: the Controls tab shows it,
 # the keyboard shortcuts and the MIDI bindings hang on the same ids.
@@ -402,7 +408,10 @@ KEYMAP += [("canvas", "canvas_neutral", "", "canvas back to the whole screen: no
                                             "centred, zoom 100, no tilt"),
            ("canvas", "canvas_fit_next", "", "fill / fit: the picture covers the screen or "
                                              "shows whole at zoom 100"),
-           ("canvas", "canvas_bg_next", "", "background: the colour / the file")]
+           ("canvas", "canvas_bg_next", "", "background: the colour / the file"),
+           ("canvas", "canvas_blend_next", "", "next blend of the video over the background "
+                                               "(over, add, multiply, screen, overlay, "
+                                               "difference, lighten, darken)")]
 KEYMAP += [("canvas", f"canvas_{k}", "", f"canvas {'crop ' if k.startswith('crop_') else ''}"
                                          f"{lbl}: {lo:g} to {hi:g}{sfx.strip()}, neutral {val:g}")
            for k, lbl, (lo, hi, _s, val), sfx, _t in CANVAS_KNOBS]
@@ -2459,6 +2468,7 @@ class Main(QMainWindow):
         self.actions["canvas_neutral"] = self._canvas_neutral
         self.actions["canvas_fit_next"] = lambda: self._combo_next(self.canvas_fit)
         self.actions["canvas_bg_next"] = lambda: self._combo_next(self.bg_mode)
+        self.actions["canvas_blend_next"] = lambda: self._combo_next(self.canvas_blend)
         for k, cb in self.keep_fx.items():
             self.actions[f"keep_{k}"] = cb.toggle
         for name, cb in self.keep_shd.items():
@@ -6327,6 +6337,7 @@ class Main(QMainWindow):
                     "picture": self.perf_picture.currentText(),
                     "dissolve": self.perf_dissolve.currentText(),
                     "canvas_fit": self.canvas_fit.currentText(),
+                    "canvas_blend": self.canvas_blend.currentText(),
                     "canvas_bg": self.bg_mode.currentText(),
                     "canvas_bg_file": self.bg_file.text(),
                     "canvas_bg_colour": self._bg_colour.name()}
@@ -6380,6 +6391,9 @@ class Main(QMainWindow):
         elif ident == "canvas_fit":
             if self.canvas_fit.findText(str(val)) >= 0:
                 self.canvas_fit.setCurrentText(str(val))
+        elif ident == "canvas_blend":
+            if self.canvas_blend.findText(str(val)) >= 0:
+                self.canvas_blend.setCurrentText(str(val))
         elif ident == "canvas_bg":
             if self.bg_mode.findText(str(val)) >= 0:
                 self.bg_mode.setCurrentText(str(val))
@@ -6565,6 +6579,18 @@ class Main(QMainWindow):
         clear.clicked.connect(self._clear_bg_file)
         form.addRow("Background", self._row([("", self.bg_mode), ("colour", self.bg_colour_btn)]))
         form.addRow("", self._row([("file", self.bg_file), ("", browse), ("", clear)]))
+        self.canvas_blend = QComboBox()
+        self.canvas_blend.addItems(PIC_BLENDS)
+        self.canvas_blend.setToolTip(
+            "How the video meets the background: over = on top of it; add = a double "
+            "exposure, bright on bright clips; multiply = the background's colour or "
+            "picture tints the video (a blue background: a blue video); screen = the "
+            "two lighten each other, never clipping; overlay = multiply in the dark, "
+            "screen in the light; difference, lighten, darken as in a paint program. "
+            "With mix and feather beside it the edge can disappear")
+        self.canvas_blend.currentIndexChanged.connect(self._apply_canvas)
+        form.addRow("Blend", self._row([("", self.canvas_blend), ("mix", k["mix"]),
+                                        ("feather", k["feather"])]))
         # who keeps to the canvas
         fx_off, shd_off = self._keep_saved()
         labels = {key: lbl for key, lbl, _d, _t in VIDEO_EFFECTS}
@@ -6634,11 +6660,14 @@ class Main(QMainWindow):
             "fit": self.canvas_fit.currentText(),
             "crop": tuple(v[c] / 100.0 for c in ("crop_l", "crop_r", "crop_t", "crop_b")),
             "x": v["x"] / 100.0, "y": v["y"] / 100.0, "zoom": v["zoom"] / 100.0,
-            "tilt_x": v["tilt_x"], "tilt_y": v["tilt_y"]}
+            "tilt_x": v["tilt_x"], "tilt_y": v["tilt_y"],
+            "blend": self.canvas_blend.currentIndex(), "mix": v["mix"] / 100.0,
+            "feather": v["feather"] / 100.0}
 
     def _canvas_neutral(self):
         for key, _lbl, (_lo, _hi, _st, val), _sfx, _tip in CANVAS_KNOBS:
             self.canvas_knobs[key].setValue(val)
+        self.canvas_blend.setCurrentIndex(0)
 
     def _apply_background(self, *_):
         """The background menu, colour and file -> the backdrop; the colour

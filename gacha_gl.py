@@ -68,7 +68,11 @@ KEEP_FX = ["color", "tint", "pump", "flash", "pixel", "bits", "dither", "mono", 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 CANVAS_FITS = ["fill", "fit"]
 CANVAS_DEFAULT = {"fit": "fill", "crop": (0.0, 0.0, 0.0, 0.0), "x": 0.0, "y": 0.0,
-                  "zoom": 1.0, "tilt_x": 0.0, "tilt_y": 0.0}
+                  "zoom": 1.0, "tilt_x": 0.0, "tilt_y": 0.0,
+                  "blend": 0, "mix": 1.0, "feather": 0.0}
+# how the placed video meets the background: index = the shader's uPicBlend
+PIC_BLENDS = ["over", "add", "multiply", "screen", "overlay", "difference", "lighten",
+              "darken"]
 BG_MODES = ["colour", "file"]
 BG_DEFAULT = {"mode": "colour", "colour": (16 / 255, 9 / 255, 7 / 255), "path": ""}
 EYE = 2.5                 # the tilt's perspective: the eye this many screen heights away
@@ -201,14 +205,17 @@ void main() {
 ZONE_GLSL = """
 uniform mat3 uToZone;          // screen uv -> canvas uv, homogeneous (the tilt is a perspective)
 uniform vec2 uZoneK;           // canvas uv per screen uv, without the tilt
+uniform float uFeather;        // the edge's fade, as a fraction of the canvas's height
 vec2 toZone(vec2 s) {
     vec3 q = uToZone * vec3(s, 1.0);
     if (q.z <= 1e-4) return vec2(-10.0);            // behind the eye: nowhere
     return q.xy / q.z;
 }
-// 1 on the canvas, 0 off it, a one-pixel soft edge
+// 1 on the canvas, 0 off it: a one-pixel soft edge, or the feather, the
+// same width on every side
 float inside(vec2 z) {
-    vec2 e = uZoneK / uRes;
+    float zaspect = (uRes.x / uRes.y) * uZoneK.y / uZoneK.x;
+    vec2 e = max(uZoneK / uRes, vec2(uFeather / zaspect, uFeather));
     vec2 a = smoothstep(vec2(0.0), e, z) * smoothstep(vec2(0.0), e, 1.0 - z);
     return a.x * a.y;
 }
@@ -244,6 +251,8 @@ uniform vec4 uCrop;            // left, right, top, bottom cut off the source, f
 uniform float uBgOn;           // 1: uBg is the background, else uBgColor
 uniform vec3 uBgColor;
 uniform int uKeep;             // a bit per effect, KEEP_FX order: 1 = it keeps to the canvas
+uniform float uPicBlend;       // how the video meets the background: PIC_BLENDS index
+uniform float uPicMix;         // the video's opacity over it, 0..1
 //@KEEP
 //@ZONE
 
@@ -337,6 +346,24 @@ vec3 bgc(vec2 s) {
     vec2 p = (s - 0.5) * sc + 0.5;
     return texture(uBg, vec2(p.x, 1.0 - p.y)).rgb;
 }
+// the video `p` laid onto the background `bg` where it is (`a`): over
+// it, or blended into it: add (a double exposure), multiply (the
+// background's colour or picture tints the video), screen, overlay,
+// difference, lighten, darken; then the video's own opacity
+vec3 lay(vec3 bg, vec3 p, float a) {
+    vec3 r;
+    if (uPicBlend < 0.5)      r = p;
+    else if (uPicBlend < 1.5) r = bg + p;
+    else if (uPicBlend < 2.5) r = bg * p;
+    else if (uPicBlend < 3.5) r = 1.0 - (1.0 - bg) * (1.0 - p);
+    else if (uPicBlend < 4.5) r = mix(2.0 * bg * p, 1.0 - 2.0 * (1.0 - bg) * (1.0 - p),
+                                      step(0.5, bg));
+    else if (uPicBlend < 5.5) r = abs(bg - p);
+    else if (uPicBlend < 6.5) r = max(bg, p);
+    else                      r = min(bg, p);
+    return mix(bg, clamp(r, 0.0, 1.0), a * uPicMix);
+}
+
 // the warps: a polar fold, upright; square cells; horizontal tears
 vec2 kaleido(vec2 uv, float aspect) {
     vec2 p = (uv - 0.5) * vec2(aspect, 1.0);
@@ -396,14 +423,14 @@ void main() {
         vec2 d = vec2(uRgbShift, 0.0);
         if (keep(K_RGB)) {
             vec2 dz = d * uZoneK;
-            col = mix(bgc(s), vec3(pic(z - dz).r, pic(z).g, pic(z + dz).b), ins);
+            col = lay(bgc(s), vec3(pic(z - dz).r, pic(z).g, pic(z + dz).b), ins);
         } else {
             vec2 dz = toZone(s + d) - toZone(s);
-            col = vec3(mix(bgc(s - d), pic(z - dz), inside(z - dz)).r,
-                       mix(bgc(s), pic(z), ins).g,
-                       mix(bgc(s + d), pic(z + dz), inside(z + dz)).b);
+            col = vec3(lay(bgc(s - d), pic(z - dz), inside(z - dz)).r,
+                       lay(bgc(s), pic(z), ins).g,
+                       lay(bgc(s + d), pic(z + dz), inside(z + dz)).b);
         }
-    } else col = mix(bgc(s), pic(z), ins);
+    } else col = lay(bgc(s), pic(z), ins);
     if (uGran > 0.0) {
         // the granular picture: the frame is the buffer, now at its right
         // edge, and every grain a band at its spot, as wide as the grain,
@@ -436,8 +463,8 @@ void main() {
             vec2 d = 1.0 / uRes;
             vec2 dzx = toZone(s + vec2(d.x, 0.0)) - toZone(s);
             vec2 dzy = toZone(s + vec2(0.0, d.y)) - toZone(s);
-            gx = luma(mix(bgc(s + vec2(d.x, 0.0)), pic(z + dzx), inside(z + dzx))) - luma(col);
-            gy = luma(mix(bgc(s + vec2(0.0, d.y)), pic(z + dzy), inside(z + dzy))) - luma(col);
+            gx = luma(lay(bgc(s + vec2(d.x, 0.0)), pic(z + dzx), inside(z + dzx))) - luma(col);
+            gy = luma(lay(bgc(s + vec2(0.0, d.y)), pic(z + dzy), inside(z + dzy))) - luma(col);
         }
         vec3 e = mix(col, vec3(clamp((abs(gx) + abs(gy)) * 12.0, 0.0, 1.0)), uEdges);
         col = ap(K_EDGES, col, e, ins);
@@ -1093,6 +1120,9 @@ class GLBackdrop(QOpenGLWidget):
         # the canvas: its place, the crop, the background, who keeps to it
         p.setUniformValue("uToZone", _mat3(geo["to_zone"]))
         p.setUniformValue("uZoneK", QVector2D(*geo["k"]))
+        p.setUniformValue1f("uFeather", float(self.canvas.get("feather", 0.0)))
+        p.setUniformValue1f("uPicBlend", float(self.canvas.get("blend", 0)))
+        p.setUniformValue1f("uPicMix", float(self.canvas.get("mix", 1.0)))
         l, r, tp, bt = self.canvas.get("crop", CANVAS_DEFAULT["crop"])
         p.setUniformValue("uCrop", float(l), float(r), float(tp), float(bt))
         self._bind_tex(3, self._bg_tex.textureId() if bg_on else 0)
@@ -1172,6 +1202,7 @@ class GLBackdrop(QOpenGLWidget):
         c.setUniformValue1f("uGenZone", 1.0 if zone else 0.0)
         c.setUniformValue("uToZone", _mat3(geo["to_zone"]))
         c.setUniformValue("uZoneK", QVector2D(*geo["k"]))
+        c.setUniformValue1f("uFeather", float(self.canvas.get("feather", 0.0)))
         c.setUniformValue("uRes", QVector2D(W, H))
         c.setUniformValue1f("uOpacity", opacity)
         c.setUniformValue1f("uBlend", float(self.shader_blend))
