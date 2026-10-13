@@ -5351,7 +5351,8 @@ class Main(QMainWindow):
         reset_btn.setToolTip("Every drum voice back in, no solo, the voice racks' effects "
                              "off and their volumes at 1")
         reset_btn.clicked.connect(self._voices_reset)
-        form.addRow("Quantize", self._row([("", self.perf_quant), ("", reset_btn)]))
+        form.insertRow(drums_at + 1, "Quantize",            # under the Drums row
+                       self._row([("", self.perf_quant), ("", reset_btn)]))
         self.perf_ab = QSlider(Qt.Horizontal)
         self.perf_ab.setRange(0, 100)
         self.perf_ab.setValue(0)
