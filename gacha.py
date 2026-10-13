@@ -9526,7 +9526,7 @@ class Main(QMainWindow):
     def _push_voices(self, la):
         """The voices' switches, the solos and the grid into a fresh stream."""
         for v, cb in self.perf_voices.items():
-            la.voice_on[v] = cb.isChecked()
+            la.voice_on[v] = not cb.isChecked()       # the M button: lit while out
         la.voice_solo = {v for v, b in self.perf_solos.items() if b.isChecked()}
         la.quant = self._quant_frac()
         la.player.gap = self.perf_gap.isChecked()
