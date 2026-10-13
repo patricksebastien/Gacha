@@ -5315,7 +5315,9 @@ class Main(QMainWindow):
         form.addRow("Burst", self._row([("", burst_btn), ("length", self.burst_len)]))
         # the drum voices: in or out and soloed, landing on the quantize grid
         self.perf_voices, self.perf_solos = {}, {}
-        pairs = []
+        legend = QLabel("on/off · S = solo")     # what the tick and the button are
+        legend.setProperty("role", "sub")
+        pairs = [("", legend)]
         for i, v in enumerate(VOICES, 1):
             cb = QCheckBox(VOICE_SHORT[v])
             cb.setChecked(True)
