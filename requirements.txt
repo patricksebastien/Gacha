@@ -11,6 +11,8 @@ python-rtmidi
 psutil
 # realtime audio I/O (PortAudio); Linux also needs the library: apt install libportaudio2
 sounddevice
+# the Settings tab's ring choice (a C audio callback, Python rendering ahead); optional
+rtmixer
 # Ableton Link (the General tab's Live clock rows): prebuilt wheels for Windows, macOS and Linux
 aalink
 # ffmpeg itself is a system install (see README); this gives a fallback

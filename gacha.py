@@ -54,8 +54,9 @@ from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
 from gacha_link import INSTALL_HINT as LINK_INSTALL_HINT, LINK_AVAILABLE, LinkClock
-from gacha_audio import (LiveAudio, audio_apis, audio_devices, audio_status, PHRASE_BARS,
+from gacha_audio import (audio_apis, audio_devices, audio_status, PHRASE_BARS,
                          set_process_priority)
+from gacha_audioproc import AudioProxy, audio_host      # the engine, in its own process
 from gacha_takes import TakeStore
 from gacha_section import (EXTRA_KINDS, Material, cut_burst, render_section, render_oneshot,
                            render_swell, KINDS, STEMS)
@@ -79,7 +80,7 @@ from gacha_fx import (ALL_CHANNELS, AUDIO_FX, BIPOLAR, CHANNELS, FX_SET, FX_SETT
 from gacha_erae import (ERAE_AVAILABLE, PORT as ERAE_PORT, EraeSurface, PAGES as ERAE_PAGES,
                         DEFAULT_PAGES as ERAE_DEFAULT_PAGES, SETUP_DOC as ERAE_SETUP_DOC,
                         make_page as erae_make_page, W as ERAE_W, H as ERAE_H)
-from gacha_vst import KNOBS as VST_KNOBS, InsertChain, place_editor_window, scan_plugins
+from gacha_vst import KNOBS as VST_KNOBS, scan_plugins
 from gacha_lfo import (LfoEngine, SHAPES as LFO_SHAPES, RATES as LFO_RATES,
                        RATE_DEFAULT as LFO_RATE_DEFAULT, MODES as LFO_MODES, N_SLOTS as LFO_SLOTS)
 from gacha_scene import (SceneBank, Morph, GROUPS as SCENE_GROUPS,
@@ -1975,6 +1976,8 @@ class RenderWorker(QThread):
 
 class Main(QMainWindow):
     vst_params_changed = Signal()               # from the inserts' watch thread
+    vst_editor_closed = Signal(str)             # from the engine: a plugin's window closed
+    engine_log = Signal(str)                    # the engine process's log lines
 
     def __init__(self):
         super().__init__()
@@ -2051,7 +2054,12 @@ class Main(QMainWindow):
         self._link_playing = False                  # the session's transport as last seen / sent
         self._live_timer = QTimer(self)             # level meter refresh
         self._live_timer.timeout.connect(self._update_live_meter)
-        self.through = None                         # LiveAudio: the audio stream, when open
+        self.through = None                         # AudioProxy: the audio stream, when open
+        host = audio_host()                         # the engine process (gacha_audioproc), from now
+        host.log = self.engine_log.emit
+        host.on_event("editor_closed", self.vst_editor_closed.emit)
+        self.engine_log.connect(lambda t: self.log.appendPlainText(f"engine: {t}"))
+        self.vst_editor_closed.connect(self._vst_after_editor)
         # moments of the show, in RAM; each one also lands in videos/ as a set
         # folder named after tonight, so tomorrow the takes are backdrops
         self.takes = TakeStore(parent=self, archive_dir=VIDEOS_DIR /
@@ -2494,6 +2502,16 @@ class Main(QMainWindow):
             self.through_block.blockSignals(True)
             self.through_block.setCurrentText(str(blk))
             self.through_block.blockSignals(False)
+        sr = self.settings.value("audio/sr", "48000")
+        if self.through_sr.findText(str(sr)) >= 0:
+            self.through_sr.blockSignals(True)
+            self.through_sr.setCurrentText(str(sr))
+            self.through_sr.blockSignals(False)
+        ring = self.settings.value("audio/ring", 0, type=int)
+        if self.through_ring.findData(ring) >= 0:
+            self.through_ring.blockSignals(True)
+            self.through_ring.setCurrentIndex(self.through_ring.findData(ring))
+            self.through_ring.blockSignals(False)
         for cb, key in ((self.audio_pro, "audio/pro_audio"), (self.audio_high, "audio/high_priority"),
                         (self.audio_gc, "audio/gc_off")):
             cb.blockSignals(True)
@@ -2521,6 +2539,7 @@ class Main(QMainWindow):
             gc.disable()
         else:
             gc.enable()
+        audio_host().priority(high, off)        # the engine process, where it counts
         if self.through is not None:
             self.through.pro_audio = pro
         if save:
@@ -4479,7 +4498,7 @@ class Main(QMainWindow):
         ./vst or the system folders (or browse), open its editor, order them,
         point the eight MIDI knobs at their parameters. Everything is
         remembered, plugin state included."""
-        self.inserts = InsertChain()
+        self.inserts = audio_host().inserts         # the chain, in the engine process
         box = QVBoxLayout()
         box.setContentsMargins(8, 8, 8, 8)
         box.setSpacing(4)
@@ -4532,7 +4551,6 @@ class Main(QMainWindow):
         # and the combos are rebuilt here when it saw a change
         self.vst_params_changed.connect(self._vst_params_changed)
         self._vst_watch_stop = self.inserts.watch(self.vst_params_changed.emit)
-        self._vst_editor_close = threading.Event()  # set: the open editor window closes
         self._closing = False
         box.addLayout(grid)
         self.vst_status = QLabel("")
@@ -4703,25 +4721,20 @@ class Main(QMainWindow):
         self._vst_save()
 
     def _vst_edit(self, ins):
-        """The plugin's own window, blocking: Qt waits, the audio runs on.
-        pedalboard's loop checks `_vst_editor_close` every 10 ms and closes
-        the window when it is set, which closeEvent does: closing the app
-        while an editor is open takes the editor with it (the window
-        manager's close request reaches closeEvent through the messages
-        pedalboard's loop dispatches, so it runs from inside this call)."""
-        self.log.appendPlainText(f"vst: {ins.name} editor open, the interface waits for it")
-        self.vst_status.setText(f"{ins.name}: editor open, close it to come back here")
-        QApplication.processEvents()
-        place_editor_window(int(self.winId()))    # Windows: else it opens with its title bar off screen
-        self._vst_editor_close.clear()
-        try:
-            ins.plugin.show_editor(self._vst_editor_close)
-        except Exception as e:
-            self.log.appendPlainText(f"vst: {ins.name} editor: {e}")
+        """The plugin's own window, opened by the engine process (the plugin
+        lives there) on its main thread; this interface stays free and the
+        sound runs on. When it closes the engine says so (editor_closed)
+        and _vst_after_editor takes the patch; closing the app closes it."""
+        self.log.appendPlainText(f"vst: {ins.name} editor open")
+        self.vst_status.setText(f"{ins.name}: editor open")
+        self.inserts.edit(ins, int(self.winId()))  # Windows: it also moves the window on screen
+
+    def _vst_after_editor(self, name):
         if self._closing:
             return
         self._vst_refresh()                       # parameters may have new names
         self._vst_save()                          # the patch lives in the state
+        self.vst_status.setText(f"{name}: editor closed, the patch is kept")
 
     def _vst_knob_changed(self, n):
         self.inserts.knobs[n] = self.vst_knob_combos[n].currentData()
@@ -6634,6 +6647,37 @@ class Main(QMainWindow):
             "block per round, so 64 and 128 want ASIO or an exclusive device and "
             "a quiet machine; raise the size if xruns appear. On ASIO match the "
             "driver panel's buffer.")
+        self.through_sr = QComboBox()
+        self.through_sr.addItems(["44100", "48000", "88200", "96000"])
+        self.through_sr.setCurrentText("48000")
+        self.through_sr.setToolTip(
+            "Sample rate of the stream, in Hz. 48 kHz is the app's own: songs "
+            "and stems are rendered at it and play without resampling, and the "
+            "block sizes' times above are at it. At another rate the sections, "
+            "songs and drum samples are resampled on their way in, and a block "
+            "lasts proportionally less (256 frames at 96 kHz = 2.7 ms). Pick the "
+            "rate the interface runs at (an ASIO driver's panel, or Windows' "
+            "device format in shared mode); a device that refuses the rate falls "
+            "back to its own, and the status line says which is in use. Remembered.")
+        self.through_ring = QComboBox()
+        self.through_ring.addItem("ring off", 0)
+        for n in (1, 2, 3, 4, 5, 6, 8):
+            self.through_ring.addItem(f"ring {n}", n)
+        self.through_ring.setToolTip(
+            "Python off the driver's thread: with a ring of N, the stream's callback "
+            "is C (the rtmixer package) and only copies between the device and two "
+            "ring buffers, while a thread of ours renders N blocks ahead into one and "
+            "reads the input from the other. A wait for the GIL then costs nothing "
+            "until it outlasts the whole lead, so this is the setting against crackle "
+            "at 128 that no priority tick cured; the price is N blocks of added "
+            "output latency (2.7 ms per block at 128 frames, 48 kHz), which the Link "
+            "bars and the MIDI out's lead already account for. Off = the usual way, "
+            "Python in the driver's callback. The lead must cover what the driver "
+            "takes per call: on ASIO that is one block, so start with 2; WASAPI "
+            "shared takes 10 ms at a time, 4 blocks at 128 (ring 5) or 2 at 256 "
+            "(ring 3), and a lead short of that underruns every period. Needs "
+            "pip install rtmixer; without it the stream opens the usual way and the "
+            "status line says so. Remembered.")
         self.through_excl = QCheckBox("exclusive")
         self.through_excl.setChecked(True)
         self.through_excl.setToolTip(
@@ -6665,7 +6709,8 @@ class Main(QMainWindow):
         self.through_sync.valueChanged.connect(self._through_sync_changed)
         self.through_status = QLabel("")
         self.through_status.setProperty("role", "sub")
-        for combo in (self.through_out, self.through_in, self.through_block):
+        for combo in (self.through_out, self.through_in, self.through_block, self.through_sr,
+                      self.through_ring):
             combo.currentIndexChanged.connect(self._io_changed)
         self.video_in = QComboBox()
         self.video_in.setToolTip(
@@ -6737,16 +6782,18 @@ class Main(QMainWindow):
         form.addRow("Audio output", self._row([("driver", self.through_api),
                                               ("device", self.through_out),
                                               ("block", self.through_block),
-                                              ("", self.through_excl)]))
+                                              ("rate", self.through_sr),
+                                              ("", self.through_excl),
+                                              ("", self.through_ring)]))
         form.addRow("", self.through_status)
         # the scheduling DAWs give themselves, each a tick, remembered,
         # applied live (gacha_audio.set_process_priority, thread_pro_audio)
-        self.audio_pro = QCheckBox("Pro Audio (MMCSS) on the driver's thread")
+        self.audio_pro = QCheckBox("Pro Audio (MMCSS) on the audio thread")
         self.audio_pro.setToolTip(
-            "Windows: the audio driver's thread joins the MMCSS \"Pro Audio\" class, "
-            "the scheduling DAWs give their audio threads, so the desktop's work "
-            "waits for it and not the other way round. Takes effect on the next "
-            "block. Remembered.")
+            "Windows: the audio thread (the driver's, or with a ring on, our render "
+            "thread) joins the MMCSS \"Pro Audio\" class, the scheduling DAWs give "
+            "their audio threads, so the desktop's work waits for it and not the "
+            "other way round. Takes effect on the next block. Remembered.")
         self.audio_high = QCheckBox("high process priority")
         self.audio_high.setToolTip(
             "Windows: the whole app in HIGH_PRIORITY_CLASS, as DAWs run: the "
@@ -9608,6 +9655,8 @@ class Main(QMainWindow):
         self.settings.setValue("audio/out", out_name or "")
         self.settings.setValue("audio/in", self.through_in.currentData() or "")
         self.settings.setValue("audio/block", self.through_block.currentText())
+        self.settings.setValue("audio/sr", self.through_sr.currentText())
+        self.settings.setValue("audio/ring", int(self.through_ring.currentData() or 0))
         self.settings.setValue("audio/live_in", self.through_on.isChecked())
         self.settings.setValue("audio/exclusive", self.through_excl.isChecked())
         if self.through is not None:
@@ -9625,9 +9674,11 @@ class Main(QMainWindow):
                 self.log.appendPlainText(f"audio: {why}")
             self._update_afx_status()
             return
-        self.through = LiveAudio(in_name or None, out_name, int(self.through_block.currentText()),
+        self.through = AudioProxy(in_name or None, out_name, int(self.through_block.currentText()),
+                                 sr=int(self.through_sr.currentText()),
                                  exclusive=self.through_excl.isChecked(),
-                                 api=self.through_api.currentText() or None)
+                                 api=self.through_api.currentText() or None,
+                                 ring=int(self.through_ring.currentData() or 0))
         self.through.gain = self.vol.value() / 100
         self.through.freeze.held = bool(self._freeze_sources)
         self.through.delay_ms = self.through_sync.value()
@@ -9646,8 +9697,9 @@ class Main(QMainWindow):
         self._through_error = None
         self._through_timer.start(20)
         src = self.through_in.currentText() if in_name else "output only"
+        ring = f", ring of {self.through.ring}" if self.through.ring else ""
         self.log.appendPlainText(f"audio: {src} -> {self.through_out.currentText()}, "
-                                 f"{self.through.block} frames")
+                                 f"{self.through.block} frames at {self.through.sr} Hz{ring}")
         if self.live_on.isChecked():                 # the analysis follows the input
             if in_name:
                 self.live.start_external(self.through_in.currentText(), self.through.sr)
@@ -10604,7 +10656,7 @@ class Main(QMainWindow):
         self._lfo_timer.stop()
         self.lfo.restore_all()                  # the knobs as you set them, into the settings
         self._live_save(force=True)
-        self._vst_editor_close.set()            # a plugin editor still open goes too
+        self.inserts.close_editor()             # a plugin editor still open goes too
         self._show_ui()                         # never leave the cursor hidden
         self.player.stop()
         self.live.stop()
@@ -10615,6 +10667,7 @@ class Main(QMainWindow):
             self.through.stop()
         self._vst_save()
         self._vst_watch_stop.set()
+        audio_host().shutdown()                 # the engine process, once the chain is saved
         if getattr(self, "midi", None) is not None:
             self.midi.close_all()
         if getattr(self, "midi_out", None) is not None:
