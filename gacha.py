@@ -2525,12 +2525,6 @@ class Main(QMainWindow):
             self.through_sr.blockSignals(True)
             self.through_sr.setCurrentText(str(sr))
             self.through_sr.blockSignals(False)
-        for cb, key in ((self.audio_pro, "audio/pro_audio"), (self.audio_high, "audio/high_priority"),
-                        (self.audio_gc, "audio/gc_off")):
-            cb.blockSignals(True)
-            cb.setChecked(self.settings.value(key, False, type=bool))
-            cb.blockSignals(False)
-        self._priority_changed(save=False)
         self._io_ready = True
         self._keys_into_tips()                  # "(N)" off the buttons, into the tips
         self._live_defaults = self._live_state()  # as built: the values-only reset's target
@@ -2541,24 +2535,6 @@ class Main(QMainWindow):
         self._live_timer.start()
         QTimer.singleShot(600, self._vst_restore)      # slow plugin loads, after the window shows
         QTimer.singleShot(0, self._reopen_stream)
-
-    def _priority_changed(self, save=True):
-        """The Priority ticks of the Settings tab, all three for the engine
-        process (gacha_audioproc), where the sound is: its process class
-        and its GC at once, its audio thread's MMCSS class on the next
-        block (gacha_audio reads the flag there); remembered. This process
-        is the interface, it runs as any desktop app."""
-        high, off, pro = self.audio_high.isChecked(), self.audio_gc.isChecked(), self.audio_pro.isChecked()
-        audio_host().priority(high, off)
-        if self.through is not None:
-            self.through.pro_audio = pro
-        if save:
-            self.settings.setValue("audio/pro_audio", pro)
-            self.settings.setValue("audio/high_priority", high)
-            self.settings.setValue("audio/gc_off", off)
-            self.log.appendPlainText(f"audio: priority: pro audio {'on' if pro else 'off'}, "
-                                     f"process {'high' if high else 'normal'}, "
-                                     f"gc {'off' if off else 'on'}")
 
     # ---------- stats HUD ----------
     def _toggle_stats(self, on):
@@ -6846,33 +6822,6 @@ class Main(QMainWindow):
                                               ("rate", self.through_sr),
                                               ("", self.through_excl)]))
         form.addRow("", self.through_status)
-        # the scheduling DAWs give themselves, each a tick, remembered,
-        # applied live to the engine process (gacha_audioproc: its
-        # set_process_priority and gc, gacha_audio.thread_pro_audio)
-        self.audio_pro = QCheckBox("Pro Audio (MMCSS) on the audio thread")
-        self.audio_pro.setToolTip(
-            "Windows: the engine's audio thread (the driver's) joins the MMCSS "
-            "\"Pro Audio\" class, the scheduling "
-            "DAWs give their audio threads, so the desktop's work waits for it and "
-            "not the other way round. Takes effect on the next block. Remembered.")
-        self.audio_high = QCheckBox("high process priority")
-        self.audio_high.setToolTip(
-            "Windows: the audio engine's process in HIGH_PRIORITY_CLASS, as DAWs "
-            "run: the scheduler takes its threads before the desktop's, this "
-            "interface included. At once. Remembered.")
-        self.audio_gc = QCheckBox("GC off")
-        self.audio_gc.setToolTip(
-            "Python's garbage collector off in the audio engine's process: a "
-            "collection there holds its interpreter lock while it walks the heap, "
-            "the audio thread waiting. Memory of reference cycles is then never "
-            "reclaimed in the engine, a little growth over a show. At once. "
-            "Remembered.")
-        for cb in (self.audio_pro, self.audio_high):
-            cb.setVisible(sys.platform == "win32")
-        for cb in (self.audio_pro, self.audio_high, self.audio_gc):
-            cb.toggled.connect(lambda _v: self._priority_changed())
-        form.addRow("Priority", self._row([("", self.audio_pro), ("", self.audio_high),
-                                           ("", self.audio_gc)]))
         self.rt_btn = QPushButton("test round-trip")
         self.rt_btn.setToolTip(
             "Measure the real in-to-out latency: plug a cable from an output of "
@@ -10001,7 +9950,6 @@ class Main(QMainWindow):
         self._push_voices(self.through)
         self._push_afx()
         self.through.inserts = self.inserts
-        self.through.pro_audio = self.audio_pro.isChecked()
         self._midi_out_apply()
         self.through.start()
         self.through_status.setText("opening...")

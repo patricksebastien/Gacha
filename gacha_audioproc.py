@@ -536,13 +536,6 @@ class AudioHost:
     def on_event(self, name, cb):
         self._events.setdefault(name, []).append(cb)
 
-    def priority(self, high, gc_off):
-        """The engine process's class and its GC, from the Settings ticks."""
-        try:
-            self.call(((ATTR, "priority"),), (bool(high), bool(gc_off)), {})
-        except Exception:
-            pass
-
 
 _HOST = None
 
@@ -865,20 +858,16 @@ class Engine:
         args = self._decode(args)
         kwargs = self._decode(kwargs)
         if len(path) == 1 and path[0][0] == ATTR and path[0][1] in (
-                "new", "open", "close", "edit", "close_editor", "priority", "quit"):
+                "new", "open", "close", "edit", "close_editor", "quit"):
             op = path[0][1]
             if op == "new":
+                self.ga.set_process_priority(True)   # as DAWs run: above the desktop, the window too
                 la = self.ga.LiveAudio(**kwargs)
                 la.inserts = self.root.inserts
                 la.midi_out = self.root.midi
                 self.root.la = la
                 self.applied = max(self.applied, seq)
                 self.reply(rid, True, None)
-                return
-            if op == "priority":
-                self.ga.set_process_priority(bool(args[0]))
-                (gc.disable if args[1] else gc.enable)()
-                self.applied = max(self.applied, seq)
                 return
             if op == "close_editor":
                 self.editor_close.set()
@@ -932,6 +921,14 @@ class Engine:
                     la.start()
                     la.ready.wait(15.0)           # other hosts than ASIO open on a thread
                     self.log(f"stream: {la.error or la.mode}")
+                    # the heap as built is out of every later full collection
+                    # (a walk of it holds this process's lock for tens of ms,
+                    # the audio thread waiting), and full collections rare:
+                    # with the frozen heap out of the count the default
+                    # rule would run one at nearly every middle collection
+                    gc.collect()
+                    gc.freeze()
+                    gc.set_threshold(700, 10, 10000)
                 elif op == "close":
                     la.stop()
                 elif op == "edit":

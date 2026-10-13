@@ -47,8 +47,7 @@ driver takes one client and one full-duplex stream, so on ASIO the input and
 the output must be the same device and run in a single blocking duplex
 stream, at the buffer the driver's control panel sets. Without ASIO the
 stream asks for WASAPI exclusive mode (straight to the driver, no system
-mixer) and falls back to shared mode with Windows' converter; the audio
-thread joins the "Pro Audio" MMCSS class. WASAPI's engine runs 10 ms
+mixer) and falls back to shared mode with Windows' converter. WASAPI's engine runs 10 ms
 periods, so 480 frames at 48 kHz is the drop-free block there; 256 works in
 exclusive mode on good interfaces, 128 or less on ASIO. On Linux the "(hw:x,y)"
 entries are the cards themselves, exclusive and lowest latency, and cannot
@@ -207,28 +206,6 @@ def set_process_priority(high):
         return bool(k32.SetPriorityClass(k32.GetCurrentProcess(), 0x80 if high else 0x20))
     except Exception:
         return False
-
-
-def thread_pro_audio(on, handle=None):
-    """Windows: this thread into (or out of) the MMCSS "Pro Audio" class,
-    the scheduling DAWs give their audio threads. Returns the task handle
-    while in, None while out; call it on the thread itself."""
-    if sys.platform != "win32":
-        return None
-    try:
-        import ctypes
-        avrt = ctypes.windll.avrt
-        if on and handle is None:
-            avrt.AvSetMmThreadCharacteristicsW.restype = ctypes.c_void_p
-            idx = ctypes.c_ulong(0)
-            return avrt.AvSetMmThreadCharacteristicsW("Pro Audio", ctypes.byref(idx)) or None
-        if not on and handle is not None:
-            avrt.AvRevertMmThreadCharacteristics.argtypes = (ctypes.c_void_p,)
-            avrt.AvRevertMmThreadCharacteristics(handle)
-            return None
-    except Exception:
-        pass
-    return handle
 
 
 def _api_has_devices(idx, devs):
@@ -1557,8 +1534,6 @@ class LiveAudio:
         self.freeze = Freeze(self.sr)        # the master freeze (gacha_freeze): .held from any thread
         self.metro = Metronome(self.sr)      # the metronome (gacha_metro): .on, .note, .anchor, .beat_s
         self.inserts = None                  # gacha_vst.InsertChain on the master, or None
-        self.pro_audio = False               # the driver's thread in MMCSS "Pro Audio" (set any time)
-        self._mmcss = None                   # its task handle while it is (the driver's thread)
         # the drum hits as MIDI notes (see the module note): a gacha_midi.MidiOut
         self.midi_out = None
         self.midi_channel = 10
@@ -1694,8 +1669,6 @@ class LiveAudio:
             if self._cb_last is None:                # the driver's thread, named for the logs
                 threading.current_thread().name = "gacha-asio"
                 thread_no_throttle()                 # and on a performance core, full clocks
-            if self.pro_audio != (self._mmcss is not None):   # the Settings tick, on this thread
-                self._mmcss = thread_pro_audio(self.pro_audio, self._mmcss)
             if status:
                 if status.input_overflow:
                     self.dropped += 1
@@ -1947,8 +1920,8 @@ class LiveAudio:
     def _realtime_linux():
         """Best effort on Linux: SCHED_FIFO for the audio thread if the
         user may (rtkit / limits.conf), else nothing. On Windows the
-        thread's class is the Settings tab's Pro Audio tick (`pro_audio`,
-        read on every path's audio thread, thread_pro_audio)."""
+        driver's thread comes at the class the driver gave it (ASIO drivers
+        run theirs time-critical, PortAudio's WASAPI thread is in MMCSS)."""
         try:
             if sys.platform != "win32" and hasattr(os, "sched_setscheduler"):
                 os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
@@ -1988,8 +1961,6 @@ class LiveAudio:
                 self.ready.set()
                 last = time.monotonic()
                 while not self._stop.is_set():
-                    if self.pro_audio != (self._mmcss is not None):   # the Settings tick, this thread
-                        self._mmcss = thread_pro_audio(self.pro_audio, self._mmcss)
                     # with an input the read paces the loop; without one the
                     # output's write does. Both sleep while they wait.
                     if src is not None:
@@ -2019,7 +1990,6 @@ class LiveAudio:
         finally:
             self.running = False
             self.ready.set()
-            self._mmcss = thread_pro_audio(False, self._mmcss)
             sys.setswitchinterval(old_switch)
             power_hints(False)
             for st in ({id(x): x for x in (src, snk) if x is not None}.values()):
