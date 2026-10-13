@@ -11,6 +11,15 @@ processed video) / iChannel1 (their own previous frame), plus music data
 from the playing song (iLoud, iBeat, iBar, iBPM, iSection, iRoot, iDrop,
 iSwell, iSongPos).
 
+The canvas: the picture does not have to fill the window. It can be cropped
+(the edges of a tape cut off), placed (slid, zoomed, tilted in perspective
+for a projector hitting the wall at an angle) and what is around it is a
+background: a colour, a photo or a clip of its own. Every video effect and
+every shader either keeps to the canvas (works on the picture alone, the
+background untouched) or spills over the whole screen (a vignette darkens
+the corners of the wall, a feedback shader rushes out of the picture onto
+the background); `keep_fx` and `keep_shaders` say which.
+
 gacha.py falls back to its numpy VideoBackdrop when no usable OpenGL 3.3
 context exists.
 """
@@ -21,8 +30,9 @@ import re
 import time
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QOpenGLContext, QSurfaceFormat, QVector2D
+from PySide6.QtGui import QImage, QMatrix3x3, QOpenGLContext, QSurfaceFormat, QVector2D
 from PySide6.QtOpenGL import (
     QOpenGLBuffer, QOpenGLFramebufferObject, QOpenGLShader,
     QOpenGLShaderProgram, QOpenGLTexture, QOpenGLVersionFunctionsFactory,
@@ -47,6 +57,99 @@ GL_LINEAR, GL_CLAMP_TO_EDGE = 0x2601, 0x812F
 GL_FRAMEBUFFER = 0x8D40
 
 BLEND_MODES = ["mix", "add", "screen"]
+
+# the video effects that have a place on the screen, in the order of the
+# bits of the effects shader's uKeep (gacha.py's VIDEO_EFFECTS keys; reverse
+# and clean are not pictures and have no place); each one either keeps to
+# the canvas or works over the whole screen, the background included
+KEEP_FX = ["color", "tint", "pump", "flash", "pixel", "bits", "dither", "mono", "solar",
+           "edges", "lines", "grain", "gran", "zoom", "trails", "glitch", "rgb", "vign",
+           "kaleido"]
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+CANVAS_FITS = ["fill", "fit"]
+CANVAS_DEFAULT = {"fit": "fill", "crop": (0.0, 0.0, 0.0, 0.0), "x": 0.0, "y": 0.0,
+                  "zoom": 1.0, "tilt_x": 0.0, "tilt_y": 0.0}
+BG_MODES = ["colour", "file"]
+BG_DEFAULT = {"mode": "colour", "colour": (16 / 255, 9 / 255, 7 / 255), "path": ""}
+EYE = 2.5                 # the tilt's perspective: the eye this many screen heights away
+
+
+# ---------------------------------------------------------------- the canvas
+
+def canvas_quad(vid_size, W, H, canvas):
+    """Where the (cropped) picture lies on a W x H screen: its four corners
+    in screen uv (bottom left (0, 0)), in canvas order (0,0), (1,0), (1,1),
+    (0,1); its size in screen uv before the tilt; its aspect.
+
+    `canvas`: fit (fill = the picture covers the screen at zoom 1, fit =
+    the whole picture shows), crop (left, right, top, bottom as fractions
+    of the source), x and y (-1..1 of the screen, 0 centred), zoom, tilt_x
+    and tilt_y (degrees: a perspective tilt about the horizontal and the
+    vertical axis, the eye EYE screen heights away)."""
+    vw, vh = vid_size
+    l, r, t, b = canvas.get("crop", CANVAS_DEFAULT["crop"])
+    cw, ch = max(1e-6, vw * (1.0 - l - r)), max(1e-6, vh * (1.0 - t - b))
+    a = cw / ch if vw > 0 and vh > 0 else 16 / 9
+    A = W / max(1, H)
+    # the picture in screen heights: w0 x h0 at zoom 1
+    if (a >= A) == (canvas.get("fit", "fill") == "fit"):   # bound by the width
+        w0, h0 = A, A / a
+    else:                                                   # bound by the height
+        w0, h0 = a, 1.0
+    z = max(0.01, float(canvas.get("zoom", 1.0)))
+    w, h = w0 * z, h0 * z
+    tx = math.radians(float(canvas.get("tilt_x", 0.0)))
+    ty = math.radians(float(canvas.get("tilt_y", 0.0)))
+    ox = float(canvas.get("x", 0.0)) * A * 0.5
+    oy = float(canvas.get("y", 0.0)) * 0.5
+    pts = []
+    for cx, cy in ((-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)):
+        x, y, zz = cx * w, cy * h, 0.0
+        x, zz = x * math.cos(ty), -x * math.sin(ty)              # about the vertical axis
+        y, zz = y * math.cos(tx) - zz * math.sin(tx), y * math.sin(tx) + zz * math.cos(tx)
+        d = EYE / max(0.2, EYE - zz)                            # nearer is bigger
+        pts.append(((x * d + ox) / A + 0.5, y * d + oy + 0.5))
+    return pts, (w / A, h), a
+
+
+def square_to_quad(pts):
+    """The 3x3 homography taking the unit square's corners (0,0), (1,0),
+    (1,1), (0,1) to `pts`, acting on (u, v, 1)."""
+    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = pts
+    dx1, dx2, sx = x1 - x2, x3 - x2, x0 - x1 + x2 - x3
+    dy1, dy2, sy = y1 - y2, y3 - y2, y0 - y1 + y2 - y3
+    if abs(sx) < 1e-9 and abs(sy) < 1e-9:                      # affine
+        return np.array([[x1 - x0, x3 - x0, x0], [y1 - y0, y3 - y0, y0], [0.0, 0.0, 1.0]])
+    det = dx1 * dy2 - dx2 * dy1
+    if abs(det) < 1e-12:
+        det = 1e-12
+    g = (sx * dy2 - dx2 * sy) / det
+    h = (dx1 * sy - sx * dy1) / det
+    return np.array([[x1 - x0 + g * x1, x3 - x0 + h * x3, x0],
+                     [y1 - y0 + g * y1, y3 - y0 + h * y3, y0],
+                     [g, h, 1.0]])
+
+
+def canvas_geometry(vid_size, W, H, canvas):
+    """Everything the shaders need for the canvas: `to_screen` (canvas uv
+    -> screen uv) and `to_zone` (the inverse), `k` (canvas uv per screen uv,
+    without the tilt), `aspect`, and `px`, the size a shader keeping to the
+    canvas renders at (its aspect at the screen's height, whatever the
+    zoom, so a knob on the zoom allocates nothing)."""
+    pts, (wu, hu), a = canvas_quad(vid_size, W, H, canvas)
+    to_screen = square_to_quad(pts)
+    try:
+        to_zone = np.linalg.inv(to_screen)
+    except np.linalg.LinAlgError:
+        to_zone = np.eye(3)
+    pw = max(16, min(4096, int(round(H * a / 8.0)) * 8))
+    return {"to_screen": to_screen, "to_zone": to_zone,
+            "k": (1.0 / max(1e-6, wu), 1.0 / max(1e-6, hu)),
+            "aspect": a, "px": (pw, max(16, H))}
+
+
+def _mat3(m):
+    return QMatrix3x3([float(v) for v in np.asarray(m).reshape(9)])
 
 
 def gl_available():
@@ -94,14 +197,33 @@ void main() {
 }
 """
 
-# The effects pass: same effects and order as the numpy VideoFX, per pixel.
+# GLSL shared by the passes that need to know where the canvas is
+ZONE_GLSL = """
+uniform mat3 uToZone;          // screen uv -> canvas uv, homogeneous (the tilt is a perspective)
+uniform vec2 uZoneK;           // canvas uv per screen uv, without the tilt
+vec2 toZone(vec2 s) {
+    vec3 q = uToZone * vec3(s, 1.0);
+    if (q.z <= 1e-4) return vec2(-10.0);            // behind the eye: nowhere
+    return q.xy / q.z;
+}
+// 1 on the canvas, 0 off it, a one-pixel soft edge
+float inside(vec2 z) {
+    vec2 e = uZoneK / uRes;
+    vec2 a = smoothstep(vec2(0.0), e, z) * smoothstep(vec2(0.0), e, 1.0 - z);
+    return a.x * a.y;
+}
+"""
+
+# The effects pass: same effects and order as the numpy VideoFX, per pixel,
+# on the canvas or over the whole screen as each effect's uKeep bit says.
 FX_FS = """#version 330 core
 in vec2 vUV;
 out vec4 fragColor;
 uniform sampler2D uVideo;      // the decoded frame (top row first)
 uniform sampler2D uTake;       // the section's take frame, dissolved in by uAB
 uniform sampler2D uPrev;       // previous output, for trails
-uniform vec2 uRes, uVidRes;
+uniform sampler2D uBg;         // the background picture (a photo or a clip), top row first
+uniform vec2 uRes, uVidRes, uBgRes;
 uniform float uTime, uHasPrev;
 uniform float uBrightness, uSaturation, uHue, uTintHue, uTintAmt, uInvert;
 uniform float uBits, uDither, uMonoTones, uMonoThr, uSolar, uEdges, uScan;
@@ -114,8 +236,21 @@ uniform vec4 uGranHeads[16];
 uniform float uGExposure, uGBlack, uGGamma, uGContrast, uGSat, uGWarm, uGTint, uGSharpen;
 uniform float uAB;             // 0 = the live picture, 1 = the take frame
 uniform float uABMode;         // 0 mix, 1 add, 2 screen (same order as the shader layer)
-uniform vec2 uTakeScale;       // the B layer's cover-crop against the video's: a 16:9
+uniform vec2 uTakeScale;       // the B layer's cover-crop into the canvas: a 16:9
                                // webcam over a 5:4 tape is cropped, not squeezed
+// the canvas: where the (cropped) picture lies, what is around it, and
+// which effects keep to it
+uniform vec4 uCrop;            // left, right, top, bottom cut off the source, fractions
+uniform float uBgOn;           // 1: uBg is the background, else uBgColor
+uniform vec3 uBgColor;
+uniform int uKeep;             // a bit per effect, KEEP_FX order: 1 = it keeps to the canvas
+//@KEEP
+//@ZONE
+
+bool keep(int i) { return (uKeep & (1 << i)) != 0; }
+// an effect's result `e` over `col`: on the canvas alone when it keeps to
+// it, everywhere otherwise
+vec3 ap(int k, vec3 col, vec3 e, float ins) { return keep(k) ? mix(col, e, ins) : e; }
 
 // the source pixel: the live picture dissolved toward the take frame by
 // uAB, the picture's side of the A/B pedal. Every mode is pure tape at 0
@@ -123,10 +258,10 @@ uniform vec2 uTakeScale;       // the B layer's cover-crop against the video's: 
 // plain dissolve, add and screen superimpose the two at full strength
 // halfway (each side fades in over the first half of its travel and out
 // over the second), add clipping bright on bright, screen never clipping.
-vec3 src(vec2 p) {
-    vec3 a = texture(uVideo, p).rgb;
+vec3 src(vec2 pv, vec2 pt) {
+    vec3 a = texture(uVideo, pv).rgb;
     if (uAB <= 0.0) return a;
-    vec3 b = texture(uTake, (p - 0.5) * uTakeScale + 0.5).rgb;
+    vec3 b = texture(uTake, pt).rgb;
     if (uABMode < 0.5) return mix(a, b, uAB);
     a *= min(1.0, 2.0 * (1.0 - uAB));
     b *= min(1.0, 2.0 * uAB);
@@ -161,23 +296,21 @@ vec3 hueRotate(vec3 c, float turns) {
 vec3 hue2rgb(float h) {
     return clamp(abs(mod(h * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
 }
-// cover-crop the video into the widget, zoomed toward the centre
-vec2 coverUV(vec2 uv, float zoom) {
-    float wr = uRes.x / uRes.y, ir = uVidRes.x / uVidRes.y;
-    vec2 s = (ir > wr) ? vec2(wr / ir, 1.0) : vec2(1.0, ir / wr);
-    uv = (uv - 0.5) * s * (1.0 - zoom) + 0.5;
-    return vec2(uv.x, 1.0 - uv.y);                  // QImage rows are top-down
-}
-// the source pixel, sharpened (unsharp mask against its 4 neighbours) or
-// blurred (3x3 box), in the video's own texels so a 720x576 tape is treated
-// at tape resolution, then graded
-vec3 video(vec2 uv, float zoom) {
-    vec2 p = coverUV(uv, zoom);
-    vec3 c = src(p);
+// the cropped source at canvas uv z (0,0 bottom left), the B layer
+// cover-cropped into the same canvas, sharpened (unsharp mask against its
+// 4 neighbours) or blurred (3x3 box) in the video's own texels so a
+// 720x576 tape is treated at tape resolution, then graded
+vec3 pic(vec2 z) {
+    vec2 pv = vec2(uCrop.x + z.x * (1.0 - uCrop.x - uCrop.y),
+                   uCrop.z + (1.0 - z.y) * (1.0 - uCrop.z - uCrop.w));   // rows top-down
+    vec2 pt = (z - 0.5) * uTakeScale + 0.5;
+    pt = vec2(pt.x, 1.0 - pt.y);
+    vec3 c = src(pv, pt);
     if (uGSharpen > 0.0) {
         vec2 d = 1.0 / uVidRes;
-        vec3 b = (src(p + vec2(d.x, 0.0)) + src(p - vec2(d.x, 0.0))
-                + src(p + vec2(0.0, d.y)) + src(p - vec2(0.0, d.y))) * 0.25;
+        vec2 dx = vec2(d.x, 0.0), dy = vec2(0.0, d.y);
+        vec3 b = (src(pv + dx, pt + dx) + src(pv - dx, pt - dx)
+                + src(pv + dy, pt + dy) + src(pv - dy, pt - dy)) * 0.25;
         c = max(c + (c - b) * uGSharpen, 0.0);
     } else if (uGSharpen < 0.0) {
         // blur: a 3x3 box whose radius grows with the knob (1 to 10 source
@@ -187,137 +320,211 @@ vec3 video(vec2 uv, float zoom) {
         vec3 b = c;
         for (int i = -1; i <= 1; i++)
             for (int j = -1; j <= 1; j++)
-                if (i != 0 || j != 0)
-                    b += src(p + vec2(float(i), float(j)) * d);
+                if (i != 0 || j != 0) {
+                    vec2 o = vec2(float(i), float(j)) * d;
+                    b += src(pv + o, pt + o);
+                }
         c = mix(c, b / 9.0, min(a, 1.0));
     }
     return grade(c);
 }
+// the background at screen uv s: the colour, or the picture cover-cropped
+// into the screen
+vec3 bgc(vec2 s) {
+    if (uBgOn < 0.5) return uBgColor;
+    float wr = uRes.x / uRes.y, ir = uBgRes.x / uBgRes.y;
+    vec2 sc = (ir > wr) ? vec2(wr / ir, 1.0) : vec2(1.0, ir / wr);
+    vec2 p = (s - 0.5) * sc + 0.5;
+    return texture(uBg, vec2(p.x, 1.0 - p.y)).rgb;
+}
+// the screen at s, with the canvas at z: the picture on the canvas, the
+// background around it
+vec3 scene(vec2 s, vec2 z) { return mix(bgc(s), pic(z), inside(z)); }
+
+// the warps: a polar fold, upright; square cells; horizontal tears
+vec2 kaleido(vec2 uv, float aspect) {
+    vec2 p = (uv - 0.5) * vec2(aspect, 1.0);
+    float r = length(p), a = atan(p.y, p.x), w = 6.2831853 / uKaleido;
+    float k = floor(a / w), t = a - k * w;
+    if (mod(k, 2.0) > 0.5) t = w - t;
+    return r * vec2(cos(t), sin(t)) / vec2(aspect, 1.0) + 0.5;
+}
+vec2 pixelate(vec2 uv, vec2 cell) { return (floor(uv / cell) + 0.5) * cell; }
+vec2 glitch(vec2 uv, float xk) {
+    // a handful of bands per tick, each with its own place, height and
+    // shift; heights are log-uniform between hmin and hmax, per section:
+    // mode 0 thin sharp lines (0.4-1% of the frame), 1 medium bands
+    // (4-14%), 2 anything from 4% up to 38% slabs
+    float tick = floor(uTime * 14.0);
+    float hmin = uGlitchMode < 0.5 ? 0.004 : 0.04;
+    float hmax = uGlitchMode < 0.5 ? 0.01 : (uGlitchMode < 1.5 ? 0.14 : 0.38);
+    for (int i = 0; i < 6; i++) {
+        float fi = float(i);
+        if (hash(vec2(fi + 7.0, tick)) > uGlitch * 0.6) continue;
+        float h = hmin * pow(hmax / hmin, hash(vec2(fi + 31.0, tick)));
+        float y0 = hash(vec2(fi + 53.0, tick)) * (1.0 - h);
+        if (uv.y >= y0 && uv.y < y0 + h)
+            uv.x += (hash(vec2(tick, fi + 97.0)) - 0.5) * 0.4 * uGlitch * xk;
+    }
+    return uv;
+}
 
 void main() {
-    vec2 uv = vUV;
+    vec2 s = vUV;
     float aspect = uRes.x / uRes.y;
+    float zaspect = aspect * uZoneK.y / uZoneK.x;    // the canvas's own
+    vec2 z0 = toZone(vUV);                           // the canvas under this pixel, unwarped
+    // the zooms: the effect's with the loudness, the beat-repeat's punch
     float zoom = clamp(uZoom, 0.0, 0.45);
-    if (uRepeat > 0.5) zoom += 0.18 * uRepeatFrac;   // beat-repeat: zoom, snap back
-    if (uKaleido > 0.5) {                            // polar fold, upright
-        vec2 p = (uv - 0.5) * vec2(aspect, 1.0);
-        float r = length(p), a = atan(p.y, p.x), w = 6.2831853 / uKaleido;
-        float k = floor(a / w), t = a - k * w;
-        if (mod(k, 2.0) > 0.5) t = w - t;
-        uv = r * vec2(cos(t), sin(t)) / vec2(aspect, 1.0) + 0.5;
-    }
-    if (uPixel > 0.0) {                              // pixelate
-        vec2 cell = vec2(uPixel, uPixel * aspect);
-        uv = (floor(uv / cell) + 0.5) * cell;
-    }
-    if (uGlitch > 0.0) {                             // horizontal glitch bands
-        // a handful of bands per tick, each with its own place, height and
-        // shift; heights are log-uniform between hmin and hmax, per section:
-        // mode 0 thin sharp lines (0.4-1% of the frame), 1 medium bands
-        // (4-14%), 2 anything from 4% up to 38% slabs
-        float tick = floor(uTime * 14.0);
-        float hmin = uGlitchMode < 0.5 ? 0.004 : 0.04;
-        float hmax = uGlitchMode < 0.5 ? 0.01 : (uGlitchMode < 1.5 ? 0.14 : 0.38);
-        for (int i = 0; i < 6; i++) {
-            float fi = float(i);
-            if (hash(vec2(fi + 7.0, tick)) > uGlitch * 0.6) continue;
-            float h = hmin * pow(hmax / hmin, hash(vec2(fi + 31.0, tick)));
-            float y0 = hash(vec2(fi + 53.0, tick)) * (1.0 - h);
-            if (uv.y >= y0 && uv.y < y0 + h)
-                uv.x += (hash(vec2(tick, fi + 97.0)) - 0.5) * 0.4 * uGlitch;
-        }
-    }
+    float zk = keep(K_ZOOM) ? zoom : 0.0, zs = zoom - zk;    // on the canvas / the screen
+    if (uRepeat > 0.5) { if (keep(K_FLASH)) zk += 0.18 * uRepeatFrac; else zs += 0.18 * uRepeatFrac; }
+    // the warps that spill off the canvas work on the screen, the ones
+    // that keep to it on the canvas; between the two kinds the order is moot
+    if (zs > 0.0) s = (s - 0.5) * (1.0 - zs) + 0.5;
+    if (uKaleido > 0.5 && !keep(K_KALEIDO)) s = kaleido(s, aspect);
+    if (uPixel > 0.0 && !keep(K_PIXEL)) s = pixelate(s, vec2(uPixel, uPixel * aspect));
+    if (uGlitch > 0.0 && !keep(K_GLITCH)) s = glitch(s, 1.0);
+    vec2 z = toZone(s);
+    if (zk > 0.0) z = (z - 0.5) * (1.0 - zk) + 0.5;
+    if (uKaleido > 0.5 && keep(K_KALEIDO)) z = kaleido(z, zaspect);
+    if (uPixel > 0.0 && keep(K_PIXEL)) z = pixelate(z, vec2(uPixel, uPixel * aspect) * uZoneK);
+    if (uGlitch > 0.0 && keep(K_GLITCH)) z = glitch(z, uZoneK.x);
+    float ins = inside(z);
     vec3 col;
     if (uRgbShift > 0.0) {                           // chromatic aberration
-        col.r = video(uv - vec2(uRgbShift, 0.0), zoom).r;
-        col.g = video(uv, zoom).g;
-        col.b = video(uv + vec2(uRgbShift, 0.0), zoom).b;
-    } else col = video(uv, zoom);
+        vec2 d = vec2(uRgbShift, 0.0);
+        if (keep(K_RGB)) {
+            vec2 dz = d * uZoneK;
+            col = mix(bgc(s), vec3(pic(z - dz).r, pic(z).g, pic(z + dz).b), ins);
+        } else {
+            vec2 dz = toZone(s + d) - toZone(s);
+            col = vec3(scene(s - d, z - dz).r, scene(s, z).g, scene(s + d, z + dz).b);
+        }
+    } else col = scene(s, z);
     if (uGran > 0.0) {
         // the granular picture: the frame is the buffer, now at its right
         // edge, and every grain a band at its spot, as wide as the grain,
         // lifted by its window with soft edges, a bright playhead line where
         // it reads; outside the bands the frame darkens a little
+        bool kp = keep(K_GRAN);
+        float x = kp ? z0.x : vUV.x;
         float lit = 0.0, line = 0.0;
-        float px1 = 1.5 / uRes.x;
+        float px1 = 1.5 / uRes.x * (kp ? uZoneK.x : 1.0);
         for (int i = 0; i < 16; i++) {
             if (i >= uGranN) break;
             vec4 hd = uGranHeads[i];
             if (hd.y <= 0.0) continue;
             float e = max(px1, 0.08 * hd.y);
-            float inside = clamp((vUV.x - hd.x) / e, 0.0, 1.0)
-                         * clamp((hd.x + hd.y - vUV.x) / e, 0.0, 1.0);
-            lit = max(lit, inside * hd.w);
-            line = max(line, clamp(1.0 - abs(vUV.x - hd.z) / px1, 0.0, 1.0) * inside);
+            float in_ = clamp((x - hd.x) / e, 0.0, 1.0) * clamp((hd.x + hd.y - x) / e, 0.0, 1.0);
+            lit = max(lit, in_ * hd.w);
+            line = max(line, clamp(1.0 - abs(x - hd.z) / px1, 0.0, 1.0) * in_);
         }
-        col = col * (1.0 - 0.3 * uGran + 0.6 * uGran * lit) + 0.16 * uGran * lit;
-        col = mix(col, 1.0 - col, line * uGran);
+        vec3 e = col * (1.0 - 0.3 * uGran + 0.6 * uGran * lit) + 0.16 * uGran * lit;
+        e = mix(e, 1.0 - e, line * uGran);
+        col = ap(K_GRAN, col, e, ins);
     }
     if (uEdges > 0.0) {
-        vec2 d = 1.0 / uRes;
-        float gx = luma(video(uv + vec2(d.x, 0.0), zoom)) - luma(col);
-        float gy = luma(video(uv + vec2(0.0, d.y), zoom)) - luma(col);
-        col = mix(col, vec3(clamp((abs(gx) + abs(gy)) * 3.0 * 255.0 / 255.0 * 4.0, 0.0, 1.0)), uEdges);
+        float gx, gy;
+        if (keep(K_EDGES)) {
+            vec2 d = uZoneK / uRes;
+            gx = luma(pic(z + vec2(d.x, 0.0))) - luma(col);
+            gy = luma(pic(z + vec2(0.0, d.y))) - luma(col);
+        } else {
+            vec2 d = 1.0 / uRes;
+            vec2 dzx = toZone(s + vec2(d.x, 0.0)) - toZone(s);
+            vec2 dzy = toZone(s + vec2(0.0, d.y)) - toZone(s);
+            gx = luma(scene(s + vec2(d.x, 0.0), z + dzx)) - luma(col);
+            gy = luma(scene(s + vec2(0.0, d.y), z + dzy)) - luma(col);
+        }
+        vec3 e = mix(col, vec3(clamp((abs(gx) + abs(gy)) * 12.0, 0.0, 1.0)), uEdges);
+        col = ap(K_EDGES, col, e, ins);
     }
-    if (uHue != 0.0) col = hueRotate(col, uHue);
-    if (uSaturation != 1.0) col = mix(vec3(luma(col)), col, uSaturation);
-    if (uTintAmt > 0.0) col = mix(col, luma(col) * hue2rgb(uTintHue), uTintAmt);
-    col *= uBrightness;
+    if (uHue != 0.0) col = ap(K_COLOR, col, hueRotate(col, uHue), ins);
+    if (uSaturation != 1.0) col = ap(K_COLOR, col, mix(vec3(luma(col)), col, uSaturation), ins);
+    if (uTintAmt > 0.0) col = ap(K_TINT, col, mix(col, luma(col) * hue2rgb(uTintHue), uTintAmt), ins);
+    if (uBrightness != 1.0) col = ap(K_PUMP, col, col * uBrightness, ins);
     if (uSolar > 0.0) {
         float thr = 1.0 - 0.6 * uSolar;
-        col = mix(col, 1.0 - col, step(thr, col));
+        col = ap(K_SOLAR, col, mix(col, 1.0 - col, step(thr, col)), ins);
     }
     if (uMonoTones > 0.5) {                          // 1 = smooth gray, 2 = threshold, 3+ = tones
         float g = luma(col);
         if (uMonoTones > 1.5 && uMonoTones < 2.5) g = step(uMonoThr, g);
         else if (uMonoTones > 2.5) g = floor(clamp(g, 0.0, 0.999) * uMonoTones) / (uMonoTones - 1.0);
-        col = vec3(g);
+        col = ap(K_MONO, col, vec3(g), ins);
     }
     if (uBits > 0.5) {
         float levels = pow(2.0, uBits);
-        col = floor(clamp(col, 0.0, 0.999) * levels) / (levels - 1.0);
+        col = ap(K_BITS, col, floor(clamp(col, 0.0, 0.999) * levels) / (levels - 1.0), ins);
     }
     if (uDither > 0.0) {                             // 4x4 Bayer, 1 bit
         ivec2 q = ivec2(mod(gl_FragCoord.xy, 4.0));
         int idx = q.y * 4 + q.x;
         float bayer[16] = float[16](0.,8.,2.,10., 12.,4.,14.,6., 3.,11.,1.,9., 15.,7.,13.,5.);
         float bw = step(bayer[idx] / 16.0, luma(col));
-        col = mix(col, vec3(bw), uDither);
+        col = ap(K_DITHER, col, mix(col, vec3(bw), uDither), ins);
     }
-    if (uScan > 0.0 && mod(gl_FragCoord.y, 2.0) < 1.0) col *= 1.0 - 0.7 * uScan;
-    if (uGrain > 0.0) col += (hash(gl_FragCoord.xy + fract(uTime) * 100.0) - 0.5) * 0.35 * uGrain;
+    if (uScan > 0.0 && mod(gl_FragCoord.y, 2.0) < 1.0)
+        col = ap(K_LINES, col, col * (1.0 - 0.7 * uScan), ins);
+    if (uGrain > 0.0)
+        col = ap(K_GRAIN, col, col + (hash(gl_FragCoord.xy + fract(uTime) * 100.0) - 0.5) * 0.35 * uGrain, ins);
     if (uVign > 0.0) {
-        vec2 p = vUV * 2.0 - 1.0;
-        col *= 1.0 - uVign * clamp((p.x * p.x + p.y * p.y * 1.3) * 0.7, 0.0, 1.0);
+        vec2 p = (keep(K_VIGN) ? z0 : vUV) * 2.0 - 1.0;
+        col = ap(K_VIGN, col, col * (1.0 - uVign * clamp((p.x * p.x + p.y * p.y * 1.3) * 0.7, 0.0, 1.0)), ins);
     }
-    if (uRepeat > 0.5 && mod(uRepeatK, 2.0) > 0.5) col = 1.0 - col;
-    if (uSwell > 0.0) col += (1.0 - col) * 0.75 * uSwell * uSwell;
-    if (uInvert > 0.5) col = 1.0 - col;
+    if (uRepeat > 0.5 && mod(uRepeatK, 2.0) > 0.5) col = ap(K_FLASH, col, 1.0 - col, ins);
+    if (uSwell > 0.0) col = ap(K_FLASH, col, col + (1.0 - col) * 0.75 * uSwell * uSwell, ins);
+    if (uInvert > 0.5) col = ap(K_FLASH, col, 1.0 - col, ins);
     col = clamp(col, 0.0, 1.0);
     if (uTrails > 0.0 && uHasPrev > 0.5)
-        col = max(col, texture(uPrev, vUV).rgb * (0.55 + 0.42 * uTrails));
+        col = ap(K_TRAILS, col, max(col, texture(uPrev, vUV).rgb * (0.55 + 0.42 * uTrails)), ins);
     fragColor = vec4(col, 1.0);
 }
-"""
+""".replace("//@KEEP", "\n".join(f"const int K_{k.upper()} = {i};" for i, k in enumerate(KEEP_FX))) \
+   .replace("//@ZONE", ZONE_GLSL)
 
-# Final pass: video layer + generative layer + the legibility scrim.
+# Final pass: video layer + generative layer + the legibility scrim. A
+# shader that kept to the canvas was drawn at the canvas's own size and is
+# laid back into it here, through the canvas's perspective.
 COMPOSITE_FS = """#version 330 core
 in vec2 vUV;
 out vec4 fragColor;
 uniform sampler2D uFx, uGen;
+uniform vec2 uRes;
 uniform float uGenOn, uOpacity, uBlend, uScrim;
+uniform float uGenZone;        // 1: uGen is the canvas alone, not the screen
+//@ZONE
 void main() {
     vec3 base = texture(uFx, vUV).rgb;
     vec3 col = base;
     if (uGenOn > 0.5) {
-        vec4 g = texture(uGen, vUV);
-        float a = clamp(g.a, 0.0, 1.0) * uOpacity;
+        vec2 p = vUV;
+        float m = 1.0;
+        if (uGenZone > 0.5) {
+            p = toZone(vUV);
+            m = inside(p);
+        }
+        vec4 g = texture(uGen, p);
+        float a = clamp(g.a, 0.0, 1.0) * uOpacity * m;
         if (uBlend < 0.5)      col = mix(base, g.rgb, a);                 // mix
         else if (uBlend < 1.5) col = base + g.rgb * a;                    // add
         else                   col = 1.0 - (1.0 - base) * (1.0 - g.rgb * a); // screen
     }
     col = mix(col, vec3(0.047, 0.027, 0.02), uScrim * 0.215);
     fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+""".replace("//@ZONE", ZONE_GLSL)
+
+# The canvas cut out of the effects pass, at its own size, for a shader
+# that keeps to it: what it gets as iChannel0.
+EXTRACT_FS = """#version 330 core
+in vec2 vUV;
+out vec4 fragColor;
+uniform sampler2D uFx;
+uniform mat3 uToScreen;        // canvas uv -> screen uv
+void main() {
+    vec3 q = uToScreen * vec3(vUV, 1.0);
+    fragColor = texture(uFx, q.xy / max(q.z, 1e-4));
 }
 """
 
@@ -408,6 +615,17 @@ class GLBackdrop(QOpenGLWidget):
         self._gen_cache = {}              # path -> (mtime, program): compile once
         self._gen_min_opacity = {}        # path -> opacity a shader insists on
         self._prewarm = []                # shaders still to compile in idle time
+        # the canvas: where the picture lies on the screen (canvas_quad),
+        # what is around it, and which effects and shaders keep to it
+        self.canvas = dict(CANVAS_DEFAULT)
+        self.background = dict(BG_DEFAULT)
+        self.keep_fx = set(KEEP_FX)       # the effects that keep to the canvas
+        self.keep_shaders = set()         # the shader stems that keep to it
+        self.source_bg = None             # the background clip's own decoder
+        self._bg_clip = None              # its path while a clip is the background
+        self._bg_img = None               # a background photo (QImage)
+        self._shown_bg = None             # what is on the background texture
+        self._src_error_bg = None
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
         lay.addWidget(child)
@@ -473,13 +691,15 @@ class GLBackdrop(QOpenGLWidget):
                 self._open_main(random_start=True)
             if self.input2 and self.source2 is not None:
                 self.source2.open(self.input2, options=self._input2_opts)
+            if self._bg_clip is not None and self.source_bg is not None:
+                self.source_bg.open(self._bg_clip)
             self._timer.start(16)
         else:
             self._timer.stop()
-            for s in (self.source, self.source2):
+            for s in (self.source, self.source2, self.source_bg):
                 if s is not None:
                     s.close()
-            self._shown = self._shown_ov = None
+            self._shown = self._shown_ov = self._shown_bg = None
             self.update()                    # one paint: black
 
     def set_second_on_b(self, on):
@@ -488,6 +708,38 @@ class GLBackdrop(QOpenGLWidget):
         Off: B is the take frames again. Without a second device nothing
         changes."""
         self.second_on_b = bool(on)
+
+    def set_background(self, mode, colour, path=""):
+        """What is around the canvas: a colour (r, g, b in 0..1), or with
+        mode 'file' a photo, or a clip looping on a decoder of its own at
+        its own pace, untouched by the song."""
+        self.background = {"mode": mode, "colour": tuple(colour), "path": str(path or "")}
+        self._bg_img = None
+        self._shown_bg = None
+        clip = None
+        if mode == "file" and path:
+            p = Path(path)
+            if p.suffix.lower() in IMAGE_SUFFIXES:
+                img = QImage(str(p))
+                if img.isNull():
+                    self.log.append(f"background: cannot read {p.name}")
+                else:
+                    if img.height() > 2160:          # a photo straight off a camera
+                        img = img.scaledToHeight(2160, Qt.SmoothTransformation)
+                    self._bg_img = img.convertToFormat(QImage.Format_RGBA8888)
+            elif p.is_file():
+                clip = p
+            else:
+                self.log.append(f"background: no such file {p.name}")
+        self._bg_clip = clip
+        if clip is not None:
+            if self.source_bg is None:
+                self.source_bg = VideoSource(parent=self)
+            self._src_error_bg = None
+            if self.enabled:
+                self.source_bg.open(clip)
+        elif self.source_bg is not None:
+            self.source_bg.close()
 
     def second_frame(self):
         """The second input's latest Frame while it stands in for the take
@@ -543,7 +795,8 @@ class GLBackdrop(QOpenGLWidget):
         self.gl.initializeOpenGLFunctions()
         self._fx = self._program(FX_FS, "effects")
         self._comp = self._program(COMPOSITE_FS, "composite")
-        if not (self._fx and self._comp):
+        self._extract = self._program(EXTRACT_FS, "canvas cut-out")
+        if not (self._fx and self._comp and self._extract):
             return
         self._vao = QOpenGLVertexArrayObject()   # core profile needs one bound,
         self._vao.create()                       # even with no attributes
@@ -551,8 +804,12 @@ class GLBackdrop(QOpenGLWidget):
         self._vid_size = (0, 0)
         self._take_tex = None
         self._take_size = (0, 0)
+        self._bg_tex = None
+        self._bg_size = (0, 0)
         self._fbo_fx = [None, None]
-        self._fbo_gen = [None, None]
+        self._fbo_gen = [None, None]      # the shader layer's pair: the screen's size,
+        self._gen_size = None             # or the canvas's for a shader keeping to it
+        self._fbo_zone = None             # the canvas cut out of the effects pass, then
         self._ping = 0
         self._has_prev = False
         self._fbo_size = None
@@ -562,13 +819,15 @@ class GLBackdrop(QOpenGLWidget):
     def _cleanup_gl(self):
         """Free GL objects while the context is still current (on exit)."""
         self.makeCurrent()
-        for name in ("_video_tex", "_take_tex"):
+        for name in ("_video_tex", "_take_tex", "_bg_tex"):
             tex = getattr(self, name, None)
             if tex is not None:
                 tex.destroy()
             setattr(self, name, None)
         self._fbo_fx = [None, None]
         self._fbo_gen = [None, None]
+        self._fbo_zone = None
+        self._gen_size = None
         self._gen_prog = None
         self.doneCurrent()
 
@@ -629,10 +888,30 @@ class GLBackdrop(QOpenGLWidget):
             return
         self._fbo_size = size
         self._fbo_fx = [QOpenGLFramebufferObject(*size) for _ in range(2)]
-        self._fbo_gen = [QOpenGLFramebufferObject(*size) for _ in range(2)]
-        for fbo in self._fbo_fx + self._fbo_gen:
+        for fbo in self._fbo_fx:
             self._set_filters(fbo.texture())
         self._has_prev = False
+
+    def _ensure_gen_fbos(self, size, zone):
+        """The shader layer's pair at `size` (the screen's, or the canvas's
+        own for a shader that keeps to it, plus the cut-out it reads then),
+        cleared when made so a feedback shader starts from black."""
+        if size != self._gen_size:
+            self._gen_size = size
+            self._fbo_gen = [QOpenGLFramebufferObject(*size) for _ in range(2)]
+            self._fbo_zone = None
+            for fbo in self._fbo_gen:
+                self._set_filters(fbo.texture())
+                self._clear_fbo(fbo)
+        if zone and self._fbo_zone is None:
+            self._fbo_zone = QOpenGLFramebufferObject(*size)
+            self._set_filters(self._fbo_zone.texture())
+            self._clear_fbo(self._fbo_zone)
+
+    def _clear_fbo(self, fbo):
+        fbo.bind()
+        self.gl.glClearColor(0.0, 0.0, 0.0, 0.0)
+        self.gl.glClear(GL_COLOR_BUFFER_BIT)
 
     def _set_filters(self, tex_id):
         gl = self.gl
@@ -650,6 +929,10 @@ class GLBackdrop(QOpenGLWidget):
     def _upload_take(self, img):
         """The section's take frame -> its own texture, dissolved in by uAB."""
         self._take_tex, self._take_size = self._upload(img, self._take_tex, self._take_size)
+
+    def _upload_bg(self, img):
+        """The background photo or the background clip's frame -> its texture."""
+        self._bg_tex, self._bg_size = self._upload(img, self._bg_tex, self._bg_size)
 
     def _upload(self, img, tex, size):
         """A QImage into `tex` (reallocated when the size changes); returns
@@ -678,19 +961,15 @@ class GLBackdrop(QOpenGLWidget):
                                 GL_UNSIGNED_BYTE, img.constBits())
         return tex, size
 
-    def _take_scale(self, W, H, same):
-        """How the B texture's cover-crop relates to the video's, so both fill
-        the widget by their own aspect: (1, 1) when they share it."""
-        if same:
+    def _take_scale(self, same, aspect):
+        """The B texture's cover-crop into the canvas (its aspect `aspect`,
+        the cropped video's): a 16:9 webcam over a 5:4 tape is cropped, not
+        squeezed. (1, 1) when B is the video itself."""
+        tw, th = self._take_size
+        if same or tw <= 0 or th <= 0:
             return (1.0, 1.0)
-
-        def cover(w, h):
-            if w <= 0 or h <= 0:
-                return (1.0, 1.0)
-            wr, ir = W / max(1, H), w / h
-            return (wr / ir, 1.0) if ir > wr else (1.0, ir / wr)
-        sv, st = cover(*self._vid_size), cover(*self._take_size)
-        return (st[0] / sv[0], st[1] / sv[1])
+        ta = tw / th
+        return (aspect / ta, 1.0) if ta > aspect else (1.0, ta / aspect)
 
     def _bind_tex(self, unit, tex_id):
         self.gl.glActiveTexture(GL_TEXTURE0 + unit)
@@ -720,7 +999,8 @@ class GLBackdrop(QOpenGLWidget):
         self._frozen = bool(st.get("repeat") or st.get("freeze"))
         src = self.source
         for s, attr, who in ((self.source, "_src_error", "video"),
-                             (self.source2, "_src_error2", "video input 2")):
+                             (self.source2, "_src_error2", "video input 2"),
+                             (self.source_bg, "_src_error_bg", "background")):
             if s is not None and s.error and s.error != getattr(self, attr):
                 setattr(self, attr, s.error)
                 self.log.append(f"{who}: {s.error}")
@@ -744,6 +1024,18 @@ class GLBackdrop(QOpenGLWidget):
                     and not self._frozen:
                 self._upload_frame(fr.img)
                 self._shown = fr                 # keeps fr.arr alive with it
+        # the background: a photo (uploaded once), a clip's frames as they
+        # come, or nothing (the colour)
+        bg = None
+        if self._bg_img is not None:
+            bg = self._bg_img
+        elif self._bg_clip is not None and self.source_bg is not None:
+            fr = self.source_bg.latest()
+            bg = fr if (fr is not None and fr.img is not None) else None
+        if bg is not None and bg is not self._shown_bg:
+            self._upload_bg(bg if isinstance(bg, QImage) else bg.img)
+            self._shown_bg = bg
+        bg_on = bg is not None and self._bg_tex is not None
         # the picture's A/B: 0 = the live picture, 1 = the B layer (take frame
         # or webcam); with nothing on B, or one texture still missing, no dissolve
         vid, take = self._video_tex, self._take_tex
@@ -780,11 +1072,25 @@ class GLBackdrop(QOpenGLWidget):
         p.setUniformValue1i("uTake", 2)
         p.setUniformValue1f("uAB", ab)
         p.setUniformValue1f("uABMode", float(self.override_blend))
-        p.setUniformValue("uTakeScale", QVector2D(*self._take_scale(W, H, take is vid)))
+        geo = canvas_geometry(self._vid_size, W, H, self.canvas)
+        p.setUniformValue("uTakeScale", QVector2D(*self._take_scale(take is vid, geo["aspect"])))
         p.setUniformValue("uRes", QVector2D(W, H))
         p.setUniformValue("uVidRes", QVector2D(*self._vid_size))
         p.setUniformValue1f("uTime", t)
         p.setUniformValue1f("uHasPrev", 1.0 if self._has_prev else 0.0)
+        # the canvas: its place, the crop, the background, who keeps to it
+        p.setUniformValue("uToZone", _mat3(geo["to_zone"]))
+        p.setUniformValue("uZoneK", QVector2D(*geo["k"]))
+        l, r, tp, bt = self.canvas.get("crop", CANVAS_DEFAULT["crop"])
+        p.setUniformValue("uCrop", float(l), float(r), float(tp), float(bt))
+        self._bind_tex(3, self._bg_tex.textureId() if bg_on else 0)
+        p.setUniformValue1i("uBg", 3)
+        p.setUniformValue1f("uBgOn", 1.0 if bg_on else 0.0)
+        p.setUniformValue("uBgRes", QVector2D(*(self._bg_size if bg_on else (1, 1))))
+        cr, cg, cb = self.background.get("colour", BG_DEFAULT["colour"])
+        p.setUniformValue("uBgColor", float(cr), float(cg), float(cb))
+        p.setUniformValue1i("uKeep", sum(1 << i for i, k in enumerate(KEEP_FX)
+                                         if k in self.keep_fx))
         self._set_fx_uniforms(p, st)
         self._draw()
 
@@ -799,16 +1105,32 @@ class GLBackdrop(QOpenGLWidget):
                       self._gen_min_opacity.get(self.shader_path, 0.0))
         gen_on = self._gen_prog is not None and opacity > 0 \
             and not st.get("clean")              # clean bar: video only
+        # a shader that keeps to the canvas is drawn at the canvas's own
+        # size over the canvas cut out of the effects pass, and laid back
+        # into it by the composite; the others see the whole screen
+        zone = gen_on and self.shader_path is not None \
+            and self.shader_path.stem in self.keep_shaders
         if gen_on:
+            gw, gh = geo["px"] if zone else (W, H)
+            self._ensure_gen_fbos((gw, gh), zone)
+            if zone:
+                self._fbo_zone.bind()
+                gl.glViewport(0, 0, gw, gh)
+                x = self._extract
+                x.bind()
+                self._bind_tex(0, self._fbo_fx[cur].texture())
+                x.setUniformValue1i("uFx", 0)
+                x.setUniformValue("uToScreen", _mat3(geo["to_screen"]))
+                self._draw()
             self._fbo_gen[cur].bind()
-            gl.glViewport(0, 0, W, H)
+            gl.glViewport(0, 0, gw, gh)
             g = self._gen_prog
             g.bind()
-            self._bind_tex(0, self._fbo_fx[cur].texture())
+            self._bind_tex(0, (self._fbo_zone if zone else self._fbo_fx[cur]).texture())
             self._bind_tex(1, self._fbo_gen[prev].texture())
             g.setUniformValue1i("iChannel0", 0)
             g.setUniformValue1i("iChannel1", 1)
-            g.setUniformValue("iResolution", float(W), float(H), 1.0)
+            g.setUniformValue("iResolution", float(gw), float(gh), 1.0)
             g.setUniformValue1f("iTime", t)
             g.setUniformValue1f("iTimeDelta", dt)
             g.setUniformValue1i("iFrame", self._frame_n)
@@ -831,10 +1153,14 @@ class GLBackdrop(QOpenGLWidget):
         c = self._comp
         c.bind()
         self._bind_tex(0, self._fbo_fx[cur].texture())
-        self._bind_tex(1, self._fbo_gen[cur].texture())
+        self._bind_tex(1, self._fbo_gen[cur].texture() if self._fbo_gen[cur] else 0)
         c.setUniformValue1i("uFx", 0)
         c.setUniformValue1i("uGen", 1)
         c.setUniformValue1f("uGenOn", 1.0 if gen_on else 0.0)
+        c.setUniformValue1f("uGenZone", 1.0 if zone else 0.0)
+        c.setUniformValue("uToZone", _mat3(geo["to_zone"]))
+        c.setUniformValue("uZoneK", QVector2D(*geo["k"]))
+        c.setUniformValue("uRes", QVector2D(W, H))
         c.setUniformValue1f("uOpacity", opacity)
         c.setUniformValue1f("uBlend", float(self.shader_blend))
         c.setUniformValue1f("uScrim", 1.0 if self.child.isVisible() else 0.0)

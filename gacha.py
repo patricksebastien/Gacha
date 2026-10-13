@@ -36,7 +36,7 @@ from PySide6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
 from PySide6.QtCore import QRegularExpression
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PySide6.QtWidgets import (
-    QFileDialog, QFrame,
+    QColorDialog, QFileDialog, QFrame,
     QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QCompleter, QDoubleSpinBox,
     QFormLayout, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -48,7 +48,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gacha_gl import BLEND_MODES, GLBackdrop, gl_available, shader_files
+from gacha_gl import (BG_MODES, BLEND_MODES, CANVAS_FITS, GLBackdrop, KEEP_FX,
+                      gl_available, shader_files)
 from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
@@ -282,6 +283,33 @@ VIDEO_EFFECTS = [
                             "is, with no effects and no shader layer. "
                             "0 = never, 1 = every bar"),
 ]
+# the Canvas tab's knobs: (key, label, (lo, hi, step, default), suffix, tip);
+# the ids are canvas_<key>
+CANVAS_KNOBS = [
+    ("crop_l", "left", (0.0, 45.0, 0.5, 0.0), " %",
+     "Cut off the left edge of the picture, in percent of its width"),
+    ("crop_r", "right", (0.0, 45.0, 0.5, 0.0), " %",
+     "Cut off the right edge of the picture, in percent of its width"),
+    ("crop_t", "top", (0.0, 45.0, 0.5, 0.0), " %",
+     "Cut off the top edge of the picture, in percent of its height"),
+    ("crop_b", "bottom", (0.0, 45.0, 0.5, 0.0), " %",
+     "Cut off the bottom edge of the picture, in percent of its height (a "
+     "tape's head-switching noise lives there)"),
+    ("x", "x", (-100.0, 100.0, 1.0, 0.0), " %",
+     "Slide the picture sideways, in percent of the screen's width; 0 centred, "
+     "100 its centre on the right edge"),
+    ("y", "y", (-100.0, 100.0, 1.0, 0.0), " %",
+     "Slide the picture up (positive) or down, in percent of the screen's height"),
+    ("zoom", "zoom", (5.0, 200.0, 1.0, 100.0), " %",
+     "The picture's size: 100 is fill or fit as chosen next to it, 50 half that, "
+     "200 twice; the background shows around a small picture"),
+    ("tilt_x", "tilt x", (-60.0, 60.0, 1.0, 0.0), "\u00b0",
+     "Keystone: the picture tilted about its horizontal axis, in degrees; positive "
+     "brings the top edge toward you (wider), negative the bottom edge"),
+    ("tilt_y", "tilt y", (-60.0, 60.0, 1.0, 0.0), "\u00b0",
+     "Keystone: the picture tilted about its vertical axis, in degrees; positive "
+     "sends the right edge away (narrower), negative the left edge"),
+]
 # every action the performer has, in one table: the Controls tab shows it,
 # the keyboard shortcuts and the MIDI bindings hang on the same ids.
 # (group, id, key, what); "" for key = MIDI only (a continuous control)
@@ -365,6 +393,22 @@ KEYMAP += [("vst", f"vst_{n}", "", f"insert knob {n}: the plugin parameter it is
 KEYMAP += [("vfx", f"vfx_{k}", "", f"{lbl}: video effect in the show, off/on")
            for k, lbl, _d, _t in VIDEO_EFFECTS]
 KEYMAP += [("vfx", f"shd_{p.stem}", "", f"{p.stem}: shader in the pool, off/on")
+           for p in shader_files()]
+# the Canvas tab: the picture's place on the screen and what is around
+# it, then one tick per effect and per shader: on the canvas alone, or
+# over the whole screen
+KEYMAP += [("canvas", "canvas_neutral", "", "canvas back to the whole screen: no crop, "
+                                            "centred, zoom 100, no tilt"),
+           ("canvas", "canvas_fit_next", "", "fill / fit: the picture covers the screen or "
+                                             "shows whole at zoom 100"),
+           ("canvas", "canvas_bg_next", "", "background: the colour / the file")]
+KEYMAP += [("canvas", f"canvas_{k}", "", f"canvas {'crop ' if k.startswith('crop_') else ''}"
+                                         f"{lbl}: {lo:g} to {hi:g}{sfx.strip()}, neutral {val:g}")
+           for k, lbl, (lo, hi, _s, val), sfx, _t in CANVAS_KNOBS]
+KEYMAP += [("keep", f"keep_{k}", "", f"{lbl}: on the canvas alone / over the whole screen")
+           for k, lbl, _d, _t in VIDEO_EFFECTS if k in KEEP_FX]
+KEYMAP += [("keep", f"keepshd_{p.stem}", "", f"{p.stem}: on the canvas alone / over the "
+                                              "whole screen")
            for p in shader_files()]
 # the clip on screen by hand: the ticked videos of the Videos tab
 KEYMAP += [("show", "video_prev", "", "previous ticked video, in list order"),
@@ -586,6 +630,7 @@ CONTINUOUS = {"ab", "volume", "sync", "shader_mix", "shader_pick", "avol", "burs
     | {f"lfo_{_n}_depth" for _n in range(1, LFO_SLOTS + 1)} \
     | {f"macro_{_n}" for _n in range(1, MACRO_SLOTS + 1)} \
     | {f"grade_{k}" for k, *_ in VIDEO_GRADE} | {f"fx_{k}" for k, *_ in VIDEO_EFFECTS} \
+    | {f"canvas_{k}" for k, *_ in CANVAS_KNOBS} \
     | {f"afx_{k}" for k, *_ in AUDIO_FX} \
     | {f"afx_{_ch}_{k}" for _ch in ALL_CHANNELS for k, *_ in AUDIO_FX} \
     | {f"avol_{_ch}" for _ch in ALL_CHANNELS} | {f"vst_{n}" for n in range(1, VST_KNOBS + 1)} \
@@ -601,6 +646,8 @@ KEYMAP_GROUPS = {"show": "picture", "tape": "tape", "clock": "clock",
                  "audio_focus": "audio racks: focused channel",
                  "fxset": "audio racks: effect settings",
                  "vst": "master inserts (VST3)", "vfx": "video fx: the pool",
+                 "canvas": "canvas: the picture on the screen",
+                 "keep": "canvas: on it alone, or the whole screen",
                  "voices": "drum voices", "pads": "drum pads", "lfo": "LFOs", "scene": "scenes",
                  "macro": "macros", "frag": "fragments: the sliced bar",
                  **{f"audio_{_ch}": f"audio rack: {_ch}" for _ch in CHANNELS},
@@ -644,6 +691,8 @@ def _knob_label(group, ident, what):
         if i > 0:
             short = short[:i]
     short = short.replace(" strength", "").strip()
+    if group == "canvas":                           # "canvas zoom" -> "canvas: zoom"
+        return short.replace("canvas ", "canvas: ", 1)
     return f"{ {'grade': 'grade', 'fx': 'fx', 'vst': 'vst'}.get(group, group)}: {short}"
 
 
@@ -2239,6 +2288,9 @@ class Main(QMainWindow):
         self.backdrop.state_fn = self._video_state
         self.backdrop.shader_mix = self.shader_mix.value()
         self.backdrop.shader_blend = self.shader_blend.currentIndex()
+        self._apply_canvas()
+        self._apply_keep()
+        self._apply_background()
         if self.settings.value("video/off", False, type=bool):
             self.video_off.setChecked(True)      # the backdrop exists now: it applies
         self.setCentralWidget(self.backdrop)
@@ -2372,6 +2424,16 @@ class Main(QMainWindow):
             self.actions[f"vfx_{k}"] = cb.toggle
         for name, cb in self.shader_on.items():
             self.actions[f"shd_{name}"] = cb.toggle
+        # the canvas: its knobs, the fit and the background menus, the ticks
+        for k, sp in self.canvas_knobs.items():
+            self.actions[f"canvas_{k}"] = self._frac_setter(sp)
+        self.actions["canvas_neutral"] = self._canvas_neutral
+        self.actions["canvas_fit_next"] = lambda: self._combo_next(self.canvas_fit)
+        self.actions["canvas_bg_next"] = lambda: self._combo_next(self.bg_mode)
+        for k, cb in self.keep_fx.items():
+            self.actions[f"keep_{k}"] = cb.toggle
+        for name, cb in self.keep_shd.items():
+            self.actions[f"keepshd_{name}"] = cb.toggle
         self.actions["video_prev"] = lambda: self._video_step(-1)
         self.actions["video_next"] = lambda: self._video_step(1)
         self.actions["video_random"] = self._video_random
@@ -2403,6 +2465,7 @@ class Main(QMainWindow):
                              "rep_pos": self.rep_pos}
         self.knob_widgets.update({f"grade_{k}": sp for k, sp in self.grade.items()})
         self.knob_widgets.update({f"fx_{k}": sp for k, sp in self.vfx.items()})
+        self.knob_widgets.update({f"canvas_{k}": sp for k, sp in self.canvas_knobs.items()})
         self.knob_widgets.update({(f"avol_{ch}" if key == "vol" else f"afx_{ch}_{key}"): sp
                                   for (ch, key), sp in self.afx.items()})
         self.knob_widgets.update({f"macro_{n}": self.macro_rows[n - 1]["knob"]
@@ -2681,6 +2744,7 @@ class Main(QMainWindow):
         tabs.addTab(perform, "Perform")
         tabs.addTab(sections, "Sections")
         tabs.addTab(video, "Video")
+        tabs.addTab(self._tab_canvas(), "Canvas")
         audio_fx = self._tab_audio_fx()  # built here, shown after Video FX
         cycles = self._tab_cycles()  # built here, shown after Macros
         tabs.addTab(self._tab_video_fx(), "Video FX")
@@ -2844,7 +2908,7 @@ class Main(QMainWindow):
             tree.setStyleSheet(f"QTreeWidget {{ font-size: 12px; }} "
                                f"QTreeWidget::item {{ height: {max(13, round(row_h * 0.8))}px; }}")
         for group in groups:                     # long knob lists: folded at first
-            if group in ("grade", "fx", "vfx", "lfo", "scene", "macro") \
+            if group in ("grade", "fx", "vfx", "canvas", "keep", "lfo", "scene", "macro") \
                     or group.startswith("rack_") \
                     or group.startswith("mc_") and group != "mc_focus" \
                     or group.startswith("audio_") and group != "audio_focus":
@@ -6187,7 +6251,8 @@ class Main(QMainWindow):
                     + [f"macro_{n}" for n in range(1, MACRO_SLOTS + 1)])
         if g == "video":
             return ([f"grade_{k}" for k, *_ in VIDEO_GRADE]
-                    + [f"fx_{k}" for k, *_ in VIDEO_EFFECTS] + ["shader_mix"])
+                    + [f"fx_{k}" for k, *_ in VIDEO_EFFECTS] + ["shader_mix"]
+                    + [f"canvas_{k}" for k, *_ in CANVAS_KNOBS])
         if g == "mc":
             return ([self._mc_ident(t, key) for (t, key), w in self.mc.items()
                      if not isinstance(w, QCheckBox)] + list(MC_RETRIG_KNOBS))
@@ -6219,7 +6284,11 @@ class Main(QMainWindow):
                     "shader_blend": self.shader_blend.currentText(),
                     "video_plain": self.video_plain.isChecked(),
                     "picture": self.perf_picture.currentText(),
-                    "dissolve": self.perf_dissolve.currentText()}
+                    "dissolve": self.perf_dissolve.currentText(),
+                    "canvas_fit": self.canvas_fit.currentText(),
+                    "canvas_bg": self.bg_mode.currentText(),
+                    "canvas_bg_file": self.bg_file.text(),
+                    "canvas_bg_colour": self._bg_colour.name()}
         return {}
 
     def _scene_capture(self):
@@ -6267,6 +6336,20 @@ class Main(QMainWindow):
         elif ident == "dissolve":
             if self.perf_dissolve.findText(str(val)) >= 0:
                 self.perf_dissolve.setCurrentText(str(val))
+        elif ident == "canvas_fit":
+            if self.canvas_fit.findText(str(val)) >= 0:
+                self.canvas_fit.setCurrentText(str(val))
+        elif ident == "canvas_bg":
+            if self.bg_mode.findText(str(val)) >= 0:
+                self.bg_mode.setCurrentText(str(val))
+        elif ident == "canvas_bg_file":
+            self.bg_file.setText(str(val or ""))
+            self._apply_background()
+        elif ident == "canvas_bg_colour":
+            c = QColor(str(val))
+            if c.isValid():
+                self._bg_colour = c
+                self._apply_background()
         elif ident in self.mc_toggles:
             self.mc_toggles[ident].setChecked(bool(val))
 
@@ -6368,6 +6451,192 @@ class Main(QMainWindow):
                          f"{round(100 * self.scene_morph.frac)} %")
         if self.scene_status.text() != text:
             self.scene_status.setText(text)
+
+    def _tab_canvas(self):
+        """The canvas: the picture need not fill the screen. For a projector:
+        the picture cropped (a tape's edges off), placed (slid, zoomed,
+        tilted in perspective for a wall hit at an angle) and a background
+        around it, a colour, a photo or a clip of its own. Then one tick per
+        video effect and per shader: ticked it keeps to the canvas (the
+        picture alone, the background untouched), unticked it works over
+        the whole screen (a vignette darkens the wall's corners, a feedback
+        shader rushes out of the picture onto the background). Every knob
+        is a MIDI knob and an LFO or macro destination, the menus are
+        buttons, every tick a MIDI button (Controls tab, groups 'canvas');
+        the knobs and the background are part of a scene's video group,
+        the ticks are remembered. OpenGL only."""
+        form = QFormLayout()
+        self.canvas_fit = QComboBox()
+        self.canvas_fit.addItems(CANVAS_FITS)
+        self.canvas_fit.setToolTip(
+            "At zoom 100: fill = the picture covers the screen, its edges cut "
+            "(as always before); fit = the whole picture shows, the background "
+            "beside or above it")
+        self.canvas_fit.currentIndexChanged.connect(self._apply_canvas)
+        self.canvas_knobs = {}
+        for key, label, (lo, hi, step, val), suffix, tip in CANVAS_KNOBS:
+            sp = QDoubleSpinBox(minimum=lo, maximum=hi, singleStep=step, decimals=1,
+                                suffix=suffix)
+            sp.setValue(val)
+            sp.setToolTip(tip)
+            sp.valueChanged.connect(self._apply_canvas)
+            self.canvas_knobs[key] = sp
+        k = self.canvas_knobs
+        labels = {key: lbl for key, lbl, *_ in CANVAS_KNOBS}
+        neutral = QPushButton("neutral")
+        neutral.setToolTip("The whole screen again: no crop, centred, zoom 100, no tilt")
+        neutral.clicked.connect(self._canvas_neutral)
+        form.addRow("Picture", self._row([("", self.canvas_fit), ("zoom", k["zoom"]),
+                                          ("", neutral)]))
+        form.addRow("Crop", self._row([(labels[c], k[c])
+                                       for c in ("crop_l", "crop_r", "crop_t", "crop_b")]))
+        form.addRow("Place", self._row([("x", k["x"]), ("y", k["y"]),
+                                        ("tilt x", k["tilt_x"]), ("tilt y", k["tilt_y"])]))
+        place_hint = QLabel("x and y slide the picture, the tilts are a keystone: a "
+                            "perspective about the horizontal and the vertical axis")
+        place_hint.setProperty("role", "sub")
+        form.addRow("", place_hint)
+        # the background
+        self.bg_mode = QComboBox()
+        self.bg_mode.addItems(BG_MODES)
+        self.bg_mode.setToolTip("What is around the picture: a flat colour, or a file: "
+                                "a photo, or a clip looping at its own pace")
+        self.bg_mode.currentIndexChanged.connect(self._apply_background)
+        self._bg_colour = QColor(16, 9, 7)
+        self.bg_colour_btn = QPushButton("")
+        self.bg_colour_btn.setToolTip("Pick the background colour")
+        self.bg_colour_btn.clicked.connect(self._pick_bg_colour)
+        self.bg_file = QLineEdit()
+        self.bg_file.setReadOnly(True)
+        self.bg_file.setPlaceholderText("a photo or a clip")
+        self.bg_file.setToolTip("The background file: png, jpg, webp... for a photo; "
+                                "mp4, mov, mkv... for a clip, looping, with its own "
+                                "decoder, untouched by the song")
+        browse = QPushButton("...")
+        browse.setObjectName("small")
+        browse.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        browse.setToolTip("Choose the background file")
+        browse.clicked.connect(self._pick_bg_file)
+        clear = QPushButton("none")
+        clear.setObjectName("small")
+        clear.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        clear.setToolTip("No file: the colour again")
+        clear.clicked.connect(self._clear_bg_file)
+        form.addRow("Background", self._row([("", self.bg_mode), ("colour", self.bg_colour_btn)]))
+        form.addRow("", self._row([("file", self.bg_file), ("", browse), ("", clear)]))
+        # who keeps to the canvas
+        fx_off, shd_off = self._keep_saved()
+        labels = {key: lbl for key, lbl, _d, _t in VIDEO_EFFECTS}
+        self.keep_fx = {}
+        for key in KEEP_FX:
+            cb = QCheckBox(labels.get(key, key))
+            cb.setProperty("role", "pool")
+            cb.setToolTip(f"{labels.get(key, key)}: ticked, on the picture alone; unticked, "
+                          "over the whole screen, the background included")
+            cb.setChecked(key not in fx_off)
+            cb.toggled.connect(self._keep_changed)
+            self.keep_fx[key] = cb
+        form.addRow("Effects on the canvas", self._pool_box(self.keep_fx))
+        self.keep_shd = {}
+        for p in shader_files():
+            cb = QCheckBox(p.stem)
+            cb.setProperty("role", "pool")
+            cb.setToolTip(f"{p.name}: ticked, drawn on the picture alone, at its size; "
+                          "unticked, drawn over the whole screen with the picture a "
+                          "part of it, so it runs out onto the background")
+            cb.setChecked(p.stem not in shd_off)
+            cb.toggled.connect(self._keep_changed)
+            self.keep_shd[p.stem] = cb
+        form.addRow("Shaders on the canvas", self._pool_box(self.keep_shd))
+        hint = self._info("ticked: the effect or shader keeps to the canvas, the picture "
+                          "alone, and the background stays as it is; unticked: it works "
+                          "over the whole screen, a vignette darkens the wall's corners, "
+                          "a feedback shader rushes out of the picture. All on: the "
+                          "background is never touched. Remembered; every tick is a "
+                          "MIDI button in the Controls tab, every knob above a MIDI "
+                          "knob, an LFO and a macro destination, and part of a scene's "
+                          "video group. OpenGL only")
+        form.addRow("", hint)
+        self._apply_background()                     # the colour onto its button
+        return self._scrolling(self._wrap(form))
+
+    def _keep_saved(self):
+        """The unticked keep boxes from the settings: (effects, shaders)."""
+        try:
+            keep = json.loads(self.settings.value("canvas/keep", "") or "{}")
+            if not isinstance(keep, dict):
+                keep = {}
+        except (ValueError, TypeError):
+            keep = {}
+        return set(keep.get("fx_off", [])), set(keep.get("shaders_off", []))
+
+    def _keep_changed(self, *_):
+        self.settings.setValue("canvas/keep", json.dumps({
+            "fx_off": [k for k, cb in self.keep_fx.items() if not cb.isChecked()],
+            "shaders_off": [n for n, cb in self.keep_shd.items() if not cb.isChecked()]}))
+        self._apply_keep()
+
+    def _apply_keep(self):
+        if hasattr(self, "backdrop"):
+            self.backdrop.keep_fx = {k for k, cb in self.keep_fx.items() if cb.isChecked()}
+            self.backdrop.keep_shaders = {n for n, cb in self.keep_shd.items()
+                                          if cb.isChecked()}
+
+    def _apply_canvas(self, *_):
+        """The Canvas tab's knobs -> the backdrop, as one dict (fractions)."""
+        if not hasattr(self, "backdrop"):
+            return
+        v = {key: sp.value() for key, sp in self.canvas_knobs.items()}
+        self.backdrop.canvas = {
+            "fit": self.canvas_fit.currentText(),
+            "crop": tuple(v[c] / 100.0 for c in ("crop_l", "crop_r", "crop_t", "crop_b")),
+            "x": v["x"] / 100.0, "y": v["y"] / 100.0, "zoom": v["zoom"] / 100.0,
+            "tilt_x": v["tilt_x"], "tilt_y": v["tilt_y"]}
+
+    def _canvas_neutral(self):
+        for key, _lbl, (_lo, _hi, _st, val), _sfx, _tip in CANVAS_KNOBS:
+            self.canvas_knobs[key].setValue(val)
+
+    def _apply_background(self, *_):
+        """The background menu, colour and file -> the backdrop; the colour
+        onto its button."""
+        c = self._bg_colour
+        self.bg_colour_btn.setText(c.name())
+        self.bg_colour_btn.setStyleSheet(
+            f"QPushButton {{ background: {c.name()}; "
+            f"color: {'#1a1a1a' if c.lightness() > 110 else '#e6ddd8'}; }}")
+        bd = getattr(self, "backdrop", None)
+        if bd is not None and hasattr(bd, "set_background"):
+            bd.set_background(self.bg_mode.currentText(), (c.redF(), c.greenF(), c.blueF()),
+                              self.bg_file.text())
+
+    def _pick_bg_colour(self):
+        c = QColorDialog.getColor(self._bg_colour, self, "Background colour")
+        if c.isValid():
+            self._bg_colour = c
+            if self.bg_mode.currentText() != "colour":
+                self.bg_mode.setCurrentText("colour")     # applies
+            else:
+                self._apply_background()
+
+    def _pick_bg_file(self):
+        start = self.bg_file.text() or str(VIDEOS_DIR)
+        path, _f = QFileDialog.getOpenFileName(
+            self, "Background: a photo or a clip", start,
+            "Pictures and clips (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff "
+            "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mpg *.mpeg);;All files (*)")
+        if not path:
+            return
+        self.bg_file.setText(path)
+        if self.bg_mode.currentText() != "file":
+            self.bg_mode.setCurrentText("file")           # applies
+        else:
+            self._apply_background()
+        self.log.appendPlainText(f"canvas: background {Path(path).name}")
+
+    def _clear_bg_file(self):
+        self.bg_file.setText("")
+        self._apply_background()
 
     def _tab_video_fx(self):
         """The pool: which video effects and which shaders are in the show at
@@ -7228,6 +7497,13 @@ class Main(QMainWindow):
             cb.setChecked(name not in sh_off)
             cb.blockSignals(False)
         self._vfx_save()
+        # the canvas: who keeps to it (the knobs and the background are in
+        # the live state, below)
+        fx_off, shd_off = self._keep_saved()
+        for key, cb in self.keep_fx.items():
+            cb.setChecked(key not in fx_off)
+        for name, cb in self.keep_shd.items():
+            cb.setChecked(name not in shd_off)
         # the VST inserts: the chain as the set has it (the text first:
         # removing writes the empty chain back)
         text = sv("vst/inserts", "")
@@ -10936,7 +11212,8 @@ class Main(QMainWindow):
         if self.link is not None:
             self.link.close()
         for src in (getattr(self.backdrop, "source", None),
-                    getattr(self.backdrop, "source2", None)):
+                    getattr(self.backdrop, "source2", None),
+                    getattr(self.backdrop, "source_bg", None)):
             if src is not None:
                 src.stop()
         if self.worker and self.worker.isRunning():
