@@ -5339,10 +5339,10 @@ class Main(QMainWindow):
                           "is out while any is, on the quantize grid")
             so.toggled.connect(lambda on, v=v: self._perf_solo(v, on))
             self.perf_voices[v], self.perf_solos[v] = cb, so
-            box = QHBoxLayout()                       # [KICK] [M] [S]
+            box = QHBoxLayout()                       # [M] [S] [KICK]
             box.setContentsMargins(0, 0, 0, 0)
             box.setSpacing(4)
-            for x in (lab, cb, so):
+            for x in (cb, so, lab):
                 box.addWidget(x)
             cell = QWidget()
             cell.setLayout(box)
