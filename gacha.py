@@ -304,9 +304,9 @@ CANVAS_KNOBS = [
     ("mix", "mix", (0.0, 100.0, 1.0, 100.0), " %",
      "The video's opacity over the background, in its blend mode: 100 the video, 0 "
      "the background alone"),
-    ("feather", "feather", (0.0, 50.0, 0.5, 0.0), " %",
-     "A soft edge: the video fades into the background over this much of its height, "
-     "on every side; 0 a hard edge"),
+    ("feather", "feather", (0.0, 100.0, 1.0, 0.0), " %",
+     "A soft edge: 0 a hard edge, 50 the video fades into the background over a "
+     "quarter of its height on every side, 100 the fade reaches the centre, a glow"),
 ]
 # every action the performer has, in one table: the Controls tab shows it,
 # the keyboard shortcuts and the MIDI bindings hang on the same ids.
@@ -6626,7 +6626,7 @@ class Main(QMainWindow):
             "x": v["x"] / 100.0, "y": v["y"] / 100.0, "zoom": v["zoom"] / 100.0,
             "tilt_x": v["tilt_x"], "tilt_y": v["tilt_y"],
             "blend": self.canvas_blend.currentIndex(), "mix": v["mix"] / 100.0,
-            "feather": v["feather"] / 100.0}
+            "feather": v["feather"] / 200.0}      # 100 % = the fade reaches the centre
 
     def _canvas_neutral(self):
         for key, _lbl, (_lo, _hi, _st, val), _sfx, _tip in CANVAS_KNOBS:
