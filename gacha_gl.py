@@ -362,9 +362,9 @@ class GLBackdrop(QOpenGLWidget):
         fmt.setProfile(QSurfaceFormat.CoreProfile)
         # no vsync wait inside our own draw calls: with the interval at 1
         # the driver's queue fills and a draw call blocks until the display
-        # takes a frame, several ms with the GIL held (the audio callback
-        # waiting); the 60 fps timer paces the paints, and the window is
-        # composed by the desktop, so nothing tears
+        # takes a frame, several ms of the GUI thread gone each paint; the
+        # 60 fps timer paces the paints, and the window is composed by the
+        # desktop, so nothing tears
         fmt.setSwapInterval(0)
         super().__init__()
         self.setFormat(fmt)

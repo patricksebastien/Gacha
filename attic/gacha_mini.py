@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-gacha_mini.py — the audio stream alone, in a small Qt window: does a bare
-callback crackle on this machine, and what makes it start?
+attic/gacha_mini.py — the audio stream alone, in a small Qt window: does a
+bare callback crackle on this machine, and what makes it start? Kept for
+reference (2026-10-13): the hunt it served is over, the crackle was the
+GUI holding the interpreter lock and the engine in its own process
+(gacha_audioproc.py) settled it. Still runs from here: python attic/gacha_mini.py
 
 The main app is 10k lines of Qt, video, MIDI and DSP round one ASIO
 callback; when it crackles, this is the control: the same stream opened
@@ -50,7 +53,7 @@ import time
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the repo, for gacha_audio
 import gacha_audio as ga                                   # noqa: E402
 from gacha_gilwatch import GilWatch                        # noqa: E402
 

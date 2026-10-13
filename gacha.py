@@ -21,7 +21,6 @@ import math
 import random
 import re
 import subprocess
-import gc
 import sys
 import tempfile
 import time
@@ -54,8 +53,7 @@ from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
 from gacha_link import INSTALL_HINT as LINK_INSTALL_HINT, LINK_AVAILABLE, LinkClock
-from gacha_audio import (audio_apis, audio_devices, audio_status, PHRASE_BARS,
-                         set_process_priority)
+from gacha_audio import audio_apis, audio_devices, audio_status, PHRASE_BARS
 from gacha_audioproc import AudioProxy, audio_host      # the engine, in its own process
 from gacha_takes import TakeStore
 from gacha_section import (EXTRA_KINDS, Material, cut_burst, render_section, render_oneshot,
@@ -2537,16 +2535,13 @@ class Main(QMainWindow):
         QTimer.singleShot(0, self._reopen_stream)
 
     def _priority_changed(self, save=True):
-        """The Priority ticks of the Settings tab: the process class and the
-        GC at once, the driver's thread's MMCSS class on its next block
-        (gacha_audio reads the flag there); remembered."""
+        """The Priority ticks of the Settings tab, all three for the engine
+        process (gacha_audioproc), where the sound is: its process class
+        and its GC at once, its audio thread's MMCSS class on the next
+        block (gacha_audio reads the flag there); remembered. This process
+        is the interface, it runs as any desktop app."""
         high, off, pro = self.audio_high.isChecked(), self.audio_gc.isChecked(), self.audio_pro.isChecked()
-        set_process_priority(high)
-        if off:
-            gc.disable()
-        else:
-            gc.enable()
-        audio_host().priority(high, off)        # the engine process, where it counts
+        audio_host().priority(high, off)
         if self.through is not None:
             self.through.pro_audio = pro
         if save:
@@ -2648,10 +2643,9 @@ class Main(QMainWindow):
 
     def _free_memory_gb(self):
         """The machine's free memory. Not psutil's virtual_memory() on
-        Windows: that call keeps the GIL for 5 ms (measured), twice a
-        second, and the audio callback waited on it every time (a 128-frame
-        block is 2.7 ms); GlobalMemoryStatusEx through ctypes takes 20 us
-        and lets the GIL go. Elsewhere psutil, every few seconds."""
+        Windows: that call takes 5 ms (measured) twice a second, a stutter
+        in the interface for a number; GlobalMemoryStatusEx through ctypes
+        takes 20 us. Elsewhere psutil, every few seconds."""
         now = time.monotonic()
         if self._mem_free is not None and now - self._mem_free[0] < 2.0:
             return self._mem_free[1]
@@ -6688,12 +6682,13 @@ class Main(QMainWindow):
             "Python off the driver's thread: with a ring of N, the stream's callback "
             "is C (the rtmixer package) and only copies between the device and two "
             "ring buffers, while a thread of ours renders N blocks ahead into one and "
-            "reads the input from the other. A wait for the GIL then costs nothing "
-            "until it outlasts the whole lead, so this is the setting against crackle "
-            "at 128 that no priority tick cured; the price is N blocks of added "
-            "output latency (2.7 ms per block at 128 frames, 48 kHz), which the Link "
-            "bars and the MIDI out's lead already account for. Off = the usual way, "
-            "Python in the driver's callback. The lead must cover what the driver "
+            "reads the input from the other. A wait for the engine's interpreter "
+            "lock then costs nothing until it outlasts the whole lead: a margin on "
+            "top of the engine running in its own process, which is what cured the "
+            "crackle at 128; the price is N blocks of added output latency (2.7 ms "
+            "per block at 128 frames, 48 kHz), which the Link bars and the MIDI "
+            "out's lead already account for. Off = the usual way, Python in the "
+            "driver's callback. The lead must cover what the driver "
             "takes per call: on ASIO that is one block, so start with 2; WASAPI "
             "shared takes 10 ms at a time, 4 blocks at 128 (ring 5) or 2 at 256 "
             "(ring 3), and a lead short of that underruns every period. Needs "
@@ -6808,23 +6803,26 @@ class Main(QMainWindow):
                                               ("", self.through_ring)]))
         form.addRow("", self.through_status)
         # the scheduling DAWs give themselves, each a tick, remembered,
-        # applied live (gacha_audio.set_process_priority, thread_pro_audio)
+        # applied live to the engine process (gacha_audioproc: its
+        # set_process_priority and gc, gacha_audio.thread_pro_audio)
         self.audio_pro = QCheckBox("Pro Audio (MMCSS) on the audio thread")
         self.audio_pro.setToolTip(
-            "Windows: the audio thread (the driver's, or with a ring on, our render "
-            "thread) joins the MMCSS \"Pro Audio\" class, the scheduling DAWs give "
-            "their audio threads, so the desktop's work waits for it and not the "
-            "other way round. Takes effect on the next block. Remembered.")
+            "Windows: the engine's audio thread (the driver's, or with a ring on, "
+            "its render thread) joins the MMCSS \"Pro Audio\" class, the scheduling "
+            "DAWs give their audio threads, so the desktop's work waits for it and "
+            "not the other way round. Takes effect on the next block. Remembered.")
         self.audio_high = QCheckBox("high process priority")
         self.audio_high.setToolTip(
-            "Windows: the whole app in HIGH_PRIORITY_CLASS, as DAWs run: the "
-            "scheduler takes its threads before the desktop's. At once. Remembered.")
+            "Windows: the audio engine's process in HIGH_PRIORITY_CLASS, as DAWs "
+            "run: the scheduler takes its threads before the desktop's, this "
+            "interface included. At once. Remembered.")
         self.audio_gc = QCheckBox("GC off")
         self.audio_gc.setToolTip(
-            "Python's garbage collector off for the whole run: a collection holds "
-            "the GIL while it walks the heap, the audio callback waiting. Memory of "
-            "reference cycles is then never reclaimed, a little growth over a show. "
-            "At once. Remembered.")
+            "Python's garbage collector off in the audio engine's process: a "
+            "collection there holds its interpreter lock while it walks the heap, "
+            "the audio thread waiting. Memory of reference cycles is then never "
+            "reclaimed in the engine, a little growth over a show. At once. "
+            "Remembered.")
         for cb in (self.audio_pro, self.audio_high):
             cb.setVisible(sys.platform == "win32")
         for cb in (self.audio_pro, self.audio_high, self.audio_gc):
@@ -10871,13 +10869,4 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = Main()
     win.showMaximized()                         # the whole screen from the start
-    gc.collect()
-    gc.freeze()                                 # the GUI built: out of every later full
-                                                # collection (tens of ms under the GIL, the
-                                                # audio callback waiting while it walks)...
-    gc.set_threshold(700, 10, 10000)            # ...and full collections rare: with the
-                                                # frozen heap out of the count, the rule of a
-                                                # quarter more long-lived objects would run one
-                                                # at nearly every middle collection (7 ms each,
-                                                # seen); this one runs about once an hour
     sys.exit(app.exec())

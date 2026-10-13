@@ -5,20 +5,17 @@ gacha_bench.py — what one audio block costs, offline, state by state.
 Runs LiveAudio._dsp_block (no device) at a block size: nothing playing,
 then a section with and without racks, varispeed, the stretch, a repeat,
 the freeze, the fragments and a break, and prints the mean, the 99th
-percentile and the worst block against the block's own length. With
---gil a busy pure-Python thread runs beside it (the GUI at its worst)
-and the same block is timed at several GIL switch intervals: the DSP is
-a tenth of a 128-frame block, the wait for the GIL is what crackles
-(gacha_audio.SWITCH_INTERVAL). --prof adds a profile of the heavier
-states.
+percentile and the worst block against the block's own length. --prof
+adds a profile of the heavier states. (The DSP is a tenth of a 128-frame
+block; what crackled was the GUI holding the interpreter lock, settled
+by the engine in its own process, gacha_audioproc.py.)
 
-    python gacha_bench.py 128 --gil
+    python gacha_bench.py 128
 """
 import cProfile
 import os
 import pstats
 import sys
-import threading
 import time
 
 import numpy as np
@@ -142,32 +139,6 @@ def main():
     la.player.fill("glitch")
     run(la, n=1500, label="section + glitch break")
 
-    if "--gil" in sys.argv:
-        gil()
-
-
-def gil():
-    """A GUI-like thread burning Python; the block timed from the audio side."""
-    print("\nGIL: a busy pure-Python thread beside the block")
-    stop = threading.Event()
-
-    def burn():
-        d = {}
-        while not stop.is_set():
-            for i in range(2000):
-                d[i] = i * 2
-    t = threading.Thread(target=burn, daemon=True)
-    t.start()
-    try:
-        for sw in (0.005, 0.001, 0.0005, 0.00025):
-            sys.setswitchinterval(sw)
-            la = make_la()
-            section(la)
-            la.racks["drums"].amounts.update(reverb=0.3, delay=0.3)
-            run(la, n=2000, label=f"  switch interval {1000 * sw:.2f} ms")
-    finally:
-        stop.set()
-        sys.setswitchinterval(0.005)
 
 
 if __name__ == "__main__":

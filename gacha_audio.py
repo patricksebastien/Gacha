@@ -142,12 +142,14 @@ assert VOICES[:len(DRUM_ROLES)] == DRUM_ROLES      # one voice per MIDI role, th
 SR = 48000
 PREFERRED_APIS = ("ASIO", "Windows WASAPI", "ALSA", "Core Audio",
                   "Windows DirectSound", "MME")
-SWITCH_INTERVAL = 0.0005         # s; Python's default 5 ms lets the GUI hold the
-                                 # GIL for two whole 128-frame blocks, and a block
-                                 # asks for it back many times (every plugin call
-                                 # lets it go): measured with a busy Python thread
-                                 # beside it, a 128-frame block takes 11 ms at 5 ms,
-                                 # 4 ms at 1 ms and under 1 ms at 0.5 ms
+SWITCH_INTERVAL = 0.0005         # s, while a stream is open; Python's default 5 ms
+                                 # lets another thread of the engine process (the
+                                 # command reader, the snapshot sender) hold the GIL
+                                 # for two whole 128-frame blocks, and a block asks
+                                 # for it back many times (every plugin call lets it
+                                 # go): measured with a busy Python thread beside
+                                 # it, a 128-frame block takes 11 ms at 5 ms, 4 ms
+                                 # at 1 ms and under 1 ms at 0.5 ms
 MAX_DELAY_MS = 2000              # the sync delay's ring
 
 
@@ -2107,19 +2109,13 @@ class LiveAudio:
         return src, snk
 
     @staticmethod
-    def _boost_priority():
-        """Best effort: the audio thread above the rest. Windows: the MMCSS
-        "Pro Audio" class (what DAWs use) and time-critical priority; Linux:
-        SCHED_FIFO if the user may (rtkit / limits.conf), else nothing."""
+    def _realtime_linux():
+        """Best effort on Linux: SCHED_FIFO for the audio thread if the
+        user may (rtkit / limits.conf), else nothing. On Windows the
+        thread's class is the Settings tab's Pro Audio tick (`pro_audio`,
+        read on every path's audio thread, thread_pro_audio)."""
         try:
-            if sys.platform == "win32":
-                import ctypes
-                task_index = ctypes.c_ulong(0)
-                avrt = ctypes.windll.avrt
-                if not avrt.AvSetMmThreadCharacteristicsW("Pro Audio", ctypes.byref(task_index)):
-                    k32 = ctypes.windll.kernel32
-                    k32.SetThreadPriority(k32.GetCurrentThread(), 15)   # TIME_CRITICAL
-            elif hasattr(os, "sched_setscheduler"):
+            if sys.platform != "win32" and hasattr(os, "sched_setscheduler"):
                 os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
         except Exception:
             pass
@@ -2133,7 +2129,7 @@ class LiveAudio:
             self.ready.set()
             return
         sys.setswitchinterval(SWITCH_INTERVAL)
-        self._boost_priority()
+        self._realtime_linux()
         thread_no_throttle()
         hints = power_hints(True)
         if hints:
@@ -2157,6 +2153,8 @@ class LiveAudio:
                 self.ready.set()
                 last = time.monotonic()
                 while not self._stop.is_set():
+                    if self.pro_audio != (self._mmcss is not None):   # the Settings tick, this thread
+                        self._mmcss = thread_pro_audio(self.pro_audio, self._mmcss)
                     # with an input the read paces the loop; without one the
                     # output's write does. Both sleep while they wait.
                     if src is not None:
@@ -2186,6 +2184,7 @@ class LiveAudio:
         finally:
             self.running = False
             self.ready.set()
+            self._mmcss = thread_pro_audio(False, self._mmcss)
             sys.setswitchinterval(old_switch)
             power_hints(False)
             for st in ({id(x): x for x in (src, snk) if x is not None}.values()):

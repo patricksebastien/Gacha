@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-gacha_gilwatch.py — who holds the GIL when the audio callback stalls.
+attic/gacha_gilwatch.py — who holds the GIL when the audio callback stalls.
+Kept for attic/gacha_mini.py (2026-10-13); the app runs no watcher since the
+engine moved to its own process (gacha_audioproc.py).
 
 The audio block is a tenth of a 128-frame buffer; what crackles is the
 driver's thread waiting for the GIL. Pure-Python work on the other

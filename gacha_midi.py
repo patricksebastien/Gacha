@@ -725,8 +725,8 @@ class MidiOut:
         try:
             while True:
                 if spin is not None:           # the last ms or two, outside the lock:
-                    while time.perf_counter() < spin:   # the audio thread takes it every
-                        pass                   # block (grid(), note()) and must not wait here
+                    while time.perf_counter() < spin:   # the engine's notes arrive under
+                        pass                   # it (grid(), note()) and must not wait here
                     spin = None
                 with self._cond:
                     while not self._stop and not self._heap and self._tick_due is None \
