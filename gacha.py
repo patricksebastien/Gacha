@@ -4988,6 +4988,7 @@ class Main(QMainWindow):
                 "bar (a second to render). The sub bass follows the drums, the "
                 "layers and the chops. Stopped, the shuffle waits in the "
                 "section for the next start.")
+            sh.setCheckable(True)                     # lit while a shuffle is on its way
             sh.clicked.connect(lambda _=False, st=stem: self.perform_shuffle(st))
             self.perf_shuffles[stem] = sh
             pairs.append(("", sh))
@@ -8605,16 +8606,37 @@ class Main(QMainWindow):
         part (pressed again before it lands, the press is the same one)."""
         if self.through is None or not self.through.running:
             self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
+            self._shuffle_faces()
             return
         if self._perf_current is None:
             self.log.appendPlainText("shuffle: no section yet, press N for one")
+            self._shuffle_faces()
             return
         busy = self._perf_busy
-        if part in self._shuffle_queue or (busy is not None and busy[0] == "shuffle"
-                                           and busy[1] == part):
-            return                                    # pressed twice: one new sound
+        if part in self._shuffle_queue or part in self._shuffle_landing \
+                or (busy is not None and busy[0] == "shuffle" and busy[1] == part):
+            self._shuffle_faces()                     # pressed twice: one new sound
+            return
         self._shuffle_queue.append(part)
         self._shuffle_kick()
+        self._shuffle_faces()
+
+    def _shuffle_faces(self):
+        """The four buttons say where their shuffle is: queued, rendering,
+        on its way to the bar, or nothing (plain, unlit)."""
+        busy = self._perf_busy
+        for part, btn in self.perf_shuffles.items():
+            if busy is not None and busy[0] == "shuffle" and busy[1] == part:
+                face = "rendering..."
+            elif part in self._shuffle_landing:
+                face = "on the bar..."
+            elif part in self._shuffle_queue:
+                face = "queued..."
+            else:
+                face = "shuffle"
+            if btn.text() != face:
+                btn.setText(face)
+            btn.setChecked(face != "shuffle")
 
     def _shuffle_kick(self):
         """The next shuffle asked, once the render thread is free."""
@@ -8632,6 +8654,7 @@ class Main(QMainWindow):
         mat_key = self._perf_material_key() or getattr(sec, "mat_key", None)
         if mat_key is None:
             self.log.appendPlainText("shuffle: no material (record a take, or tick samples or videos)")
+            self._shuffle_faces()
             return
         self._perf_busy = ("shuffle", part)
         threading.Thread(target=self._perf_render_shuffle,
@@ -8681,6 +8704,7 @@ class Main(QMainWindow):
         cur = self._perf_current
         if cur is None or cur[0] is not sec:
             self.log.appendPlainText(f"shuffle {part}: the section moved on, dropped")
+            self._shuffle_faces()
             return
         heads = self.SHUFFLE_NOTES[part]
         own = lambda note: note.split(" ", 1)[0] in heads   # noqa: E731
@@ -8698,6 +8722,7 @@ class Main(QMainWindow):
             self.log.appendPlainText(f"shuffle {part}: {what}; on the bar")
         else:
             self.log.appendPlainText(f"shuffle {part}: {what}; with the next start")
+        self._shuffle_faces()
 
     def _perf_start(self, what, key):
         if self._perf_busy is not None:
@@ -8742,6 +8767,9 @@ class Main(QMainWindow):
         # the ending effect and the ring-out, then the stop
         start_bar = sec.bars // 2 if sec.kind == "outro" else 0
         pl.queue(stems, sec.events, sec.bpm, sec.bars, bar_t0, start_bar)
+        if self._shuffle_landing:                     # the queued section replaces everything
+            self._shuffle_landing = []
+            self._shuffle_faces()
         self._perf_playing = sec
         self._perf_current = (sec, stems, self.through.sr)   # what a start brings back
         self.perf_next_btn.setText("next section")           # from here on N moves on
@@ -8782,6 +8810,9 @@ class Main(QMainWindow):
         self._perf_want = False                        # a render on its way stays quiet
         if la is not None:
             la.player.clear()
+        if self._shuffle_landing:                      # it is in the section, for the next start
+            self._shuffle_landing = []
+            self._shuffle_faces()
         self._perf_playing = None
         self._perf_hold = None
         self.backdrop.override = None
@@ -9362,6 +9393,7 @@ class Main(QMainWindow):
             elif what == "shuffle":
                 self._perf_shuffled(*r[1:])
             self._shuffle_kick()                       # a shuffle waiting its turn
+            self._shuffle_faces()
         la = self.through
         pl = la.player if la is not None and la.running else None
         burst = self._burst_frame()
@@ -9430,6 +9462,7 @@ class Main(QMainWindow):
             if self._shuffle_landing:                  # (the last carries the ones before it)
                 self.log.appendPlainText(f"shuffle {', '.join(self._shuffle_landing)}: in")
                 self._shuffle_landing = []
+                self._shuffle_faces()
         if pl.dropped:                                 # a break ended here: the drop
             pl.dropped = False
             self._perf_drop_t = time.monotonic()
@@ -9445,6 +9478,9 @@ class Main(QMainWindow):
         busy = self._perf_busy
         ready = "next ready" if self._perf_ready else (
             "" if not busy else f"shuffling {busy[1]}..." if busy[0] == "shuffle" else "rendering next...")
+        if self._shuffle_landing:
+            landing = ", ".join(self._shuffle_landing) + " on the bar..."
+            ready = f"{landing}  ·  {ready}" if ready else landing
         if sec is None:                                # stop asked: it lands on the bar
             self.perf_status.setText("stopping on the bar...")
             big = "stopping on the bar..."
