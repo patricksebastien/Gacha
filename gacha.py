@@ -4986,7 +4986,7 @@ class Main(QMainWindow):
             sh.clicked.connect(lambda _=False, st=stem: self.perform_shuffle(st))
             self.perf_shuffles[stem] = sh
             pairs.append(("", sh))
-        form.addRow("Stems", self._row(pairs))
+        stems_row = self._row(pairs)                   # added under the Break row
         glitch_btn = QPushButton("glitch (G)")
         glitch_btn.setToolTip(
             "A glitch break, on the phrase: it waits for the last bar of the "
@@ -5016,6 +5016,7 @@ class Main(QMainWindow):
         self.perf_gap.setChecked(self.settings.value("perform/gap", False, type=bool))
         self.perf_gap.toggled.connect(self._perf_gap_changed)
         form.addRow("Break", self._row([("", glitch_btn), ("", break_btn), ("", self.perf_gap)]))
+        form.addRow("Stems", stems_row)
         # the repeat: held from a key, a note or this latching button
         self._rep_sources = set()
         self.rep_btn = QPushButton("repeat (H)")
