@@ -5315,12 +5315,13 @@ class Main(QMainWindow):
         form.addRow("Burst", self._row([("", burst_btn), ("length", self.burst_len)]))
         # the drum voices: in or out and soloed, landing on the quantize grid
         self.perf_voices, self.perf_solos = {}, {}
-        legend = QLabel("on/off · S = solo")     # what the tick and the button are
-        legend.setProperty("role", "sub")
-        pairs = [("", legend)]
+        pairs = []
         for i, v in enumerate(VOICES, 1):
-            cb = QCheckBox(VOICE_SHORT[v])
+            cb = QCheckBox()                          # "KICK on" / "KICK off", the state in the face
             cb.setChecked(True)
+            cb.toggled.connect(lambda on, cb=cb, v=v: cb.setText(
+                f"{VOICE_SHORT[v].upper()} {'on' if on else 'off'}"))
+            cb.setText(f"{VOICE_SHORT[v].upper()} on")
             cb.setToolTip(f"{VOICE_LABELS[v]} in or out (Shift+F{i}), on the quantize grid "
                           "while a section plays; its MIDI notes stop with it only with "
                           "'follow mutes' ticked in the MIDI out panel. A delay "
