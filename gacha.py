@@ -318,10 +318,10 @@ KEYMAP = [
     ("section", "stem_layers", "F2", "layers stem in/out"),
     ("section", "stem_chops", "F3", "chops stem in/out"),
     ("section", "stem_events", "F4", "events stem in/out"),
-    ("section", "shuffle_drums", "F5", "shuffle: the drums rendered again, the rest kept"),
-    ("section", "shuffle_layers", "F6", "shuffle: the layers rendered again, the rest kept"),
-    ("section", "shuffle_chops", "F7", "shuffle: the chops rendered again, the rest kept"),
-    ("section", "shuffle_events", "F8", "shuffle: the events rendered again, the rest kept"),
+    ("section", "randomize_drums", "F5", "randomize: the drums rendered again, the rest kept"),
+    ("section", "randomize_layers", "F6", "randomize: the layers rendered again, the rest kept"),
+    ("section", "randomize_chops", "F7", "randomize: the chops rendered again, the rest kept"),
+    ("section", "randomize_events", "F8", "randomize: the events rendered again, the rest kept"),
     # MIDI only from here on (no key): more buttons, then the knobs
     ("show", "randomize_fx", "", "new random effect strengths (the Randomize button)"),
     ("show", "grade_neutral", "", "source grade back to neutral"),
@@ -2326,7 +2326,7 @@ class Main(QMainWindow):
             self.actions[f"shader_{n}"] = lambda n=n: self.select_shader_key(n)
         for stem in STEMS:
             self.actions[f"stem_{stem}"] = self.perf_stems[stem].toggle
-            self.actions[f"shuffle_{stem}"] = lambda stem=stem: self.perform_shuffle(stem)
+            self.actions[f"randomize_{stem}"] = lambda stem=stem: self.perform_shuffle(stem)
         for v in VOICES:
             self.actions[f"voice_{v}"] = self.perf_voices[v].toggle
             self.actions[f"solo_{v}"] = self.perf_solos[v].toggle
@@ -4999,13 +4999,14 @@ class Main(QMainWindow):
             lab = QLabel(stem.upper())
             lab.setStyleSheet("font-weight: bold;")
             pairs.append(("", self._pair(cb, lab)))
-            sh = QPushButton(f"shuffle ({shuffle_keys[stem]})")
+            sh = QPushButton(f"randomize ({shuffle_keys[stem]})")
+            sh.setObjectName("small")
             sh.setToolTip(
                 f"The {stem} of the section playing rendered again from the "
                 "material: a new sound in that part, the other three as they "
                 "are, bar for bar, and the loop where it is. Lands on the next "
                 "bar (a second to render). The sub bass follows the drums, the "
-                "layers and the chops. Stopped, the shuffle waits in the "
+                "layers and the chops. Stopped, it waits in the "
                 "section for the next start.")
             sh.setCheckable(True)                     # lit while a shuffle is on its way
             sh.clicked.connect(lambda _=False, st=stem: self.perform_shuffle(st))
@@ -8752,7 +8753,8 @@ class Main(QMainWindow):
             self._perf_result = ("error", f"one-shot failed: {e}")
 
     def perform_shuffle(self, part):
-        """F5-F8 (or the button): `part` (drums, layers, chops, events)
+        """Randomize, F5-F8 (or the button; the code says shuffle): `part`
+        (drums, layers, chops, events)
         of the current section rendered again from the material,
         a new sound in that part, the other three untouched, the loop
         where it is: on the next bar. A voice (KIT_PARTS, the R buttons):
@@ -8765,7 +8767,7 @@ class Main(QMainWindow):
             self._shuffle_faces()
             return
         if self._perf_current is None:
-            self.log.appendPlainText("shuffle: no section yet, press N for one")
+            self.log.appendPlainText("randomize: no section yet, press N for one")
             self._shuffle_faces()
             return
         busy = self._perf_busy
@@ -8789,10 +8791,10 @@ class Main(QMainWindow):
             elif part in self._shuffle_queue:
                 face = "queued..."
             else:
-                face = "shuffle"
+                face = "randomize"
             if btn.text() != face:
                 btn.setText(face)
-            btn.setChecked(face != "shuffle")
+            btn.setChecked(face != "randomize")
         for part, btn in self.perf_randoms.items():
             btn.setChecked(part in self._shuffle_queue or part in self._shuffle_landing
                            or (busy is not None and busy[0] == "shuffle" and busy[1] == part))
@@ -8816,14 +8818,14 @@ class Main(QMainWindow):
             force.add(part)
         mat_key = self._perf_material_key() or getattr(sec, "mat_key", None)
         if mat_key is None:
-            self.log.appendPlainText("shuffle: no material (record a take, or tick samples or videos)")
+            self.log.appendPlainText("randomize: no material (record a take, or tick samples or videos)")
             self._shuffle_faces()
             return
         self._perf_busy = ("shuffle", part)
         threading.Thread(target=self._perf_render_shuffle,
                          args=(mat_key, sec, stems, part, salts, force, kit_salts),
                          daemon=True, name="gacha-render").start()
-        self.log.appendPlainText(f"shuffle {part}: rendering...")
+        self.log.appendPlainText(f"randomize {part}: rendering...")
 
     def _perf_render_shuffle(self, mat_key, sec, stems, part, salts, force, kit_salts):
         """Render thread: `sec` again with the same seed, kind, tempo,
@@ -8856,7 +8858,7 @@ class Main(QMainWindow):
                             + [e for e in new.events if e[5] in roles], key=lambda e: e[0])
             self._perf_result = ("shuffle", part, sec, new, out, events, salts, force, kit_salts)
         except Exception as e:                        # noqa: BLE001
-            self._perf_result = ("error", f"shuffle failed: {e}")
+            self._perf_result = ("error", f"randomize failed: {e}")
 
     SHUFFLE_NOTES = {"drums": ("drums", "sub"), "layers": ("layer", "sub"),
                      "chops": ("chops",), "events": ("event", "swell", "collage")}
@@ -8866,7 +8868,7 @@ class Main(QMainWindow):
         is still the current one, and onto the player on the bar if it plays."""
         cur = self._perf_current
         if cur is None or cur[0] is not sec:
-            self.log.appendPlainText(f"shuffle {part}: the section moved on, dropped")
+            self.log.appendPlainText(f"randomize {part}: the section moved on, dropped")
             self._shuffle_faces()
             return
         heads = self.SHUFFLE_NOTES.get(part, ())
@@ -8887,9 +8889,9 @@ class Main(QMainWindow):
         if self._perf_playing is sec and pl is not None and pl.playing:
             pl.replace(out, events)
             self._shuffle_landing.append(part)
-            self.log.appendPlainText(f"shuffle {part}: {what}; on the bar")
+            self.log.appendPlainText(f"randomize {part}: {what}; on the bar")
         else:
-            self.log.appendPlainText(f"shuffle {part}: {what}; with the next start")
+            self.log.appendPlainText(f"randomize {part}: {what}; with the next start")
         self._shuffle_faces()
 
     def _perf_start(self, what, key):
@@ -9629,7 +9631,7 @@ class Main(QMainWindow):
         if pl.replaced:                                # the shuffles handed over landed, on the bar
             pl.replaced = False
             if self._shuffle_landing:                  # (the last carries the ones before it)
-                self.log.appendPlainText(f"shuffle {', '.join(self._shuffle_landing)}: in")
+                self.log.appendPlainText(f"randomize {', '.join(self._shuffle_landing)}: in")
                 self._shuffle_landing = []
                 self._shuffle_faces()
         if pl.dropped:                                 # a break ended here: the drop
@@ -9646,7 +9648,7 @@ class Main(QMainWindow):
         bar = int(bar_pos) + 1
         busy = self._perf_busy
         ready = "next ready" if self._perf_ready else (
-            "" if not busy else f"shuffling {busy[1]}..." if busy[0] == "shuffle" else "rendering next...")
+            "" if not busy else f"randomizing {busy[1]}..." if busy[0] == "shuffle" else "rendering next...")
         if self._shuffle_landing:
             landing = ", ".join(self._shuffle_landing) + " on the bar..."
             ready = f"{landing}  ·  {ready}" if ready else landing
