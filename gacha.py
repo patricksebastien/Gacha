@@ -4223,8 +4223,8 @@ class Main(QMainWindow):
         if ident == "pitch_lock":
             return self.pitch_mode.currentIndex() == 1
         if ident.startswith("stem_"):
-            cb = self.perf_stems.get(ident[5:])
-            return None if cb is None else cb.isChecked()
+            cb = self.perf_stems.get(ident[5:])       # the M button: lit while out
+            return None if cb is None else not cb.isChecked()
         if ident.startswith("voice_"):
             cb = self.perf_voices.get(ident[6:])      # the M button: lit while out
             return None if cb is None else not cb.isChecked()
@@ -4967,13 +4967,23 @@ class Main(QMainWindow):
         shuffle_keys = {"drums": "F5", "layers": "F6", "chops": "F7", "events": "F8"}
         pairs = []
         self.perf_shuffles = {}
+        # a mixer's way, as the voices below: M (lit while the stem is out),
+        # the name, the shuffle. perf_stems holds the M buttons: checked =
+        # out; the stem_* actions, the scenes and the pads speak of the
+        # stem being in (see _erae_read)
         for stem in STEMS:
-            cb = QCheckBox(f"{stem.upper()} ({keys[stem]})")
-            cb.setStyleSheet("font-weight: bold;")
-            cb.setChecked(True)
-            cb.toggled.connect(lambda on, st=stem: self._perf_stem(st, on))
+            cb = QPushButton("M")
+            cb.setObjectName("solo")
+            cb.setCheckable(True)
+            cb.setFixedWidth(24)
+            cb.setToolTip(f"mute the {stem} stem ({keys[stem]}): out with a ramp, on the "
+                          "quantize grid, for the section and a song alike, after its "
+                          "rack; lit while out.")
+            cb.toggled.connect(lambda muted, st=stem: self._perf_stem(st, not muted))
             self.perf_stems[stem] = cb
-            pairs.append(("", cb))
+            lab = QLabel(stem.upper())
+            lab.setStyleSheet("font-weight: bold;")
+            pairs.append(("", self._pair(cb, lab)))
             sh = QPushButton(f"shuffle ({shuffle_keys[stem]})")
             sh.setToolTip(
                 f"The {stem} of the section playing rendered again from the "
@@ -6183,7 +6193,7 @@ class Main(QMainWindow):
         if g == "voices":
             sw = {f"voice_{v}": not cb.isChecked() for v, cb in self.perf_voices.items()}
             sw.update({f"solo_{v}": b.isChecked() for v, b in self.perf_solos.items()})
-            sw.update({f"stem_{st}": cb.isChecked() for st, cb in self.perf_stems.items()})
+            sw.update({f"stem_{st}": not cb.isChecked() for st, cb in self.perf_stems.items()})
             sw["quant"] = self.perf_quant.currentText()
             return sw
         if g == "lfo":
@@ -6219,7 +6229,7 @@ class Main(QMainWindow):
         elif ident.startswith("solo_") and ident[5:] in self.perf_solos:
             self.perf_solos[ident[5:]].setChecked(bool(val))
         elif ident.startswith("stem_") and ident[5:] in self.perf_stems:
-            self.perf_stems[ident[5:]].setChecked(bool(val))
+            self.perf_stems[ident[5:]].setChecked(not bool(val))   # val: in; the M: out
         elif ident == "quant":
             if self.perf_quant.findText(str(val)) >= 0:
                 self.perf_quant.setCurrentText(str(val))
@@ -9869,7 +9879,7 @@ class Main(QMainWindow):
         self.through.ab = self.perf_ab.value() / 100.0
         self.through.hold_tape = self._webcam_b()
         for stem, cb in self.perf_stems.items():
-            self.through.on[stem] = cb.isChecked()
+            self.through.on[stem] = not cb.isChecked()   # the M: lit while out
         self._push_voices(self.through)
         self._push_afx()
         self.through.inserts = self.inserts
