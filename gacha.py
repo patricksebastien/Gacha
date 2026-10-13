@@ -4226,8 +4226,8 @@ class Main(QMainWindow):
             cb = self.perf_stems.get(ident[5:])
             return None if cb is None else cb.isChecked()
         if ident.startswith("voice_"):
-            cb = self.perf_voices.get(ident[6:])
-            return None if cb is None else cb.isChecked()
+            cb = self.perf_voices.get(ident[6:])      # the M button: lit while out
+            return None if cb is None else not cb.isChecked()
         if ident.startswith("solo_"):
             b = self.perf_solos.get(ident[5:])
             return None if b is None else b.isChecked()
@@ -4351,9 +4351,9 @@ class Main(QMainWindow):
         b = QPushButton(VOICE_SHORT[v])
         b.setCheckable(True)
         b.setChecked(True)
-        cb = self.perf_voices[v]
-        b.toggled.connect(cb.setChecked)
-        cb.toggled.connect(b.setChecked)
+        m = self.perf_voices[v]                       # the Perform tab's M: lit while out
+        b.toggled.connect(lambda on, m=m: m.setChecked(not on))
+        m.toggled.connect(lambda muted, b=b: b.setChecked(not muted))
         b.setToolTip(f"{VOICE_LABELS[v]}: in or out, the Perform tab's switch; the knobs "
                      "below are this voice's own rack, before the drums rack (the bus)")
         return b
@@ -5313,21 +5313,24 @@ class Main(QMainWindow):
         self.burst_len.valueChanged.connect(
             lambda v: self.settings.setValue("perform/burst_ms", float(v)))
         form.addRow("Burst", self._row([("", burst_btn), ("length", self.burst_len)]))
-        # the drum voices: in or out and soloed, landing on the quantize grid
+        # the drum voices, a mixer's way: the name, M (lit while muted), S
+        # (lit while soloed), landing on the quantize grid. perf_voices holds
+        # the M buttons: checked = muted; the voice_* actions, the scenes and
+        # the pads still speak of the voice being in (see _erae_read)
         self.perf_voices, self.perf_solos = {}, {}
         pairs = []
         for i, v in enumerate(VOICES, 1):
-            cb = QCheckBox()                          # "KICK on" / "KICK off", the state in the face
-            cb.setChecked(True)
-            cb.toggled.connect(lambda on, cb=cb, v=v: cb.setText(
-                f"{VOICE_SHORT[v].upper()} {'on' if on else 'off'}"))
-            cb.setText(f"{VOICE_SHORT[v].upper()} on")
-            cb.setToolTip(f"{VOICE_LABELS[v]} in or out (Shift+F{i}), on the quantize grid "
-                          "while a section plays; its MIDI notes stop with it only with "
-                          "'follow mutes' ticked in the MIDI out panel. A delay "
+            lab = QLabel(VOICE_SHORT[v].upper())
+            cb = QPushButton("M")
+            cb.setObjectName("solo")
+            cb.setCheckable(True)
+            cb.setFixedWidth(24)
+            cb.setToolTip(f"mute the {VOICE_LABELS[v]} (Shift+F{i}): out on the quantize grid "
+                          "while a section plays, lit while out; its MIDI notes stop with it "
+                          "only with 'follow mutes' ticked in the MIDI out panel. A delay "
                           "or a reverb on its rack (Audio FX tab) rings out after the "
                           "mute. Every voice starts in at launch.")
-            cb.toggled.connect(lambda on, v=v: self._perf_voice(v, on))
+            cb.toggled.connect(lambda muted, v=v: self._perf_voice(v, not muted))
             so = QPushButton("S")
             so.setObjectName("solo")
             so.setCheckable(True)
@@ -5336,7 +5339,14 @@ class Main(QMainWindow):
                           "is out while any is, on the quantize grid")
             so.toggled.connect(lambda on, v=v: self._perf_solo(v, on))
             self.perf_voices[v], self.perf_solos[v] = cb, so
-            pairs.append(("", self._pair(cb, so)))
+            box = QHBoxLayout()                       # [KICK] [M] [S]
+            box.setContentsMargins(0, 0, 0, 0)
+            box.setSpacing(4)
+            for x in (lab, cb, so):
+                box.addWidget(x)
+            cell = QWidget()
+            cell.setLayout(box)
+            pairs.append(("", cell))
         form.insertRow(drums_at, "Drums", self._row(pairs))   # under the Stems row
         self.perf_quant = QComboBox()
         self.perf_quant.addItems([name for name, _f in QUANT_GRIDS])
@@ -6171,7 +6181,7 @@ class Main(QMainWindow):
         if g == "audio":
             return {"inserts": self.vst_bypass.isChecked()}
         if g == "voices":
-            sw = {f"voice_{v}": cb.isChecked() for v, cb in self.perf_voices.items()}
+            sw = {f"voice_{v}": not cb.isChecked() for v, cb in self.perf_voices.items()}
             sw.update({f"solo_{v}": b.isChecked() for v, b in self.perf_solos.items()})
             sw.update({f"stem_{st}": cb.isChecked() for st, cb in self.perf_stems.items()})
             sw["quant"] = self.perf_quant.currentText()
@@ -6205,7 +6215,7 @@ class Main(QMainWindow):
         if ident == "inserts":
             self.vst_bypass.setChecked(bool(val))
         elif ident.startswith("voice_") and ident[6:] in self.perf_voices:
-            self.perf_voices[ident[6:]].setChecked(bool(val))
+            self.perf_voices[ident[6:]].setChecked(not bool(val))   # val: in; the M: out
         elif ident.startswith("solo_") and ident[5:] in self.perf_solos:
             self.perf_solos[ident[5:]].setChecked(bool(val))
         elif ident.startswith("stem_") and ident[5:] in self.perf_stems:
@@ -8986,7 +8996,7 @@ class Main(QMainWindow):
         """Shift+F8: every voice in, no solo, the voice racks clean."""
         for v in VOICES:
             self.perf_solos[v].setChecked(False)
-            self.perf_voices[v].setChecked(True)
+            self.perf_voices[v].setChecked(False)     # the M off: the voice in
             for key, *_ in AUDIO_FX:
                 self.afx[(v, key)].setValue(0.0)
             self.afx[(v, "vol")].setValue(1.0)
@@ -9354,7 +9364,7 @@ class Main(QMainWindow):
         the grid): in, and not soloed out."""
         solo = {v for v, b in self.perf_solos.items() if b.isChecked()}
         return {v for v, cb in self.perf_voices.items()
-                if cb.isChecked() and (not solo or v in solo)}
+                if not cb.isChecked() and (not solo or v in solo)}
 
     def _push_voices(self, la):
         """The voices' switches, the solos and the grid into a fresh stream."""
