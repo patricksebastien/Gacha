@@ -59,7 +59,7 @@ from gacha_audio import (audio_apis, audio_devices, audio_status, PHRASE_BARS,
 from gacha_audioproc import AudioProxy, audio_host      # the engine, in its own process
 from gacha_takes import TakeStore
 from gacha_section import (EXTRA_KINDS, Material, cut_burst, render_section, render_oneshot,
-                           render_swell, KINDS, STEMS)
+                           render_swell, KINDS, STEMS, SHUFFLE_STEMS, SHUFFLE_ROLES)
 import gacha_engine as E
 from scipy.signal import resample_poly
 import threading
@@ -320,6 +320,10 @@ KEYMAP = [
     ("section", "stem_layers", "F2", "layers stem in/out"),
     ("section", "stem_chops", "F3", "chops stem in/out"),
     ("section", "stem_events", "F4", "events stem in/out"),
+    ("section", "shuffle_drums", "F5", "shuffle: the drums rendered again, the rest kept"),
+    ("section", "shuffle_layers", "F6", "shuffle: the layers rendered again, the rest kept"),
+    ("section", "shuffle_chops", "F7", "shuffle: the chops rendered again, the rest kept"),
+    ("section", "shuffle_events", "F8", "shuffle: the events rendered again, the rest kept"),
     # MIDI only from here on (no key): more buttons, then the knobs
     ("show", "randomize_fx", "", "new random effect strengths (the Randomize button)"),
     ("show", "grade_neutral", "", "source grade back to neutral"),
@@ -2082,6 +2086,8 @@ class Main(QMainWindow):
         self._perf_busy = None                      # ("section"|"shot", key) rendering now
         self._perf_result = None                    # set by the render thread
         self._perf_want = False                     # play the next result as soon as it lands
+        self._shuffle_queue = []                    # parts asked for a shuffle, in turn
+        self._shuffle_landing = []                  # parts handed to the player, not yet on the bar
         self._perf_playing = None                   # Section on the player
         self._perf_current = None                   # (Section, stems, sr): the last one played,
                                                     # what stop / Link start bring back
@@ -2311,6 +2317,7 @@ class Main(QMainWindow):
             self.actions[f"shader_{n}"] = lambda n=n: self.select_shader_key(n)
         for stem in STEMS:
             self.actions[f"stem_{stem}"] = self.perf_stems[stem].toggle
+            self.actions[f"shuffle_{stem}"] = lambda stem=stem: self.perform_shuffle(stem)
         for v in VOICES:
             self.actions[f"voice_{v}"] = self.perf_voices[v].toggle
             self.actions[f"solo_{v}"] = self.perf_solos[v].toggle
@@ -4963,7 +4970,9 @@ class Main(QMainWindow):
         form.addRow("Section", self._row([("", next_btn), ("", stop_btn), ("", event_btn)]))
         self.perf_stems = {}
         keys = {"drums": "F1", "layers": "F2", "chops": "F3", "events": "F4"}
+        shuffle_keys = {"drums": "F5", "layers": "F6", "chops": "F7", "events": "F8"}
         pairs = []
+        self.perf_shuffles = {}
         for stem in STEMS:
             cb = QCheckBox(f"{stem.upper()} ({keys[stem]})")
             cb.setStyleSheet("font-weight: bold;")
@@ -4971,6 +4980,17 @@ class Main(QMainWindow):
             cb.toggled.connect(lambda on, st=stem: self._perf_stem(st, on))
             self.perf_stems[stem] = cb
             pairs.append(("", cb))
+            sh = QPushButton(f"shuffle ({shuffle_keys[stem]})")
+            sh.setToolTip(
+                f"The {stem} of the section playing rendered again from the "
+                "material: a new sound in that part, the other three as they "
+                "are, bar for bar, and the loop where it is. Lands on the next "
+                "bar (a second to render). The sub bass follows the drums, the "
+                "layers and the chops. Stopped, the shuffle waits in the "
+                "section for the next start.")
+            sh.clicked.connect(lambda _=False, st=stem: self.perform_shuffle(st))
+            self.perf_shuffles[stem] = sh
+            pairs.append(("", sh))
         form.addRow("Stems", self._row(pairs))
         glitch_btn = QPushButton("glitch (G)")
         glitch_btn.setToolTip(
@@ -8539,6 +8559,7 @@ class Main(QMainWindow):
             kind = random.choice(KINDS) if kind_choice == "random" else kind_choice
             sec = render_section(mat, seed=random.randrange(1 << 30), bpm=key[2],
                                  bars=8, kind=kind, **(kw or {}))
+            sec.knobs, sec.kw, sec.mat_key = mat.k, dict(kw or {}), key[0]   # for a shuffle
             sr = self.through.sr if self.through is not None else 48000
             stems = {}
             for name, data in sec.stems.items():
@@ -8574,6 +8595,109 @@ class Main(QMainWindow):
             self._perf_result = ("shot", np.ascontiguousarray(clip.T.astype(np.float32)), shot)
         except Exception as e:                        # noqa: BLE001
             self._perf_result = ("error", f"one-shot failed: {e}")
+
+    def perform_shuffle(self, part):
+        """F5-F8 (or the button): `part` (drums, layers, chops, events)
+        of the current section rendered again from the material,
+        a new sound in that part, the other three untouched, the loop
+        where it is: on the next bar. The render takes a second, after
+        whatever renders now; several presses queue up, one of each
+        part (pressed again before it lands, the press is the same one)."""
+        if self.through is None or not self.through.running:
+            self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
+            return
+        if self._perf_current is None:
+            self.log.appendPlainText("shuffle: no section yet, press N for one")
+            return
+        busy = self._perf_busy
+        if part in self._shuffle_queue or (busy is not None and busy[0] == "shuffle"
+                                           and busy[1] == part):
+            return                                    # pressed twice: one new sound
+        self._shuffle_queue.append(part)
+        self._shuffle_kick()
+
+    def _shuffle_kick(self):
+        """The next shuffle asked, once the render thread is free."""
+        if not self._shuffle_queue or self._perf_busy is not None:
+            return
+        cur = self._perf_current
+        if cur is None:
+            self._shuffle_queue.clear()
+            return
+        part = self._shuffle_queue.pop(0)
+        sec, stems, _sr = cur
+        salts = dict(sec.salts)
+        salts[part] = salts.get(part, 0) + 1
+        force = set(sec.force) | {part}
+        mat_key = self._perf_material_key() or getattr(sec, "mat_key", None)
+        if mat_key is None:
+            self.log.appendPlainText("shuffle: no material (record a take, or tick samples or videos)")
+            return
+        self._perf_busy = ("shuffle", part)
+        threading.Thread(target=self._perf_render_shuffle,
+                         args=(mat_key, sec, stems, part, salts, force),
+                         daemon=True, name="gacha-render").start()
+        self.log.appendPlainText(f"shuffle {part}: rendering...")
+
+    def _perf_render_shuffle(self, mat_key, sec, stems, part, salts, force):
+        """Render thread: `sec` again with the same seed, kind, tempo,
+        knobs and shape, `part`'s salt moved on (and that part forced in),
+        then only that part's stems (SHUFFLE_STEMS: the sub with the drums,
+        the layers and the chops) into a copy of `stems` at the player's
+        rate, its events in place
+        of the old part's. Lands in _perf_result."""
+        try:
+            mat = self._perf_bank(mat_key)
+            mat.k = getattr(sec, "knobs", mat.k)
+            if not mat.ok:
+                self._perf_result = ("error", "no material with sound")
+                return
+            kw = dict(getattr(sec, "kw", {}))
+            if sec.kind == "intro" and sec.style:        # the shape pinned, not drawn again
+                kw["intro_style"] = sec.style
+            elif sec.kind == "outro" and sec.style:
+                kw["outro_style"] = sec.style
+            new = render_section(mat, seed=sec.seed, bpm=sec.bpm, bars=sec.bars, kind=sec.kind,
+                                 salts=salts, force=force, **kw)
+            sr = self.through.sr if self.through is not None else 48000
+            out = dict(stems)
+            for name in SHUFFLE_STEMS[part]:
+                d = new.stems[name]
+                d = d if sr == E.SR else resample_poly(d, sr // 300, E.SR // 300, axis=0)
+                out[name] = np.ascontiguousarray(d.T.astype(np.float32))
+            roles = set(SHUFFLE_ROLES[part])
+            events = sorted([e for e in sec.events if e[5] not in roles]
+                            + [e for e in new.events if e[5] in roles], key=lambda e: e[0])
+            self._perf_result = ("shuffle", part, sec, new, out, events, salts, force)
+        except Exception as e:                        # noqa: BLE001
+            self._perf_result = ("error", f"shuffle failed: {e}")
+
+    SHUFFLE_NOTES = {"drums": ("drums", "sub"), "layers": ("layer", "sub"),
+                     "chops": ("chops",), "events": ("event", "swell", "collage")}
+
+    def _perf_shuffled(self, part, sec, new, out, events, salts, force):
+        """A shuffle's render landed: into the section it was for, if that
+        is still the current one, and onto the player on the bar if it plays."""
+        cur = self._perf_current
+        if cur is None or cur[0] is not sec:
+            self.log.appendPlainText(f"shuffle {part}: the section moved on, dropped")
+            return
+        heads = self.SHUFFLE_NOTES[part]
+        own = lambda note: note.split(" ", 1)[0] in heads   # noqa: E731
+        sec.salts, sec.force, sec.events = salts, force, events
+        sec.notes = [n for n in sec.notes if not own(n)] + [n for n in new.notes if own(n)]
+        for name in SHUFFLE_STEMS[part]:
+            sec.stems[name] = new.stems[name]
+        self._perf_current = (sec, out, cur[2])
+        what = "; ".join(n for n in new.notes if own(n)) or "nothing in it"
+        la = self.through
+        pl = la.player if la is not None and la.running else None
+        if self._perf_playing is sec and pl is not None and pl.playing:
+            pl.replace(out, events)
+            self._shuffle_landing.append(part)
+            self.log.appendPlainText(f"shuffle {part}: {what}; on the bar")
+        else:
+            self.log.appendPlainText(f"shuffle {part}: {what}; with the next start")
 
     def _perf_start(self, what, key):
         if self._perf_busy is not None:
@@ -9235,6 +9359,9 @@ class Main(QMainWindow):
                     self._perf_start("section", key)  # pre-render the one after
                 else:
                     self._perf_ready = (key, sec, stems)
+            elif what == "shuffle":
+                self._perf_shuffled(*r[1:])
+            self._shuffle_kick()                       # a shuffle waiting its turn
         la = self.through
         pl = la.player if la is not None and la.running else None
         burst = self._burst_frame()
@@ -9298,6 +9425,11 @@ class Main(QMainWindow):
                 off -= bar_s
             if abs(off) > 0.002:
                 self.tempo.anchor += off
+        if pl.replaced:                                # the shuffles handed over landed, on the bar
+            pl.replaced = False
+            if self._shuffle_landing:                  # (the last carries the ones before it)
+                self.log.appendPlainText(f"shuffle {', '.join(self._shuffle_landing)}: in")
+                self._shuffle_landing = []
         if pl.dropped:                                 # a break ended here: the drop
             pl.dropped = False
             self._perf_drop_t = time.monotonic()
@@ -9310,7 +9442,9 @@ class Main(QMainWindow):
         pos = pl.pos_s()
         bar_pos = pos * pl.bpm / 60.0 / 4                # bars into the loop
         bar = int(bar_pos) + 1
-        ready = "next ready" if self._perf_ready else ("rendering next..." if self._perf_busy else "")
+        busy = self._perf_busy
+        ready = "next ready" if self._perf_ready else (
+            "" if not busy else f"shuffling {busy[1]}..." if busy[0] == "shuffle" else "rendering next...")
         if sec is None:                                # stop asked: it lands on the bar
             self.perf_status.setText("stopping on the bar...")
             big = "stopping on the bar..."

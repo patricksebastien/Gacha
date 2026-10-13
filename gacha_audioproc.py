@@ -105,6 +105,7 @@ SNAP_LA = [
     ((ATTR, "player"), (ATTR, "beat_frames")), ((ATTR, "player"), (ATTR, "fill_armed")),
     ((ATTR, "player"), (ATTR, "brake_bars")), ((ATTR, "player"), (ATTR, "swapped")),
     ((ATTR, "player"), (ATTR, "dropped")), ((ATTR, "player"), (ATTR, "locked")),
+    ((ATTR, "player"), (ATTR, "replaced")),
     ((ATTR, "player"), (ATTR, "speed_sync")), ((ATTR, "player"), (ATTR, "burst_fired")),
     ((ATTR, "player"), (ATTR, "gap")),
     ((ATTR, "player"), (ATTR, "head_state"), (CALL, None)),
@@ -130,6 +131,7 @@ SNAP_INSERT = [((ATTR, "name"),), ((ATTR, "path"),), ((ATTR, "on"),), ((ATTR, "e
 SYNC = {
     LA + ((ATTR, "player"), (ATTR, "fire")): 5.0,
     LA + ((ATTR, "player"), (ATTR, "queue")): 20.0,
+    LA + ((ATTR, "player"), (ATTR, "replace")): 20.0,
     LA + ((ATTR, "record_stop"),): 20.0,
     INSERTS + ((ATTR, "add"),): 120.0,
     INSERTS + ((ATTR, "remove"),): 10.0,

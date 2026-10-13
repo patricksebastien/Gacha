@@ -462,6 +462,9 @@ class SectionPlayer:
         self.burst_fired = None              # (number, monotonic start) of the last one out
         self.loop_t0 = None                  # monotonic time the loop last wrapped
         self.swapped = False                 # a pending section just went live
+        self._replace = None                 # (stems, events, table): the loop's stems anew, on the bar
+        self._bar_crossed = False            # the last block crossed a bar line
+        self.replaced = False                # a replace just landed (the GUI resets)
         self.beat_frames = 0
         self.fill_armed = None               # (kind, swell): a break asked, next beat
         self._fill = None                    # dict: the break playing, see _fill_start
@@ -1022,6 +1025,15 @@ class SectionPlayer:
         self._pend_covered = 0
         self.frag.prepare(stems)             # its stacked copy, here and not on the audio thread
 
+    def replace(self, stems, events):
+        """The playing section's stems and events anew, the loop where it
+        is: a shuffle (one part rendered again, the rest the same arrays).
+        Lands on the next bar line, a block late at most; the same length
+        as the loop or it is dropped. A section queued meanwhile wins, it
+        replaces everything anyway; a break waits it out."""
+        self._replace = (stems, events, drum_table(events, self.sr))
+        self.frag.prepare(stems)
+
     def waiting_for(self):
         """The bar time a queued section waits for, or None."""
         p = self.pending
@@ -1061,6 +1073,7 @@ class SectionPlayer:
 
     def _swap(self, now=None, bs=0):
         p, self.pending = self.pending, None
+        self._replace = None                      # for the section going, if any
         if p[0] == "clear":
             if self.stems is not None:
                 self.stopped = True
@@ -1189,6 +1202,14 @@ class SectionPlayer:
         self.grid_off = 0
         bar_f = 4 * self.beat_frames
         breaking = self.fill_armed or self._fill is not None
+        crossed, self._bar_crossed = self._bar_crossed, False
+        if self._replace is not None and self.stems is not None and crossed \
+                and not breaking and self.pending is None:
+            stems, events, table = self._replace
+            self._replace = None
+            if next(iter(stems.values())).shape[1] == self.n:
+                self.stems, self.events, self._ev = stems, events, table
+                self.replaced = True
         if self.pending is not None and (self.stems is None or (self.pos == 0 and not breaking)):
             wait = self.waiting_for()
             if wait is None or now + self.out_lat + bs / self.sr >= wait:   # a timed start: not yet
@@ -1265,10 +1286,12 @@ class SectionPlayer:
             if i0 + m >= self.n:                      # wrapped inside this block
                 self.loop_t0 += self.n / (self.sr * r)
             # a bar boundary inside this block: a pending section comes in
-            # at the next block (5 ms off at most), its position on the bar
-            if self.pending is not None and bar_f and not breaking \
-                    and (i0 // bar_f) != ((i0 + m) // bar_f):
-                self.pos, self._tfrac = 0, 0.0        # so the swap lands on the bar
+            # at the next block (5 ms off at most), its position on the bar;
+            # a replace too, the loop going on
+            if bar_f and (i0 // bar_f) != ((i0 + m) // bar_f):
+                self._bar_crossed = True
+                if self.pending is not None and not breaking:
+                    self.pos, self._tfrac = 0, 0.0    # so the swap lands on the bar
             on_beat = (i0 // self.beat_frames) != ((i0 + m) // self.beat_frames) \
                 if self.beat_frames else True
             # an armed break waits for the phrase's last bar, then starts on
@@ -1357,6 +1380,7 @@ class SectionPlayer:
         else:                                         # done: the drop
             self._fill = None
             self.pos = end % self.n
+            self._bar_crossed = True                  # the one: a replace lands here
             self._covered = self.pos + f["after"]
             if self.pending is not None:
                 self._swap()

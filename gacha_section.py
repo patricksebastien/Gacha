@@ -48,6 +48,15 @@ INTRO_STYLES = ("random", "ambient", "sparse", "none", "build", "drums-first",
 OUTRO_TAIL_MAX_BARS = 4        # the ring-out never takes more than half the loop
 STEMS = ("drums", "layers", "chops", "events")      # the live mix's channels (F1-F4)
 SECTION_STEMS = ("layers", "chops", "events") + VOICES   # what a section is rendered as
+# a shuffle (render_section's `salts`): the rendered stems and the event
+# roles each of the four parts owns; the sub goes with the drums (it sits
+# on the kicks), the layers (it takes their root) and the chops (its level
+# is set against their mix)
+SHUFFLE_STEMS = {"drums": VOICES, "layers": ("layers", "sub"),
+                 "chops": ("chops", "sub"), "events": ("events",)}
+SHUFFLE_ROLES = {"drums": ("kick", "snare", "hihat", "ohat", "ride", "glitch"),
+                 "layers": ("texture",), "chops": ("chop",),
+                 "events": ("oneshot", "swell", "collage")}
 
 
 class Material:
@@ -88,8 +97,10 @@ class Material:
 
 class Section:
     def __init__(self, kind, bpm, bars, seed, stems, events, notes, root=None,
-                 drum_style=None, style=None):
+                 drum_style=None, style=None, salts=None, force=()):
         self.kind, self.bpm, self.bars, self.seed = kind, bpm, bars, seed
+        self.salts = dict(salts or {})  # {stem: int}: each part's stream of chance (a shuffle)
+        self.force = set(force)         # the parts rendered whatever the kind (shuffled once)
         self.drum_style = drum_style    # the style the drums were patterned in
         self.style = style              # an intro's or an outro's style, else None
         self.stems = stems              # {stem: (n, 2) float32 @ SR}, all n equal (SECTION_STEMS)
@@ -131,16 +142,32 @@ def _loopify(x, n, fade_s=0.05):
 
 def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                    pan_layers=0.6, pan_events=0.5, drum_style="random",
-                   intro_style="ambient", outro_style="random"):
+                   intro_style="ambient", outro_style="random", salts=None, force=()):
     """One looping section as stems + events. `kind`: groove (full kit, one
     to three layers, maybe chops), break (one or two drum voices, more
     layers), build (voices stack up bar by bar), sparse (one voice, one
     layer), intro (the song intro of `intro_style`, see the module note),
-    outro (a groove ending in `outro_style`, silent by the last bar)."""
+    outro (a groove ending in `outro_style`, silent by the last bar).
+
+    The four parts (STEMS: the drums, the layers, the chops, the events)
+    are each drawn from their own stream of chance, seeded by `seed` and
+    the part's salt (`salts`, {stem: int}, 0 where not given); the shape
+    of the section (an intro's or an outro's style) from the seed alone.
+    So the section rendered again with one salt changed has that part
+    new and the other three the same: a shuffle. The sub follows the
+    drums (it sits on the kicks), the layers (it takes their root) and
+    the chops (its level is set against the mix of the three).
+    `force`: parts rendered even where the kind would leave them out
+    (chops outside a groove, layers or drums in an intro without them),
+    so a shuffle of a part always gives one to hear."""
     k = mat.k
-    rng = random.Random(seed)
+    salts = {s: int((salts or {}).get(s, 0)) for s in STEMS}
+    force = set(force)
+    rng = random.Random(seed)                         # the section's shape
+    rngs = {s: random.Random(f"{seed}:{s}:{salts[s]}") for s in STEMS}
+    rd, rl, rc, rx = (rngs[s] for s in STEMS)        # the drums', the layers', the chops', the events'
     if drum_style == "random" or drum_style not in E.DRUM_STYLES:
-        drum_style = rng.choice(E.DRUM_STYLES)
+        drum_style = rd.choice(E.DRUM_STYLES)
     intro_kind = intro_style if kind == "intro" and intro_style in INTRO_STYLES else None
     if intro_kind == "random":
         intro_kind = rng.choice(E.INTRO_STYLES)
@@ -170,26 +197,28 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
 
     gains = {"kick": k.gain_kick, "snare": k.gain_snare, "hihat": k.gain_hihat,
              "ohat": k.gain_ohat, "ride": k.gain_ride}
-    swing = (k.swing if k.swing is not None else rng.uniform(0.0, 0.06)) * step_len * SR
+    swing = (k.swing if k.swing is not None else rd.uniform(0.0, 0.06)) * step_len * SR
 
     # ---- drums ----
-    pats = {r: E.make_pattern(rng, r, drum_style) for r in ("kick", "snare", "hihat", "ride")}
-    pats["hihat"], pats["ohat"] = E.open_hat_pattern(rng, pats["hihat"], drum_style)
+    pats = {r: E.make_pattern(rd, r, drum_style) for r in ("kick", "snare", "hihat", "ride")}
+    pats["hihat"], pats["ohat"] = E.open_hat_pattern(rd, pats["hihat"], drum_style)
     active = ["kick", "snare", "hihat"]
     build_from = {}
     # an intro the songs drop the drums from: ambient now and then, the
     # swell and the collage always
-    drop_drums = (intro_kind == "ambient" and rng.random() < 0.6) \
+    drop_drums = (intro_kind == "ambient" and rd.random() < 0.6) \
         or intro_kind in ("reverse-swell", "collage")
     if drop_drums:
         active = []
     elif kind == "break":
-        active = rng.sample(active, rng.randint(1, 2))
+        active = rd.sample(active, rd.randint(1, 2))
     elif kind == "sparse" or intro_kind == "sparse":
-        active = [rng.choice(["hihat", "kick"])]
+        active = [rd.choice(["hihat", "kick"])]
     elif kind == "build" or intro_kind == "build":
         build_from = {"hihat": 0, "kick": max(1, bars // 3), "snare": max(2, (2 * bars) // 3)}
-    if kind in ("groove", "outro") and rng.random() < 0.35:
+    if not active and "drums" in force:               # shuffled into an intro without them
+        active = ["kick", "snare", "hihat"]
+    if kind in ("groove", "outro") and rd.random() < 0.35:
         active.append("ride")
     if "hihat" in active and kind != "sparse" and intro_kind != "sparse":
         active.append("ohat")
@@ -198,12 +227,12 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     kick_hits = []                                    # (pos, bar, step) for the sub
     for bi in range(bars):
         bar_start = int(bi * bar * SR)
-        bar_pats = {r: (E.mutate(rng, pats[r], k.mutation_amount)
-                        if rng.random() < k.mutation_chance else pats[r]) for r in active}
-        if bi == bars - 1 and rng.random() < 0.6 and "snare" in active:
+        bar_pats = {r: (E.mutate(rd, pats[r], k.mutation_amount)
+                        if rd.random() < k.mutation_chance else pats[r]) for r in active}
+        if bi == bars - 1 and rd.random() < 0.6 and "snare" in active:
             p = list(bar_pats["snare"])
             for s in range(12, 16):
-                p[s] = rng.uniform(0.5, 1.0)
+                p[s] = rd.uniform(0.5, 1.0)
             bar_pats["snare"] = p
         ohat_pat = bar_pats.get("ohat", [0.0] * 16)
         closed_pat = bar_pats.get("hihat", [0.0] * 16)
@@ -216,11 +245,11 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 pos = bar_start + int(s * step_len * SR)
                 if s % 2 == 1:
                     pos += int(swing)
-                pos += E.humanize_time(rng, k.humanize)
-                vel = E.humanize_vel(rng, vel, s, k.humanize)
+                pos += E.humanize_time(rd, k.humanize)
+                vel = E.humanize_vel(rd, vel, s, k.humanize)
                 if role == "kick":
                     kick_hits.append((max(0, pos), bi, s))
-                vi = rng.randrange(len(mat.kit[role]))
+                vi = rd.randrange(len(mat.kit[role]))
                 hit = E.pick_layer(mat.kit[role][vi], vel)
                 ksrc, onset = mat.kit_src[role][vi]
                 ev(pos, ksrc, onset, len(mat.kit[role][vi][1]), 1.0, role, vel)
@@ -228,15 +257,15 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                     nxt = next((t for t in range(s + 1, 16) if closed_pat[t] > 0), 16)
                     hit = E.choke(hit, int((nxt - s) * step_len * SR))
                 if role != "kick" and pan_drums > 0:
-                    hit = E.panned(hit, rng.uniform(-pan_drums, pan_drums))
+                    hit = E.panned(hit, rd.uniform(-pan_drums, pan_drums))
                 _place_wrap(stems[role], hit, max(0, pos), vel * gains[role])
-        if "hihat" in active and rng.random() < k.glitch_chance:
-            s = rng.randrange(16)
-            n_rep = rng.choice([6, 8, 12, 16])
-            spacing = max(1, int(step_len * SR / rng.choice([2, 3, 4, 6])))
-            vi = rng.randrange(len(mat.kit["hihat"]))
+        if "hihat" in active and rd.random() < k.glitch_chance:
+            s = rd.randrange(16)
+            n_rep = rd.choice([6, 8, 12, 16])
+            spacing = max(1, int(step_len * SR / rd.choice([2, 3, 4, 6])))
+            vi = rd.randrange(len(mat.kit["hihat"]))
             hit, gsrc = mat.kit["hihat"][vi][1], mat.kit_src["hihat"][vi]
-            ramp = rng.choice([-1, 1])
+            ramp = rd.choice([-1, 1])
             for i in range(n_rep):
                 t = i / max(1, n_rep - 1)
                 gv = 1.0 - 0.7 * (t if ramp < 0 else 1 - t)
@@ -251,7 +280,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     if intro_kind == "reverse-swell" and mat.names:
         # a long reversed sample crescendos straight into the loop's end:
         # the drop is the next section
-        src = rng.choice(mat.long_names or mat.names)
+        src = rx.choice(mat.long_names or mat.names)
         clip = mat.bank[src][::-1].copy()
         board = E.Pedalboard([
             E.Reverb(room_size=0.9, wet_level=0.5, dry_level=0.5, width=1.0),
@@ -273,20 +302,20 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         notes.append(f"swell <- {src}")
     elif intro_kind == "collage" and mat.names:
         # scattered one-shots: a field-recording scene, no beat
-        for _ in range(rng.randint(6, 12)):
-            src = rng.choice(mat.names)
-            cut = int(rng.uniform(0.5, 3.0) * SR)
-            clip = E.random_window(rng, mat.bank[src], cut, k.random_start == "all")
+        for _ in range(rx.randint(6, 12)):
+            src = rx.choice(mat.names)
+            cut = int(rx.uniform(0.5, 3.0) * SR)
+            clip = E.random_window(rx, mat.bank[src], cut, k.random_start == "all")
             c_off = len(mat.bank[src]) - len(clip)
             clip = clip[:cut].copy()
             c_dur = len(clip)
             clip = clip * E.envelope(len(clip), attack=0.02, decay_curve=1.5)
-            board, tail = E.random_texture_board(rng, beat, k.fx_min, k.fx_max, k.saturation)
+            board, tail = E.random_texture_board(rx, beat, k.fx_min, k.fx_max, k.saturation)
             clip = E.apply_fx(clip, board, tail=min(tail, 2.0))
             spread = max(pan_events, 0.6)
-            clip = E.panned(clip, rng.uniform(-spread, spread))
-            pos = rng.randint(0, max(1, n - len(clip)))
-            _place_wrap(stems["events"], clip, pos, rng.uniform(0.3, 0.5))
+            clip = E.panned(clip, rx.uniform(-spread, spread))
+            pos = rx.randint(0, max(1, n - len(clip)))
+            _place_wrap(stems["events"], clip, pos, rx.uniform(0.3, 0.5))
             ev(pos, src, c_off, c_dur, 1.0, "collage")
         notes.append("collage intro")
 
@@ -300,19 +329,21 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     elif kind in ("build", "sparse"):
         n_layers = 1
     else:
-        n_layers = rng.randint(k.layers_min, k.layers_max)
+        n_layers = rl.randint(k.layers_min, k.layers_max)
+    if "layers" in force:                             # shuffled into a section without them
+        n_layers = max(1, n_layers)
     for _ in range(n_layers if mat.names else 0):
-        src = rng.choice(mat.long_names or mat.names)
-        clip = E.random_window(rng, mat.bank[src], n, k.random_start == "all").copy()
+        src = rl.choice(mat.long_names or mat.names)
+        clip = E.random_window(rl, mat.bank[src], n, k.random_start == "all").copy()
         w_off, w_len = len(mat.bank[src]) - len(clip), len(clip)
         ops, rev, rate = [], False, 1.0
-        if rng.random() < k.reverse_chance:
+        if rl.random() < k.reverse_chance:
             clip = clip[::-1].copy(); ops.append("rev"); rev = True
-        if rng.random() < k.stretch_chance and len(clip) > SR:
+        if rl.random() < k.stretch_chance and len(clip) > SR:
             import librosa
             import warnings
             warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")   # librosa 1.0's own deprecations, inside phase_vocoder
-            n_target_bars = rng.choice([1, 2, 4])
+            n_target_bars = rl.choice([1, 2, 4])
             target = int(n_target_bars * bar * SR)
             chunk = clip[: min(len(clip), target * 2)]
             rate = len(chunk) / target
@@ -320,7 +351,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                            for c in range(2)], axis=1)
             clip = st.astype("float32"); ops.append(f"stretch{n_target_bars}bar")
         mat_n = len(clip)
-        board, tail = E.random_texture_board(rng, beat, k.fx_min, k.fx_max, k.saturation)
+        board, tail = E.random_texture_board(rl, beat, k.fx_min, k.fx_max, k.saturation)
         clip = E.apply_fx(clip, board, tail=tail)
         loop = _loopify(E.crossfade_loop(clip, n + int(0.1 * SR)), n)
         n_fade = min(int(0.05 * SR), len(clip) // 4)
@@ -330,24 +361,26 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
             ev(lp, src, w_off + w_len if rev else w_off, min(mat_n, n - lp),
                -rate if rev else rate, "texture")
             lp += step_n
-        lvl = rng.uniform(k.layer_level_min, k.layer_level_max) * (1.4 if kind == "break" else 1.0)
+        lvl = rl.uniform(k.layer_level_min, k.layer_level_max) * (1.4 if kind == "break" else 1.0)
         if pan_layers > 0:
-            loop = E.panned(loop, rng.uniform(-pan_layers, pan_layers))
+            loop = E.panned(loop, rl.uniform(-pan_layers, pan_layers))
         stems["layers"] += loop * lvl
         notes.append(f"layer <- {src} [{','.join(ops) or 'loop'}]")
 
     # ---- chops: slice a sample, replay on the grid (never in an intro) ----
-    if mat.names and (kind in ("groove", "outro") and rng.random() < k.chop_chance
-                      or kind == "break" and rng.random() < 0.5):
-        src = rng.choice(mat.names)
+    chop_roll = rc.random()                           # drawn either way: the stream stays in step
+    chops_in = (kind in ("groove", "outro") and chop_roll < k.chop_chance
+                or kind == "break" and chop_roll < 0.5)
+    if mat.names and (chops_in or "chops" in force):
+        src = rc.choice(mat.names)
         clip = mat.bank[src]
         n_slices = 8
         sl = max(1, len(clip) // n_slices)
         slices = [clip[i * sl:(i + 1) * sl] for i in range(n_slices)]
-        board, tail = E.random_texture_board(rng, beat, k.fx_min, k.fx_max, k.saturation)
+        board, tail = E.random_texture_board(rc, beat, k.fx_min, k.fx_max, k.saturation)
         tail = min(tail, 4 * beat)
-        chop_pat = [rng.randrange(n_slices) if rng.random() < 0.4 else None for _ in range(16)]
-        max_slice = int(step_len * SR * rng.choice([1, 2, 2, 4]))
+        chop_pat = [rc.randrange(n_slices) if rc.random() < 0.4 else None for _ in range(16)]
+        max_slice = int(step_len * SR * rc.choice([1, 2, 2, 4]))
         pieces = {}                                   # slice index -> processed piece
         for bi in range(bars):
             bar_start = int(bi * bar * SR)
@@ -357,14 +390,14 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 if idx not in pieces:
                     piece = slices[idx][:max_slice]
                     p_off, p_rate = idx * sl, 1.0
-                    if rng.random() < 0.2:
+                    if rc.random() < 0.2:
                         piece = piece[::-1]
                         p_off, p_rate = idx * sl + len(piece), -1.0
                     p_dur = len(piece)
                     piece = piece * E.envelope(len(piece), decay_curve=2.0)
                     piece = E.apply_fx(piece, board, tail=tail)
                     if pan_events > 0:
-                        piece = E.panned(piece, rng.uniform(-pan_events, pan_events))
+                        piece = E.panned(piece, rc.uniform(-pan_events, pan_events))
                     pieces[idx] = (piece, p_off, p_dur, p_rate)
                 piece, p_off, p_dur, p_rate = pieces[idx]
                 cpos = bar_start + int(s * step_len * SR)
@@ -373,9 +406,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         notes.append(f"chops <- {src}")
 
     # ---- events: a few one-shots scattered on the beat ----
-    for _ in range(rng.randint(1, 3) if mat.names else 0):
-        shot = render_oneshot(mat, rng.randrange(1 << 30), beat, pan_events)
-        pos = int(round(rng.uniform(0.0, bars * 4 - 1)) * beat * SR)
+    for _ in range(rx.randint(1, 3) if mat.names else 0):
+        shot = render_oneshot(mat, rx.randrange(1 << 30), beat, pan_events)
+        pos = int(round(rx.uniform(0.0, bars * 4 - 1)) * beat * SR)
         _place_wrap(stems["events"], shot["clip"], pos, shot["gain"])
         ev(pos, shot["src"], shot["off"], shot["dur"], shot["rate"], "oneshot")
         notes.append(f"event <- {shot['src']}")
@@ -459,19 +492,20 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         events = [e for e in events if e[0] * SR < body_n]
         notes.append(f"outro {style}: {body_n / SR / bar:.1f} bars then {tail_n / SR:.1f} s out")
 
+    kit = [v for v in VOICES if v != "sub"]
     for s in SECTION_STEMS:                          # headroom, no clipping
-        if s in VOICES:
+        if s in kit:
             continue
         peak = float(np.abs(stems[s]).max()) if stems[s].size else 0.0
         if peak > 0.98:
             stems[s] *= 0.98 / peak
-    peak = float(np.abs(drums_mix()).max()) if n else 0.0   # the kit as a whole, one scale
-    if peak > 0.98:
-        for v in VOICES:
+    peak = float(np.abs(sum(stems[v] for v in kit)).max()) if n else 0.0   # the kit, one scale
+    if peak > 0.98:                                  # (the sub apart: it follows the mix)
+        for v in kit:
             stems[v] *= 0.98 / peak
     events.sort(key=lambda e: e[0])
     return Section(kind, bpm, bars, seed, stems, events, notes, root=root,
-                   drum_style=drum_style, style=style)
+                   drum_style=drum_style, style=style, salts=salts, force=force)
 
 
 SECTION_ROOT_MAX_S = 8.0     # the chroma looks at this much of the layers at most
