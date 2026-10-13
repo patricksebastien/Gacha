@@ -39,19 +39,6 @@ plugins take well under a millisecond per block, and it survived a busy GUI
 thread with no drops (the interpreter's switch interval is shortened too,
 see _run()). Without an input the output's write paces the loop.
 
-The ring mode (LiveAudio(ring=N), the Settings tab's "ring" choice) takes
-Python off the driver's thread altogether: the stream is an rtmixer one
-(the sounddevice author's companion package), whose callback is C and only
-copies between the device and two lock-free ring buffers, and a Python
-thread of ours renders ahead into the output ring, keeping N blocks of
-lead, and reads the input from the other. A GIL wait then costs nothing
-until it exceeds the whole lead (the C callback never asks for the GIL),
-at the price of N blocks of extra output latency (2.7 ms per block at 128
-frames and 48 kHz), which the reported out_latency_ms includes so that
-Link bars and MIDI notes still land as heard. When the lead runs out the
-callback plays a hole and rtmixer drops the play action; the thread puts
-it back with a fresh lead and counts an underrun.
-
 Devices: everything PortAudio lists for the platform's host API (ALSA on
 Linux, WASAPI on Windows, CoreAudio on macOS). On Windows ASIO comes
 first (the sounddevice wheel ships an ASIO-enabled PortAudio, loaded when
@@ -126,11 +113,6 @@ try:
 except (ImportError, OSError) as e:        # no package, or no libportaudio
     sd = None
     SD_ERROR = str(e)
-try:                                       # the ring mode (see LiveAudio): a C
-    import rtmixer                         # callback on the same PortAudio, no
-except Exception:                          # Python on the driver's thread
-    rtmixer = None
-
 from gacha_frag import Fragments
 from gacha_freeze import Freeze
 from gacha_metro import Metronome, VEL as METRO_VEL
@@ -1540,13 +1522,9 @@ class LiveAudio:
     on, gain, mute, ab, beat_s, delay_ms; song and player have their own
     control methods."""
 
-    def __init__(self, in_name, out_name, block=256, sr=SR, exclusive=True, api=None,
-                 ring=0):
+    def __init__(self, in_name, out_name, block=256, sr=SR, exclusive=True, api=None):
         self.in_name, self.out_name = (in_name or None), out_name   # no input: output only
         self.block, self.sr = int(block), int(sr)
-        self.ring = max(0, int(ring))        # blocks of lead rendered ahead of a C callback
-                                             # (rtmixer); 0 = Python on the driver's thread
-        self._ring_note = ""                 # why the ring mode was not used, for the status
         self.exclusive = bool(exclusive)     # Windows: WASAPI exclusive first
         self.api = api                       # host API name, None = the best present
         self.mode = ""                       # how the devices were opened, for the status
@@ -1679,16 +1657,6 @@ class LiveAudio:
         blocking read/write layer, which timed out on real drivers (-9987),
         is not used. Other host APIs keep the blocking loop on a thread."""
         self._cb_stream = None
-        if self.ring > 0 and sd is not None:
-            if rtmixer is None:
-                self._ring_note = "ring off: pip install rtmixer"
-            else:
-                try:
-                    self._start_ring()
-                except Exception as e:
-                    self.error = self._explain(e)
-                self.ready.set()
-                return
         if sd is not None and self._api_name() == "ASIO":
             try:
                 src, snk = self._open(callback=True)
@@ -1713,124 +1681,6 @@ class LiveAudio:
         self._thread = threading.Thread(target=self._run, name="gacha-audio",
                                         daemon=True)
         self._thread.start()
-
-    def _start_ring(self):
-        """The ring mode (module note): an rtmixer stream, opened and started
-        here on the calling thread (ASIO wants that), its C callback fed from
-        and feeding two ring buffers, and our render thread behind them."""
-        st, _ = self._open(callback=True, ring=True)
-        self._dsp_init()
-        bs, L = self.block, self.ring
-        duplex = isinstance(st.channels, tuple)
-        ch_in = st.channels[0] if duplex else 0
-        lat = st.latency
-        out_lat = float(lat[1] if isinstance(lat, tuple) else lat)
-        # the start: the host fills its whole buffer in a burst of callbacks
-        # before the first period, so the silence to start on covers that
-        # and the lead; the render thread then holds the fill at the lead
-        # (it writes only while fewer than `ring` blocks are queued), and
-        # the extra drains away over the first few callbacks
-        prime = L + int(math.ceil(out_lat * self.sr / bs))
-        n = 1 << max(1, math.ceil(math.log2((prime + 2) * bs)))   # power of two frames
-        self._out_rb = rtmixer.RingBuffer(4 * 2, n)
-        self._in_rb = rtmixer.RingBuffer(4 * ch_in, n) if duplex else None
-        zero = np.zeros((bs, 2), np.float32)
-        for _ in range(prime):
-            self._out_rb.write(zero)
-        play = st.play_ringbuffer(self._out_rb)
-        rec = st.record_ringbuffer(self._in_rb) if duplex else None
-        self._old_switch = sys.getswitchinterval()   # the render thread is Python
-        sys.setswitchinterval(SWITCH_INTERVAL)       # too, and wants the GIL quickly
-        hints = power_hints(True)
-        st.start()
-        lead_s = L * bs / self.sr
-        self.out_latency_ms = 1000.0 * (out_lat + lead_s)
-        self.buffer_ms = 1000.0 * (float(sum(lat) if isinstance(lat, tuple) else lat) + lead_s)
-        self._cb_stream = st
-        self.mode += f" ring x{L}" + (f", {hints}" if hints else "")
-        self.running = True
-        self._thread = threading.Thread(target=self._run_ring, args=(st, play, rec),
-                                        name="gacha-ring", daemon=True)
-        self._thread.start()
-
-    def _run_ring(self, st, play, rec):
-        """The render thread of the ring mode: a block into the output ring
-        whenever fewer than `ring` blocks are queued there (the callback
-        drains one per driver buffer, so this paces at the driver's rate,
-        `ring` blocks ahead), the matching input block out of the input
-        ring. Behind by less than the lead, it catches up with rounds back
-        to back; behind by more, the callback has played a hole and dropped
-        the play action, and the thread starts again with a fresh lead."""
-        thread_no_throttle()
-        bs, sr, L = self.block, self.sr, self.ring
-        block_s = bs / sr
-        out_rb, in_rb = self._out_rb, self._in_rb
-        silence = np.zeros((2, bs), np.float32)
-        zero = np.zeros((bs, 2), np.float32)
-        ch_in = in_rb.elementsize // 4 if in_rb is not None else 0
-        inbuf = np.zeros((bs, ch_in), np.float32) if in_rb is not None else None
-        lead = L * bs                                 # frames queued ahead, held at this
-        wait_s = min(0.0005, block_s / 4)             # the poll while the lead is there
-        last = None
-        try:
-            while not self._stop.is_set():
-                if self.pro_audio != (self._mmcss is not None):   # the Settings tick, this thread
-                    self._mmcss = thread_pro_audio(self.pro_audio, self._mmcss)
-                # the actions: rtmixer drops the play action when the ring
-                # ran dry (the driver played a hole) and the record action
-                # when the input ring filled up; put them back
-                if play not in st.actions:
-                    self.underruns += 1
-                    for _ in range(L):
-                        out_rb.write(zero)
-                    play = st.play_ringbuffer(out_rb)
-                    if in_rb is not None:
-                        # the input that piled up during the stall would stay
-                        # as that much extra in-to-out delay: let it go, the
-                        # path is the lead again
-                        extra = in_rb.read_available - bs
-                        if extra > 0:
-                            in_rb.advance_read_index(extra)
-                            self.dropped += 1
-                if rec is not None and rec not in st.actions:
-                    self.dropped += 1
-                    in_rb.flush()                     # no one writes it while the action is gone
-                    rec = st.record_ringbuffer(in_rb)
-                while out_rb.read_available >= lead:  # the lead is there: wait for a drain
-                    if self._stop.is_set():
-                        return
-                    time.sleep(wait_s)
-                now = time.monotonic()
-                t0 = time.perf_counter()
-                if last is not None:                  # the cadence of our own rounds
-                    gap = t0 - last
-                    self.gap_ms = max(1000.0 * gap, self.gap_ms * (1.0 - 2.0 * block_s))
-                last = t0
-                # late: the ring was empty when we got here, so the next
-                # callback was one wait away from a hole (with a lead of 2
-                # or more; at 1 every round finds it empty). Means nothing
-                # on a host that calls in bursts (WASAPI shared, 10 ms
-                # periods): there the lead must cover a period
-                if L >= 2 and out_rb.read_available < bs:
-                    self.late += 1
-                x = silence
-                if in_rb is not None and in_rb.read_available >= bs:
-                    # the input a block at a time, in step with the output
-                    # (the callback moves both at once; a lag within the
-                    # lead is caught up round by round)
-                    in_rb.readinto(inbuf)
-                    x = inbuf.T if ch_in == 2 else np.repeat(inbuf.T, 2, axis=0)
-                    x = np.ascontiguousarray(x, dtype=np.float32)
-                y = self._dsp_block(x, now)
-                out_rb.write(np.ascontiguousarray(y.T))
-                r = (time.perf_counter() - t0) / block_s
-                self.load = 0.9 * self.load + 0.1 * r
-                self.peak = max(r, self.peak * (1.0 - 4.0 * block_s))   # ~1/e in 250 ms
-                self.rounds += 1
-        except Exception as e:
-            self.error = f"audio ring thread: {e}"
-        finally:
-            self._mmcss = thread_pro_audio(False, self._mmcss)
 
     def _cb_duplex(self, indata, outdata, frames, _time, status):
         self._cb_process(indata, outdata, frames, status)
@@ -1928,8 +1778,6 @@ class LiveAudio:
 
     def stop(self):
         self._stop.set()
-        if self._thread is not None and self._thread.name == "gacha-ring":
-            self._thread.join(3.0)                   # it reads the stream's queues
         st = getattr(self, "_cb_stream", None)
         if st is not None:                           # ASIO: same thread as start()
             self._cb_stream = None
@@ -2015,11 +1863,10 @@ class LiveAudio:
         ms = min(MAX_DELAY_MS, max(0.0, float(self.delay_ms)))
         return int(round(ms / 1000.0 * self.sr))
 
-    def _open(self, callback=False, ring=False):
+    def _open(self, callback=False):
         """(src, snk): two blocking streams, or one duplex stream on ASIO
-        (src is snk then), with our callbacks attached when `callback`; an
-        rtmixer stream (src is snk) when `ring`. Raises with every mode's
-        error when none opens."""
+        (src is snk then), with our callbacks attached when `callback`.
+        Raises with every mode's error when none opens."""
         if sd is None:
             raise RuntimeError("sounddevice/PortAudio missing: pip install sounddevice "
                                f"(Linux: apt install libportaudio2) [{SD_ERROR}]")
@@ -2052,10 +1899,8 @@ class LiveAudio:
                     if sr != self.sr:
                         self._set_sr(sr)
                     src, snk = self._open_streams(extra, duplex=(api_name == "ASIO"),
-                                                  callback=callback, ring=ring)
+                                                  callback=callback)
                     self.mode = f"{label} @ {sr} Hz"
-                    if self._ring_note:
-                        self.mode += f" ({self._ring_note})"
                     if sr != asked:
                         self.mode += f" (the device's own, {asked} refused)"
                     if errors:
@@ -2065,7 +1910,7 @@ class LiveAudio:
                     errors.append(f"{label} {sr} Hz: {str(e).strip()[:90]}")
         raise RuntimeError("; ".join(errors))
 
-    def _open_streams(self, extra, duplex=False, callback=False, ring=False):
+    def _open_streams(self, extra, duplex=False, callback=False):
         # two blocks of device buffer for the blocking loop; on ASIO the
         # suggested latency becomes the driver's buffer size, so one block
         # there, or the control panel shows twice what was asked
@@ -2074,16 +1919,6 @@ class LiveAudio:
         # size; in blocking mode on ASIO the driver's size is taken as is
         bs = 0 if (duplex and not callback) else self.block
         j, _d = _device_index(self.out_name, "output", self.api)
-        if ring:                                       # rtmixer: one stream, a C callback
-            if self.in_name:
-                i, d = _device_index(self.in_name, "input", self.api)
-                st = rtmixer.MixerAndRecorder(device=(i, j), samplerate=self.sr, blocksize=bs,
-                                              channels=(min(2, int(d["max_input_channels"])), 2),
-                                              latency=lat, extra_settings=extra)
-            else:
-                st = rtmixer.Mixer(device=j, samplerate=self.sr, blocksize=bs, channels=2,
-                                   latency=lat, extra_settings=extra)
-            return st, st
         if duplex and self.in_name:                    # ASIO: one stream, in and out
             i, d = _device_index(self.in_name, "input", self.api)
             st = sd.Stream(device=(i, j), samplerate=self.sr, blocksize=bs,

@@ -5,8 +5,8 @@ gacha_audioproc.py — the audio engine in a process of its own.
 Why: the audio thread needs the interpreter's lock (the GIL) for every
 block, and in the app's process the GUI holds it for 10 to 40 ms at a time
 (a section change, a video opening, a busy repaint), which at 256 frames
-is a hole in the sound, counted as an underrun by the ring mode of
-gacha_audio. A process has a GIL of its own, so the engine (gacha_audio.
+is a hole in the sound, heard as crackle. A process has a GIL of its own,
+so the engine (gacha_audio.
 LiveAudio with its players, racks, freeze, metronome and the VST inserts)
 runs here, in a bare process with nothing else in it, and the GUI keeps
 holding its own lock for as long as it likes. This is how DAWs are built.
@@ -199,12 +199,11 @@ class AudioProxy(RemoteNode):
     """LiveAudio's stand-in: the same constructor, start(), stop() and
     names; the engine process does the work."""
 
-    def __init__(self, in_name, out_name, block=256, sr=48000, exclusive=True, api=None,
-                 ring=0):
+    def __init__(self, in_name, out_name, block=256, sr=48000, exclusive=True, api=None):
         host = audio_host()
         super().__init__(host, LA)
         kw = dict(in_name=(in_name or None), out_name=out_name, block=int(block), sr=int(sr),
-                  exclusive=bool(exclusive), api=api, ring=int(ring))
+                  exclusive=bool(exclusive), api=api)
         host.new_engine(kw)                   # built there, the stream not yet open
 
     def __setattr__(self, name, value):

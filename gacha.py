@@ -2525,11 +2525,6 @@ class Main(QMainWindow):
             self.through_sr.blockSignals(True)
             self.through_sr.setCurrentText(str(sr))
             self.through_sr.blockSignals(False)
-        ring = self.settings.value("audio/ring", 0, type=int)
-        if self.through_ring.findData(ring) >= 0:
-            self.through_ring.blockSignals(True)
-            self.through_ring.setCurrentIndex(self.through_ring.findData(ring))
-            self.through_ring.blockSignals(False)
         for cb, key in ((self.audio_pro, "audio/pro_audio"), (self.audio_high, "audio/high_priority"),
                         (self.audio_gc, "audio/gc_off")):
             cb.blockSignals(True)
@@ -6745,26 +6740,6 @@ class Main(QMainWindow):
             "rate the interface runs at (an ASIO driver's panel, or Windows' "
             "device format in shared mode); a device that refuses the rate falls "
             "back to its own, and the status line says which is in use. Remembered.")
-        self.through_ring = QComboBox()
-        self.through_ring.addItem("ring off", 0)
-        for n in (1, 2, 3, 4, 5, 6, 8):
-            self.through_ring.addItem(f"ring {n}", n)
-        self.through_ring.setToolTip(
-            "Python off the driver's thread: with a ring of N, the stream's callback "
-            "is C (the rtmixer package) and only copies between the device and two "
-            "ring buffers, while a thread of ours renders N blocks ahead into one and "
-            "reads the input from the other. A wait for the engine's interpreter "
-            "lock then costs nothing until it outlasts the whole lead: a margin on "
-            "top of the engine running in its own process, which is what cured the "
-            "crackle at 128; the price is N blocks of added output latency (2.7 ms "
-            "per block at 128 frames, 48 kHz), which the Link bars and the MIDI "
-            "out's lead already account for. Off = the usual way, Python in the "
-            "driver's callback. The lead must cover what the driver "
-            "takes per call: on ASIO that is one block, so start with 2; WASAPI "
-            "shared takes 10 ms at a time, 4 blocks at 128 (ring 5) or 2 at 256 "
-            "(ring 3), and a lead short of that underruns every period. Needs "
-            "pip install rtmixer; without it the stream opens the usual way and the "
-            "status line says so. Remembered.")
         self.through_excl = QCheckBox("exclusive")
         self.through_excl.setChecked(True)
         self.through_excl.setToolTip(
@@ -6796,8 +6771,7 @@ class Main(QMainWindow):
         self.through_sync.valueChanged.connect(self._through_sync_changed)
         self.through_status = QLabel("")
         self.through_status.setProperty("role", "sub")
-        for combo in (self.through_out, self.through_in, self.through_block, self.through_sr,
-                      self.through_ring):
+        for combo in (self.through_out, self.through_in, self.through_block, self.through_sr):
             combo.currentIndexChanged.connect(self._io_changed)
         self.video_in = QComboBox()
         self.video_in.setToolTip(
@@ -6870,16 +6844,15 @@ class Main(QMainWindow):
                                               ("device", self.through_out),
                                               ("block", self.through_block),
                                               ("rate", self.through_sr),
-                                              ("", self.through_excl),
-                                              ("", self.through_ring)]))
+                                              ("", self.through_excl)]))
         form.addRow("", self.through_status)
         # the scheduling DAWs give themselves, each a tick, remembered,
         # applied live to the engine process (gacha_audioproc: its
         # set_process_priority and gc, gacha_audio.thread_pro_audio)
         self.audio_pro = QCheckBox("Pro Audio (MMCSS) on the audio thread")
         self.audio_pro.setToolTip(
-            "Windows: the engine's audio thread (the driver's, or with a ring on, "
-            "its render thread) joins the MMCSS \"Pro Audio\" class, the scheduling "
+            "Windows: the engine's audio thread (the driver's) joins the MMCSS "
+            "\"Pro Audio\" class, the scheduling "
             "DAWs give their audio threads, so the desktop's work waits for it and "
             "not the other way round. Takes effect on the next block. Remembered.")
         self.audio_high = QCheckBox("high process priority")
@@ -9997,7 +9970,6 @@ class Main(QMainWindow):
         self.settings.setValue("audio/in", self.through_in.currentData() or "")
         self.settings.setValue("audio/block", self.through_block.currentText())
         self.settings.setValue("audio/sr", self.through_sr.currentText())
-        self.settings.setValue("audio/ring", int(self.through_ring.currentData() or 0))
         self.settings.setValue("audio/live_in", self.through_on.isChecked())
         self.settings.setValue("audio/exclusive", self.through_excl.isChecked())
         if self.through is not None:
@@ -10018,8 +9990,7 @@ class Main(QMainWindow):
         self.through = AudioProxy(in_name or None, out_name, int(self.through_block.currentText()),
                                  sr=int(self.through_sr.currentText()),
                                  exclusive=self.through_excl.isChecked(),
-                                 api=self.through_api.currentText() or None,
-                                 ring=int(self.through_ring.currentData() or 0))
+                                 api=self.through_api.currentText() or None)
         self.through.gain = self.vol.value() / 100
         self.through.freeze.held = bool(self._freeze_sources)
         self.through.delay_ms = self.through_sync.value()
@@ -10038,9 +10009,8 @@ class Main(QMainWindow):
         self._through_error = None
         self._through_timer.start(20)
         src = self.through_in.currentText() if in_name else "output only"
-        ring = f", ring of {self.through.ring}" if self.through.ring else ""
         self.log.appendPlainText(f"audio: {src} -> {self.through_out.currentText()}, "
-                                 f"{self.through.block} frames at {self.through.sr} Hz{ring}")
+                                 f"{self.through.block} frames at {self.through.sr} Hz")
         if self.live_on.isChecked():                 # the analysis follows the input
             if in_name:
                 self.live.start_external(self.through_in.currentText(), self.through.sr)
