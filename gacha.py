@@ -251,14 +251,6 @@ VIDEO_EFFECTS = [
     ("edges", "edges", 0.3, "Edge detection, blended in"),
     ("lines", "scanlines", 0.4, "CRT scanlines"),
     ("grain", "grain", 0.3, "Film grain"),
-    ("gran", "granular", 0.5, "Granular picture: while a fragment sounds (Perform "
-                              "tab) the frame is the slice and every grain is a lit "
-                              "band at its spot, as wide as the grain, swelling and "
-                              "fading with it, a playhead line crossing it (backwards "
-                              "for a reversed grain); the motion scatters the bands, "
-                              "the size widens them, a frozen playhead holds the "
-                              "frame. With none sounding, bands on the Fragments "
-                              "rows' settings alone"),
     ("zoom", "zoom", 0.5, "Zoom punches in with the loudness"),
     ("trails", "trails", 0.4, "Motion trails: bright parts linger"),
     ("glitch", "glitch", 0.4, "Horizontal glitch tears, more when loud. Per "
@@ -731,8 +723,6 @@ BRAKE_LENS = [("1/4", 0.25), ("1/2", 0.5), ("1 bar", 1.0), ("2 bars", 2.0), ("4 
 BRAKE_DEFAULT = "1 bar"
 PITCH_MODES = ["follows", "locked"]
 NUDGE_DEFAULT = 4                 # percent
-GRAN_VIEW_S = 1.25                # the granular picture, idle: seconds across the frame
-GRAN_HEADS = 16                   # bands drawn at the most
 FRAG_DEFAULTS = {"div": 16, "size": "1/16", "rate": "dense", "motion": 100, "pitch": 0,
                  "speed": 100, "repeats": 1, "shape": 50, "dir": "forward", "play": "loop",
                  "a": 5, "d": 200, "s": 100, "r": 250}
@@ -940,7 +930,7 @@ REVERSE_LENGTHS = {"1/8 bar": 1 / 8, "1/4 bar": 1 / 4, "1/2 bar": 1 / 2,
                    "1 bar": 1.0, "2 bars": 2.0, "random": None}
 
 LOOK_EXEMPT = {"color", "pump", "flash", "pixel", "kaleido", "reverse",
-               "clean", "gran"}
+               "clean"}
 
 
 class VideoFX:
@@ -974,27 +964,6 @@ class VideoFX:
             sy = np.clip(np.rint(cy + r * np.sin(t)), 0, h - 1).astype(np.intp)
             self._kmaps[key] = (sy, sx)
         return self._kmaps[key]
-
-    def granulate(self, px, gr):
-        """The granular picture: the frame is the buffer (now at its right
-        edge) and every grain a band at its spot, as wide as the grain,
-        lifted by its window with soft edges, a bright playhead line where
-        it reads; outside the bands the frame darkens a little."""
-        h, w = px.shape[:2]
-        amt = gr["amt"]
-        x = (np.arange(w) + 0.5) / w
-        lit = np.zeros(w, "float32")
-        line = np.zeros(w, "float32")
-        for x0, bw, hx, l in gr.get("heads", []):
-            if bw <= 0:
-                continue
-            e = max(1.5 / w, 0.08 * bw)                 # the edge's softness
-            inside = np.clip((x - x0) / e, 0, 1) * np.clip((x0 + bw - x) / e, 0, 1)
-            lit = np.maximum(lit, inside * l)
-            line = np.maximum(line, np.clip(1.0 - np.abs(x - hx) * w / 1.5, 0, 1) * inside)
-        gain = 1.0 - 0.3 * amt + 0.6 * amt * lit
-        out = px * gain[None, :, None] + (40.0 * amt * lit)[None, :, None]
-        return out * (1 - line[None, :, None] * amt) + (255.0 - out) * (line[None, :, None] * amt)
 
     def vignette(self, h, w):
         if self._vig is None or self._vig.shape != (h, w):
@@ -1033,9 +1002,6 @@ class VideoFX:
         if p > 1:
             blocks = px[::p, ::p]
             px = np.repeat(np.repeat(blocks, p, axis=0), p, axis=1)[:h, :w]
-        gr = g("gran")                        # the granular picture
-        if gr:
-            px = self.granulate(px, gr)
         gl = g("glitch", 0.0)
         if gl > 0 and rng.random() < gl:
             hmin, hmax = GLITCH_MODES[int(g("glitch_mode", 2))]
@@ -2165,8 +2131,6 @@ class Main(QMainWindow):
         self._burst = None                          # (t0, until, take, off): a burst's picture
         self._perf_hold = None                      # the last take frame shown: held over gaps
         self._head_tape = False
-        self._gran_clock = 0.0                 # the granular picture's grain clock
-        self._gran_t = None                     # a file tape slowed under the section's head
         self._perf_drop_t = None                    # monotonic time a break dropped into a section
         self._perf_ready = None                     # (key, Section, stems48) pre-rendered
         self._perf_key_last, self._perf_key_t = None, 0.0   # the knobs' last change, see _perf_refresh_ready
@@ -5716,7 +5680,7 @@ class Main(QMainWindow):
         rows = [("Color", ("color", "tint", "pump", "flash")),
                 ("Pixels", ("pixel", "bits", "dither")),
                 ("Tone", ("mono", "solar", "edges", "lines")),
-                ("Grain", ("grain", "gran")),
+                ("Grain", ("grain",)),
                 ("Motion", ("zoom", "trails", "glitch", "rgb", "reverse")),
                 ("Frame", ("vign", "kaleido", "clean"))]
         labels = {k: lbl for k, lbl, _, _ in VIDEO_EFFECTS}
@@ -9692,14 +9656,6 @@ class Main(QMainWindow):
         if la is not None:
             la.freeze.held = held
 
-    def _freeze_state(self):
-        """The master freeze sounding, for the picture (see
-        gacha_freeze.Freeze.state), or None."""
-        la = self.through
-        if la is None or not la.running or not la.freeze.active:
-            return None
-        return la.freeze.state()
-
     def _frag_hold(self, key, source, on):
         """Slice `key` (1..32, or 0 for the slice under the playhead) held
         (`on`) or let go by `source`: "key", "midi" or "ui". The voice
@@ -9759,52 +9715,6 @@ class Main(QMainWindow):
         if fs["voices"] > 1:
             parts.append(f"{fs['voices']} voices")
         return " · ".join(parts)
-
-    def _gran_state(self):
-        """The fragments sounding, for the picture, or None."""
-        pl = self._player()
-        return pl.frag_state() if pl is not None else None
-
-    def _gran_heads(self, gs, size):
-        """The bands of the granular picture: (left edge, width, playhead,
-        lit), all as fractions of the frame's width. A fragment's own
-        grains when one sounds, the frame being its slice; else a few
-        made up on the Fragments rows' settings, cycling on the grain
-        clock over GRAN_VIEW_S seconds, so the picture shows what the rows
-        would do."""
-        heads = []
-        if gs is not None:
-            for x0, w, ph, rev in gs["heads"][:GRAN_HEADS]:
-                x0 = min(x0, 1.0 - w)
-                hx = x0 + (1.0 - ph if rev else ph) * w
-                lit = 0.5 - 0.5 * math.cos(2 * math.pi * ph)
-                heads.append((x0, w, hx, lit))
-            return heads
-        spread = min(1.0, self.frag_motion.value() / 400.0)
-        for i in range(5):
-            life = self._gran_clock + ((i * 0.618) % 1.0)
-            gen = math.floor(life)
-            ph = life - gen
-            h = lambda k: (math.sin(i * 127.1 + gen * 7.13 + k * 311.7) * 43758.5453) % 1.0
-            pos = size + 0.005 + h(1) * spread
-            rev = spread > 0.5 and h(2) < spread - 0.5
-            x0 = 1.0 - pos / GRAN_VIEW_S
-            w = size / GRAN_VIEW_S
-            hx = x0 + (1.0 - ph if rev else ph) * w
-            heads.append((x0, w, hx, 0.5 - 0.5 * math.cos(2 * math.pi * ph)))
-        return heads
-
-    def _freeze_heads(self, fz):
-        """The granular picture's bands for the master freeze: its grains
-        over the last GRAN_VIEW_S seconds of the mix, the frozen spot near
-        the right edge (see _gran_heads)."""
-        heads = []
-        for back, length, ph, rev in fz["heads"][:GRAN_HEADS]:
-            w = length / GRAN_VIEW_S
-            x0 = min(1.0 - w, max(0.0, 1.0 - back / GRAN_VIEW_S))
-            hx = x0 + (1.0 - ph if rev else ph) * w
-            heads.append((x0, w, hx, 0.5 - 0.5 * math.cos(2 * math.pi * ph)))
-        return heads
 
     def _speed_note(self, pl):
         """The speed for the status: '' or ' · half time', ' · tape stop
@@ -11027,25 +10937,6 @@ class Main(QMainWindow):
                         if 0 <= left < length:
                             st["reverse"] = 1.0 + 2.0 * (1 - left / length)
                             st.pop("speed", None)   # the swell wins over the timeline
-        if v["gran"]:
-            # the granular picture: the frame in grains the size of the
-            # sound's, on the row's settings, lit by the loudest cloud
-            # sounding (alone at the knob's strength with none), its clock
-            # one grain per grain length, the frame held while frozen
-            gs = self._gran_state()
-            fz = self._freeze_state() if gs is None else None   # the master freeze's grains
-            size = max(0.005, FRAGMENTS["size"] * 4 * beat_ms / 1000.0)
-            tnow = time.monotonic()
-            if self._gran_t is not None:
-                self._gran_clock += max(0.0, min(0.2, tnow - self._gran_t)) / size
-            self._gran_t = tnow
-            loud = gs or fz
-            amt = v["gran"] * ((0.6 + 0.4 * loud["level"]) if loud else 0.7)
-            frozen = gs is not None and gs["speed"] == 0.0
-            st["gran"] = {"amt": min(1.0, amt), "freeze": frozen or fz is not None,
-                          "heads": self._freeze_heads(fz) if fz else self._gran_heads(gs, size)}
-            if frozen:
-                st["freeze"] = True
         if self._freeze_sources:                     # the freeze: the picture on its frame
             st["freeze"] = True
         if self.video_plain.isChecked() or (self._clean_on and in_bar < beat_ms / 4):

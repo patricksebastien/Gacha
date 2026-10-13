@@ -63,7 +63,7 @@ BLEND_MODES = ["mix", "add", "screen"]
 # and clean are not pictures and have no place); each one either keeps to
 # the canvas or works over the whole screen, the background included
 KEEP_FX = ["color", "tint", "pump", "flash", "pixel", "bits", "dither", "mono", "solar",
-           "edges", "lines", "grain", "gran", "zoom", "trails", "glitch", "rgb", "vign",
+           "edges", "lines", "grain", "zoom", "trails", "glitch", "rgb", "vign",
            "kaleido"]
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 CANVAS_FITS = ["fill", "fit"]
@@ -236,9 +236,6 @@ uniform float uBrightness, uSaturation, uHue, uTintHue, uTintAmt, uInvert;
 uniform float uBits, uDither, uMonoTones, uMonoThr, uSolar, uEdges, uScan;
 uniform float uGrain, uVign, uPixel, uRgbShift, uGlitch, uGlitchMode, uTrails, uZoom;
 uniform float uKaleido, uRepeat, uRepeatK, uRepeatFrac, uSwell;
-uniform float uGran;           // the granular picture: strength, and its bands
-uniform int uGranN;            // (left edge, width, playhead x, lit), fractions of the width
-uniform vec4 uGranHeads[16];
 // source grade (colour correction of the picture itself, before any effect)
 uniform float uGExposure, uGBlack, uGGamma, uGContrast, uGSat, uGWarm, uGTint, uGSharpen;
 uniform float uAB;             // 0 = the live picture, 1 = the take frame
@@ -431,28 +428,6 @@ void main() {
                        lay(bgc(s + d), pic(z + dz), inside(z + dz)).b);
         }
     } else col = lay(bgc(s), pic(z), ins);
-    if (uGran > 0.0) {
-        // the granular picture: the frame is the buffer, now at its right
-        // edge, and every grain a band at its spot, as wide as the grain,
-        // lifted by its window with soft edges, a bright playhead line where
-        // it reads; outside the bands the frame darkens a little
-        bool kp = keep(K_GRAN);
-        float x = kp ? z0.x : vUV.x;
-        float lit = 0.0, line = 0.0;
-        float px1 = 1.5 / uRes.x * (kp ? uZoneK.x : 1.0);
-        for (int i = 0; i < 16; i++) {
-            if (i >= uGranN) break;
-            vec4 hd = uGranHeads[i];
-            if (hd.y <= 0.0) continue;
-            float e = max(px1, 0.08 * hd.y);
-            float in_ = clamp((x - hd.x) / e, 0.0, 1.0) * clamp((hd.x + hd.y - x) / e, 0.0, 1.0);
-            lit = max(lit, in_ * hd.w);
-            line = max(line, clamp(1.0 - abs(x - hd.z) / px1, 0.0, 1.0) * in_);
-        }
-        vec3 e = col * (1.0 - 0.3 * uGran + 0.6 * uGran * lit) + 0.16 * uGran * lit;
-        e = mix(e, 1.0 - e, line * uGran);
-        col = ap(K_GRAN, col, e, ins);
-    }
     if (uEdges > 0.0) {
         float gx, gy;
         if (keep(K_EDGES)) {
@@ -1274,9 +1249,3 @@ class GLBackdrop(QOpenGLWidget):
         f("uRepeatK", float(rpt[0]) if rpt else 0.0)
         f("uRepeatFrac", float(rpt[1]) if rpt else 0.0)
         f("uSwell", float(g("swell", 0.0)))
-        gr = g("gran")
-        f("uGran", float(gr["amt"]) if gr else 0.0)
-        heads = (gr.get("heads") or [])[:16] if gr else []
-        p.setUniformValue1i("uGranN", len(heads))
-        for i, (x0, w, hx, lit) in enumerate(heads):
-            p.setUniformValue(f"uGranHeads[{i}]", float(x0), float(w), float(hx), float(lit))
