@@ -587,6 +587,7 @@ class GLBackdrop(QOpenGLWidget):
         self.input2 = None               # its device string while it is on
         self._input2_opts = None
         self.enabled = True              # False: no decoding, no repaint, a black widget
+        self.detached = False            # in a window of its own: no interface over it, no scrim
         self.second_on_b = False         # the second input is the B layer, in place of the take frames
         self._src_error2 = None
         self.videos_fn, self.default_video = videos_fn, default_video
@@ -817,6 +818,14 @@ class GLBackdrop(QOpenGLWidget):
         self._has_prev = False
         self._fbo_size = None
         self._gl_ok = True
+        # a second init (the widget moved to another window gets a new
+        # context): the shaders compiled for the old one went with it, the
+        # textures are uploaded again from the next frames
+        self._gen_cache = {}
+        self._gen_prog = None
+        self._gen_pending = self.shader_path or None
+        self._prewarm = list(shader_files())
+        self._shown = self._shown_ov = self._shown_bg = None
         ctx.aboutToBeDestroyed.connect(self._cleanup_gl)
 
     def _cleanup_gl(self):
@@ -1166,7 +1175,8 @@ class GLBackdrop(QOpenGLWidget):
         c.setUniformValue("uRes", QVector2D(W, H))
         c.setUniformValue1f("uOpacity", opacity)
         c.setUniformValue1f("uBlend", float(self.shader_blend))
-        c.setUniformValue1f("uScrim", 1.0 if self.child.isVisible() else 0.0)
+        c.setUniformValue1f("uScrim", 1.0 if (self.child.isVisible() and not self.detached)
+                            else 0.0)
         self._draw()
         self._has_prev = True
         self._ping = prev

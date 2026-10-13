@@ -314,7 +314,8 @@ CANVAS_KNOBS = [
 # the keyboard shortcuts and the MIDI bindings hang on the same ids.
 # (group, id, key, what); "" for key = MIDI only (a continuous control)
 KEYMAP = [
-    ("show", "fullscreen", "F11", "fullscreen on/off; Esc leaves it too"),
+    ("show", "fullscreen", "F11", "fullscreen on/off (the picture's own window when it has "
+                                  "one); Esc leaves it too"),
     ("show", "video_only", "C", "video only: no effects, no shader layer"),
     ("show", "next_fx", "Space", "next video FX look, and the next shader"),
     ("show", "shader", "S", "shader layer off/on"),
@@ -1135,6 +1136,7 @@ class VideoBackdrop(QWidget):
         self.input2 = None          # its device string while it is on
         self._input2_opts = None
         self.enabled = True         # False: no decoding, no repaint, a black widget
+        self.detached = False       # in a window of its own: no scrim
         self.second_on_b = False    # the second input as the B layer (GL only shows it)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
@@ -1303,8 +1305,34 @@ class VideoBackdrop(QWidget):
                 src = QRectF(cx - src.width() * z / 2, cy - src.height() * z / 2,
                              src.width() * z, src.height() * z)
             p.drawImage(QRectF(self.rect()), img, src)
-        if self.child.isVisible():
+        if self.child.isVisible() and not self.detached:
             p.fillRect(self.rect(), QColor(12, 7, 5, 55))   # legibility scrim
+
+
+class PictureWindow(QWidget):
+    """The picture in a window of its own (Video tab: 'picture in a window
+    of its own'): dragged onto the projector's screen, maximized, or
+    fullscreen (F11, or a double-click on it). Closing it puts the picture
+    back into the main window."""
+
+    def __init__(self, main):
+        super().__init__(None, Qt.Window)
+        self.main = main
+        self.setWindowTitle("Gacha: the picture")
+        self.setStyleSheet("background: #100907;")
+        self.setMinimumSize(320, 180)
+        self.lay = QVBoxLayout(self)
+        self.lay.setContentsMargins(0, 0, 0, 0)
+
+    def mouseDoubleClickEvent(self, event):
+        self.main.toggle_fullscreen()
+
+    def closeEvent(self, event):
+        if getattr(self.main, "_closing", False):
+            event.accept()
+            return
+        event.ignore()
+        self.main.video_window.setChecked(False)    # the picture back into the main window
 
 
 class SeekSlider(QSlider):
@@ -2068,6 +2096,7 @@ class Main(QMainWindow):
         self._cursor_hidden = False
         self._fullscreen = False                    # see toggle_fullscreen
         self._was_maximized = False                 # ...and what to go back to
+        self.picture_win = None                     # the picture's own window while it has one
         self._look = {}             # per-section random multipliers per effect
         self._look_idx = None       # (section, 4-bar phrase) of the current look
         self._reverse_bar = None    # (section, bar) last rolled for a rewind
@@ -2592,6 +2621,8 @@ class Main(QMainWindow):
         self._keys_into_tips()                  # "(N)" off the buttons, into the tips
         self._live_defaults = self._live_state()  # as built: the values-only reset's target
         self._live_restore()                    # the knobs as they were left
+        if self.settings.value("video/window", False, type=bool):
+            QTimer.singleShot(0, lambda: self.video_window.setChecked(True))
         self._live_timer = QTimer(self)         # and kept from then on, every few seconds
         self._live_timer.setInterval(3000)
         self._live_timer.timeout.connect(self._live_save)
@@ -5585,6 +5616,16 @@ class Main(QMainWindow):
                                    "key to bring it back; it hides again after "
                                    "this much idle time")
         form.addRow("", self._pair(self.auto_hide, self.hide_after))
+        self.video_window = QCheckBox("picture in a window of its own, the interface stays here")
+        self.video_window.setToolTip(
+            "For a projector: the picture opens in a second window, to drag onto "
+            "the projector's screen, maximize, or put fullscreen (F11, or a "
+            "double-click on it; Esc leaves). It opens on the other screen when "
+            "there is one, and remembers where it was. The interface keeps this "
+            "window and never hides. Closing the picture window brings the "
+            "picture back here. Remembered.")
+        self.video_window.toggled.connect(self._toggle_video_window)
+        form.addRow("", self.video_window)
 
         self.shuffle_look = QCheckBox("new random look on every section")
         self.shuffle_look.setChecked(True)
@@ -6884,23 +6925,30 @@ class Main(QMainWindow):
         """Fullscreen on/off. Own flag rather than isFullScreen(): on Windows
         the window is kept a pixel taller than the screen while fullscreen
         (see _fullscreen_size), and Qt then no longer reports the state."""
+        w = self.picture_win or self    # the picture's own window when it has one
         if self._fullscreen:
             self._fullscreen = False
-            self._fullscreen_size(0)    # exact again, and once Qt has seen
+            self._fullscreen_size(w, 0)  # exact again, and once Qt has seen
             QApplication.processEvents()  # that it is fullscreen in its own
-            self.showNormal()           # eyes again, it restores the frame
+            w.showNormal()              # eyes again, it restores the frame
             if self._was_maximized:     # back to the maximized window it came from
-                self.showMaximized()
-            self._show_ui()             # back to the desktop: interface back
-            self._arm_hide()
+                w.showMaximized()
+            if w is self:
+                self._show_ui()         # back to the desktop: interface back
+                self._arm_hide()
+            else:
+                w.unsetCursor()
         else:
             self._fullscreen = True
-            self._was_maximized = self.isMaximized()
-            self.showFullScreen()
-            self._fullscreen_size(1)
-            self._hide_ui(force=True)   # straight to the picture
+            self._was_maximized = w.isMaximized()
+            w.showFullScreen()
+            self._fullscreen_size(w, 1)
+            if w is self:
+                self._hide_ui(force=True)   # straight to the picture
+            else:
+                w.setCursor(Qt.BlankCursor)  # no pointer over the projector
 
-    def _fullscreen_size(self, extra):
+    def _fullscreen_size(self, w, extra):
         """Windows: a window exactly the size of its screen is handed to the
         display directly (the shell reports a D3D fullscreen application)
         and nothing else is composited over it any more: a combo's list
@@ -6920,7 +6968,7 @@ class Main(QMainWindow):
             _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
                         ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
         u = ctypes.windll.user32
-        h = wt.HWND(int(self.winId()))
+        h = wt.HWND(int(w.winId()))
         mon = u.MonitorFromWindow(h, 2)                     # MONITOR_DEFAULTTONEAREST
         mi = MONITORINFO()
         mi.cbSize = ctypes.sizeof(MONITORINFO)
@@ -8770,6 +8818,61 @@ class Main(QMainWindow):
                                      "the B side of the pedal (W back to the take frames)")
         else:
             self.log.appendPlainText("video input: B is the take frames again")
+
+    def _toggle_video_window(self, on):
+        """The picture into a window of its own and back. The backdrop (the
+        GL widget) moves between the two windows, its context made anew on
+        the way (a black blink); the interface takes the main window's
+        centre meanwhile, with the backdrop's own margins, and never hides.
+        Fullscreen, from then on, is the picture window's."""
+        self.settings.setValue("video/window", on)
+        if not hasattr(self, "backdrop") or on == (self.picture_win is not None):
+            return
+        if self._fullscreen:
+            self.toggle_fullscreen()            # whichever window had it
+        self.hide_timer.stop()
+        self._show_ui()
+        if on:
+            win = PictureWindow(self)
+            self.takeCentralWidget()            # the backdrop, kept
+            self.backdrop.layout().removeWidget(self.ui)
+            frame = QWidget()
+            frame.setStyleSheet("background: #100907;")
+            lay = QVBoxLayout(frame)
+            lay.setContentsMargins(10, 10, 10, 10)
+            lay.addWidget(self.ui)
+            self.setCentralWidget(frame)
+            win.lay.addWidget(self.backdrop)
+            self.backdrop.detached = True
+            self.picture_win = win
+            geo = self.settings.value("video/window_geometry")
+            if not (geo and win.restoreGeometry(geo)):
+                others = [sc for sc in QApplication.screens() if sc is not self.screen()]
+                if others:                      # the projector: the whole other screen
+                    win.setGeometry(others[0].availableGeometry())
+                else:
+                    win.resize(960, 540)
+                    win.move(self.pos() + QPoint(60, 60))
+            win.show()
+            self.ui.show()
+            self.log.appendPlainText("video: the picture in its own window (F11 or a "
+                                     "double-click there for fullscreen)")
+        else:
+            win = self.picture_win
+            self.picture_win = None
+            self.settings.setValue("video/window_geometry", win.saveGeometry())
+            frame = self.takeCentralWidget()
+            frame.layout().removeWidget(self.ui)
+            win.lay.removeWidget(self.backdrop)
+            self.backdrop.layout().addWidget(self.ui)
+            self.backdrop.detached = False
+            self.setCentralWidget(self.backdrop)
+            self.ui.show()
+            win.hide()
+            win.deleteLater()
+            frame.deleteLater()
+            self.log.appendPlainText("video: the picture back in the main window")
+            self._arm_hide()
 
     def _toggle_video_off(self, on):
         """V / the tick / a pad: the whole picture off (decoders closed, no
@@ -11092,6 +11195,8 @@ class Main(QMainWindow):
             self._show_ui()
 
     def _hide_ui(self, force=False):
+        if self.picture_win is not None:        # the picture is elsewhere: nothing to uncover
+            return
         if force or (self._visuals_running() and self.auto_hide.isChecked()):
             self._travel = 0
             self._last_mouse = None
@@ -11190,6 +11295,9 @@ class Main(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
+        if self.picture_win is not None:
+            self.settings.setValue("video/window_geometry", self.picture_win.saveGeometry())
+            self.picture_win.close()
         self._lfo_timer.stop()
         self.lfo.restore_all()                  # the knobs as you set them, into the settings
         self._live_save(force=True)
