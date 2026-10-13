@@ -57,6 +57,13 @@ SHUFFLE_STEMS = {"drums": VOICES, "layers": ("layers", "sub"),
 SHUFFLE_ROLES = {"drums": ("kick", "snare", "hihat", "ohat", "ride", "glitch"),
                  "layers": ("texture",), "chops": ("chop",),
                  "events": ("oneshot", "swell", "collage")}
+# a voice's sound shuffle (render_section's `kit_salts`): the drum carved
+# again from other samples, its pattern kept; the sub's level follows the
+# kit's mix, so it goes with each
+KIT_PARTS = ("kick", "snare", "hihat", "ohat", "ride", "glitch")
+for _v in KIT_PARTS:
+    SHUFFLE_STEMS[_v] = (_v, "sub")
+    SHUFFLE_ROLES[_v] = (_v,)
 
 
 class Material:
@@ -70,6 +77,8 @@ class Material:
         self.names = list(self.bank.keys())
         self.long_names = [n for n in self.names if len(self.bank[n]) > SR]
         self.k = (knobs or E.Knobs()).sanitized()
+        self.seed = seed
+        self._kits = {}                 # (role, salt) -> (variants, sources), see kit_for
         rng = random.Random(seed)
         self.kit, self.kit_src = {}, {}
         kit_sources, hat_sources = set(), []
@@ -94,12 +103,43 @@ class Material:
     def ok(self):
         return bool(self.names)
 
+    def kit_for(self, role, salt=0):
+        """`role`'s carved drum as (variants, sources): the kit's own at salt
+        0, else carved again from other samples drawn by the salt, cached.
+        The same number of variants, so a section's draws stay in step and
+        only the sound changes: a voice's R in the Perform tab, the groove
+        kept. "glitch" asks for a hat of its own, the stutter's."""
+        base = self.kit.get(role) or []
+        base_src = self.kit_src.get(role) or []
+        salt = int(salt or 0)
+        if salt <= 0:
+            return base, base_src
+        key = (role, salt)
+        got = self._kits.get(key)
+        if got is None:
+            if not base or not self.names:
+                got = ([], [])
+            else:
+                rng = random.Random(f"{self.seed}:{role}:{salt}")
+                current = {src for src, _onset in base_src}
+                pool = [n for n in self.names if n not in current] or self.names
+                variants, srcs = [], []
+                for _ in range(len(base)):
+                    src = rng.choice(pool)
+                    pool = [n for n in pool if n != src] or pool   # the variants apart, as the kit's
+                    variants.append(E.velocity_layers(E.carve_drum(rng, self.bank[src], role)))
+                    srcs.append((src, E.strongest_onset(self.bank[src])))
+                got = (variants, srcs)
+            self._kits[key] = got
+        return got
+
 
 class Section:
     def __init__(self, kind, bpm, bars, seed, stems, events, notes, root=None,
-                 drum_style=None, style=None, salts=None, force=()):
+                 drum_style=None, style=None, salts=None, force=(), kit_salts=None):
         self.kind, self.bpm, self.bars, self.seed = kind, bpm, bars, seed
         self.salts = dict(salts or {})  # {stem: int}: each part's stream of chance (a shuffle)
+        self.kit_salts = dict(kit_salts or {})   # {voice: int}: the drum carved again (its sound)
         self.force = set(force)         # the parts rendered whatever the kind (shuffled once)
         self.drum_style = drum_style    # the style the drums were patterned in
         self.style = style              # an intro's or an outro's style, else None
@@ -142,7 +182,8 @@ def _loopify(x, n, fade_s=0.05):
 
 def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                    pan_layers=0.6, pan_events=0.5, drum_style="random",
-                   intro_style="ambient", outro_style="random", salts=None, force=()):
+                   intro_style="ambient", outro_style="random", salts=None, force=(),
+                   kit_salts=None):
     """One looping section as stems + events. `kind`: groove (full kit, one
     to three layers, maybe chops), break (one or two drum voices, more
     layers), build (voices stack up bar by bar), sparse (one voice, one
@@ -159,9 +200,15 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     the chops (its level is set against the mix of the three).
     `force`: parts rendered even where the kind would leave them out
     (chops outside a groove, layers or drums in an intro without them),
-    so a shuffle of a part always gives one to hear."""
+    so a shuffle of a part always gives one to hear. `kit_salts` ({voice:
+    int}, KIT_PARTS) take a drum's sound from another carving of the
+    material (Material.kit_for), the pattern and every draw the same: a
+    voice's sound shuffled, the groove kept."""
     k = mat.k
     salts = {s: int((salts or {}).get(s, 0)) for s in STEMS}
+    kit_salts = {v: int((kit_salts or {}).get(v, 0)) for v in KIT_PARTS}
+    kits = {r: mat.kit_for(r, kit_salts[r]) for r in ("kick", "snare", "hihat", "ohat", "ride")}
+    kits["glitch"] = mat.kit_for("hihat", kit_salts["glitch"])   # the stutter's own hat
     force = set(force)
     rng = random.Random(seed)                         # the section's shape
     rngs = {s: random.Random(f"{seed}:{s}:{salts[s]}") for s in STEMS}
@@ -223,7 +270,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     if "hihat" in active and kind != "sparse" and intro_kind != "sparse":
         active.append("ohat")
         build_from.setdefault("ohat", build_from.get("hihat", 0))
-    active = [r for r in active if gains[r] > 0 and mat.kit.get(r)]
+    active = [r for r in active if gains[r] > 0 and kits[r][0]]
     kick_hits = []                                    # (pos, bar, step) for the sub
     for bi in range(bars):
         bar_start = int(bi * bar * SR)
@@ -249,10 +296,11 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 vel = E.humanize_vel(rd, vel, s, k.humanize)
                 if role == "kick":
                     kick_hits.append((max(0, pos), bi, s))
-                vi = rd.randrange(len(mat.kit[role]))
-                hit = E.pick_layer(mat.kit[role][vi], vel)
-                ksrc, onset = mat.kit_src[role][vi]
-                ev(pos, ksrc, onset, len(mat.kit[role][vi][1]), 1.0, role, vel)
+                kv, ksr = kits[role]
+                vi = rd.randrange(len(kv))
+                hit = E.pick_layer(kv[vi], vel)
+                ksrc, onset = ksr[vi]
+                ev(pos, ksrc, onset, len(kv[vi][1]), 1.0, role, vel)
                 if role == "ohat":
                     nxt = next((t for t in range(s + 1, 16) if closed_pat[t] > 0), 16)
                     hit = E.choke(hit, int((nxt - s) * step_len * SR))
@@ -263,8 +311,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
             s = rd.randrange(16)
             n_rep = rd.choice([6, 8, 12, 16])
             spacing = max(1, int(step_len * SR / rd.choice([2, 3, 4, 6])))
-            vi = rd.randrange(len(mat.kit["hihat"]))
-            hit, gsrc = mat.kit["hihat"][vi][1], mat.kit_src["hihat"][vi]
+            gv, gsr = kits["glitch"]
+            vi = rd.randrange(len(gv))
+            hit, gsrc = gv[vi][1], gsr[vi]
             ramp = rd.choice([-1, 1])
             for i in range(n_rep):
                 t = i / max(1, n_rep - 1)
@@ -505,7 +554,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
             stems[v] *= 0.98 / peak
     events.sort(key=lambda e: e[0])
     return Section(kind, bpm, bars, seed, stems, events, notes, root=root,
-                   drum_style=drum_style, style=style, salts=salts, force=force)
+                   drum_style=drum_style, style=style, salts=salts, force=force,
+                   kit_salts=kit_salts)
 
 
 SECTION_ROOT_MAX_S = 8.0     # the chroma looks at this much of the layers at most

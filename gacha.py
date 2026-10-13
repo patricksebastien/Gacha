@@ -57,7 +57,7 @@ from gacha_audio import audio_apis, audio_devices, audio_status, PHRASE_BARS
 from gacha_audioproc import AudioProxy, audio_host      # the engine, in its own process
 from gacha_takes import TakeStore
 from gacha_section import (EXTRA_KINDS, Material, cut_burst, render_section, render_oneshot,
-                           render_swell, KINDS, STEMS, SHUFFLE_STEMS, SHUFFLE_ROLES)
+                           render_swell, KINDS, STEMS, SHUFFLE_STEMS, SHUFFLE_ROLES, KIT_PARTS)
 import gacha_engine as E
 from scipy.signal import resample_poly
 import threading
@@ -402,6 +402,9 @@ KEYMAP += [("voices", f"voice_{_v}", f"Shift+F{_i}",
 KEYMAP += [("voices", f"solo_{_v}", f"Ctrl+F{_i}",
             f"{VOICE_LABELS[_v]} solo off/on: the other voices out while any is soloed")
            for _i, _v in enumerate(VOICES, 1)]
+KEYMAP += [("voices", f"random_{_v}", "",
+            f"{VOICE_LABELS[_v]}: another sample for its sound, the groove kept (the R button)")
+           for _v in KIT_PARTS]
 KEYMAP += [("voices", "voices_reset", "Shift+F8", "every voice back in, no solo, the voice "
                                                   "racks' effects off and their volumes at 1"),
            ("voices", "quant_next", "", "next quantize grid: off, 1/16, 1/8, 1/4, 1/2, bar")]
@@ -2327,6 +2330,8 @@ class Main(QMainWindow):
         for v in VOICES:
             self.actions[f"voice_{v}"] = self.perf_voices[v].toggle
             self.actions[f"solo_{v}"] = self.perf_solos[v].toggle
+        for v in KIT_PARTS:
+            self.actions[f"random_{v}"] = lambda v=v: self.perform_shuffle(v)
         self.actions["voices_reset"] = self._voices_reset
         for v in DRUM_ROLES:
             self.actions[f"hit_{v}"] = lambda vel=1.0, v=v: self.perform_hit(v, vel)
@@ -5337,7 +5342,7 @@ class Main(QMainWindow):
         # (lit while soloed), landing on the quantize grid. perf_voices holds
         # the M buttons: checked = muted; the voice_* actions, the scenes and
         # the pads still speak of the voice being in (see _erae_read)
-        self.perf_voices, self.perf_solos = {}, {}
+        self.perf_voices, self.perf_solos, self.perf_randoms = {}, {}, {}
         pairs = []
         for i, v in enumerate(VOICES, 1):
             lab = QLabel(VOICE_SHORT[v].upper())
@@ -5359,10 +5364,24 @@ class Main(QMainWindow):
                           "is out while any is, on the quantize grid")
             so.toggled.connect(lambda on, v=v: self._perf_solo(v, on))
             self.perf_voices[v], self.perf_solos[v] = cb, so
-            box = QHBoxLayout()                       # [M] [S] [KICK]
+            cells = [cb, so]
+            if v in KIT_PARTS:                        # the sub is synthesized: no sample to swap
+                rb = QPushButton("R")
+                rb.setObjectName("solo")
+                rb.setCheckable(True)                 # lit while the new sound is on its way
+                rb.setFixedWidth(24)
+                rb.setToolTip(
+                    f"Another sample for the {VOICE_LABELS[v]} of the section playing, "
+                    "carved into that drum, on the same hits: the sound changes, the "
+                    "groove does not. Lands on the next bar, a second to render; lit "
+                    "until then. Pressed again, another one. The drum pad follows it.")
+                rb.clicked.connect(lambda _=False, v=v: self.perform_shuffle(v))
+                self.perf_randoms[v] = rb
+                cells.append(rb)
+            box = QHBoxLayout()                       # [M] [S] [R] [KICK]
             box.setContentsMargins(0, 0, 0, 0)
             box.setSpacing(4)
-            for x in (cb, so, lab):
+            for x in (*cells, lab):
                 box.addWidget(x)
             cell = QWidget()
             cell.setLayout(box)
@@ -8736,9 +8755,11 @@ class Main(QMainWindow):
         """F5-F8 (or the button): `part` (drums, layers, chops, events)
         of the current section rendered again from the material,
         a new sound in that part, the other three untouched, the loop
-        where it is: on the next bar. The render takes a second, after
-        whatever renders now; several presses queue up, one of each
-        part (pressed again before it lands, the press is the same one)."""
+        where it is: on the next bar. A voice (KIT_PARTS, the R buttons):
+        another sample carved into that drum, the hits as they are. The
+        render takes a second, after whatever renders now; several
+        presses queue up, one of each part (pressed again before it
+        lands, the press is the same one)."""
         if self.through is None or not self.through.running:
             self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
             self._shuffle_faces()
@@ -8772,6 +8793,9 @@ class Main(QMainWindow):
             if btn.text() != face:
                 btn.setText(face)
             btn.setChecked(face != "shuffle")
+        for part, btn in self.perf_randoms.items():
+            btn.setChecked(part in self._shuffle_queue or part in self._shuffle_landing
+                           or (busy is not None and busy[0] == "shuffle" and busy[1] == part))
 
     def _shuffle_kick(self):
         """The next shuffle asked, once the render thread is free."""
@@ -8783,9 +8807,13 @@ class Main(QMainWindow):
             return
         part = self._shuffle_queue.pop(0)
         sec, stems, _sr = cur
-        salts = dict(sec.salts)
-        salts[part] = salts.get(part, 0) + 1
-        force = set(sec.force) | {part}
+        salts, force = dict(sec.salts), set(sec.force)
+        kit_salts = dict(getattr(sec, "kit_salts", {}))
+        if part in KIT_PARTS:                         # the sound only
+            kit_salts[part] = kit_salts.get(part, 0) + 1
+        else:
+            salts[part] = salts.get(part, 0) + 1
+            force.add(part)
         mat_key = self._perf_material_key() or getattr(sec, "mat_key", None)
         if mat_key is None:
             self.log.appendPlainText("shuffle: no material (record a take, or tick samples or videos)")
@@ -8793,11 +8821,11 @@ class Main(QMainWindow):
             return
         self._perf_busy = ("shuffle", part)
         threading.Thread(target=self._perf_render_shuffle,
-                         args=(mat_key, sec, stems, part, salts, force),
+                         args=(mat_key, sec, stems, part, salts, force, kit_salts),
                          daemon=True, name="gacha-render").start()
         self.log.appendPlainText(f"shuffle {part}: rendering...")
 
-    def _perf_render_shuffle(self, mat_key, sec, stems, part, salts, force):
+    def _perf_render_shuffle(self, mat_key, sec, stems, part, salts, force, kit_salts):
         """Render thread: `sec` again with the same seed, kind, tempo,
         knobs and shape, `part`'s salt moved on (and that part forced in),
         then only that part's stems (SHUFFLE_STEMS: the sub with the drums,
@@ -8816,7 +8844,7 @@ class Main(QMainWindow):
             elif sec.kind == "outro" and sec.style:
                 kw["outro_style"] = sec.style
             new = render_section(mat, seed=sec.seed, bpm=sec.bpm, bars=sec.bars, kind=sec.kind,
-                                 salts=salts, force=force, **kw)
+                                 salts=salts, force=force, kit_salts=kit_salts, **kw)
             sr = self.through.sr if self.through is not None else 48000
             out = dict(stems)
             for name in SHUFFLE_STEMS[part]:
@@ -8826,14 +8854,14 @@ class Main(QMainWindow):
             roles = set(SHUFFLE_ROLES[part])
             events = sorted([e for e in sec.events if e[5] not in roles]
                             + [e for e in new.events if e[5] in roles], key=lambda e: e[0])
-            self._perf_result = ("shuffle", part, sec, new, out, events, salts, force)
+            self._perf_result = ("shuffle", part, sec, new, out, events, salts, force, kit_salts)
         except Exception as e:                        # noqa: BLE001
             self._perf_result = ("error", f"shuffle failed: {e}")
 
     SHUFFLE_NOTES = {"drums": ("drums", "sub"), "layers": ("layer", "sub"),
                      "chops": ("chops",), "events": ("event", "swell", "collage")}
 
-    def _perf_shuffled(self, part, sec, new, out, events, salts, force):
+    def _perf_shuffled(self, part, sec, new, out, events, salts, force, kit_salts):
         """A shuffle's render landed: into the section it was for, if that
         is still the current one, and onto the player on the bar if it plays."""
         cur = self._perf_current
@@ -8841,14 +8869,19 @@ class Main(QMainWindow):
             self.log.appendPlainText(f"shuffle {part}: the section moved on, dropped")
             self._shuffle_faces()
             return
-        heads = self.SHUFFLE_NOTES[part]
+        heads = self.SHUFFLE_NOTES.get(part, ())
         own = lambda note: note.split(" ", 1)[0] in heads   # noqa: E731
-        sec.salts, sec.force, sec.events = salts, force, events
+        sec.salts, sec.force, sec.events, sec.kit_salts = salts, force, events, kit_salts
         sec.notes = [n for n in sec.notes if not own(n)] + [n for n in new.notes if own(n)]
         for name in SHUFFLE_STEMS[part]:
             sec.stems[name] = new.stems[name]
         self._perf_current = (sec, out, cur[2])
-        what = "; ".join(n for n in new.notes if own(n)) or "nothing in it"
+        self._pad_cache.clear()                       # the pads follow the section's kit
+        if part in KIT_PARTS:
+            srcs = sorted({e[1] for e in new.events if e[5] == part})
+            what = f"{part} <- {', '.join(srcs)}" if srcs else "not in this section"
+        else:
+            what = "; ".join(n for n in new.notes if own(n)) or "nothing in it"
         la = self.through
         pl = la.player if la is not None and la.running else None
         if self._perf_playing is sec and pl is not None and pl.playing:
@@ -8987,14 +9020,15 @@ class Main(QMainWindow):
         vel = max(0.0, min(1.0, float(vel)))
         clip = None
         mat = self._perf_material[1] if self._perf_material else None
-        kit = (mat.kit if mat is not None else {}) or {}
         src = "hihat" if role == "glitch" else role
-        variants = kit.get(src) or []
+        sec = self._perf_current[0] if self._perf_current else None
+        salt = getattr(sec, "kit_salts", {}).get(role, 0) if sec is not None else 0
+        variants = mat.kit_for(src, salt)[0] if mat is not None else []   # the section's sound
         if variants:
             rr = self._pad_rr.get(src, 0)
             self._pad_rr[src] = rr + 1
             layer = 0 if vel < 0.5 else 1 if vel < 0.85 else 2
-            key = (id(mat), src, rr % len(variants), layer, la.sr)
+            key = (id(mat), src, salt, rr % len(variants), layer, la.sr)
             clip = self._pad_cache.get(key)
             if clip is None:
                 hit = variants[rr % len(variants)][layer]
