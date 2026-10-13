@@ -6531,28 +6531,30 @@ class Main(QMainWindow):
         for key in KEEP_FX:
             cb = QCheckBox(labels.get(key, key))
             cb.setProperty("role", "pool")
-            cb.setToolTip(f"{labels.get(key, key)}: ticked, on the picture alone; unticked, "
+            cb.setToolTip(f"{labels.get(key, key)}: ticked, inside the video alone; unticked, "
                           "over the whole screen, the background included")
             cb.setChecked(key not in fx_off)
             cb.toggled.connect(self._keep_changed)
             self.keep_fx[key] = cb
-        form.addRow("Effects on the canvas", self._pool_box(self.keep_fx))
+        form.addRow("Effects inside the video", self._pool_box(self.keep_fx))
         self.keep_shd = {}
         for p in shader_files():
             cb = QCheckBox(p.stem)
             cb.setProperty("role", "pool")
-            cb.setToolTip(f"{p.name}: ticked, drawn on the picture alone, at its size; "
-                          "unticked, drawn over the whole screen with the picture a "
-                          "part of it, so it runs out onto the background")
+            cb.setToolTip(f"{p.name}: ticked, drawn inside the video alone, at its size; "
+                          "unticked, drawn over the whole screen with the video a part "
+                          "of it, so it runs out onto the background")
             cb.setChecked(p.stem not in shd_off)
             cb.toggled.connect(self._keep_changed)
             self.keep_shd[p.stem] = cb
-        form.addRow("Shaders on the canvas", self._pool_box(self.keep_shd))
-        hint = self._info("ticked: the effect or shader keeps to the canvas, the picture "
-                          "alone, and the background stays as it is; unticked: it works "
-                          "over the whole screen, a vignette darkens the wall's corners, "
-                          "a feedback shader rushes out of the picture. All on: the "
-                          "background is never touched. Remembered; every tick is a "
+        form.addRow("Shaders inside the video", self._pool_box(self.keep_shd))
+        hint = self._info("the canvas is the video as placed above: cropped, slid, zoomed, "
+                          "tilted. Ticked: the effect or shader stays inside it, the "
+                          "background (colour, photo or clip) is never touched; unticked: "
+                          "it works over the whole screen, a vignette darkens the wall's "
+                          "corners, a feedback shader rushes out of the video onto the "
+                          "background. All on, as at first: nothing ever touches the "
+                          "background. Remembered; every tick is a "
                           "MIDI button in the Controls tab, every knob above a MIDI "
                           "knob, an LFO and a macro destination, and part of a scene's "
                           "video group. OpenGL only")

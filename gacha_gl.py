@@ -337,10 +337,6 @@ vec3 bgc(vec2 s) {
     vec2 p = (s - 0.5) * sc + 0.5;
     return texture(uBg, vec2(p.x, 1.0 - p.y)).rgb;
 }
-// the screen at s, with the canvas at z: the picture on the canvas, the
-// background around it
-vec3 scene(vec2 s, vec2 z) { return mix(bgc(s), pic(z), inside(z)); }
-
 // the warps: a polar fold, upright; square cells; horizontal tears
 vec2 kaleido(vec2 uv, float aspect) {
     vec2 p = (uv - 0.5) * vec2(aspect, 1.0);
@@ -385,11 +381,16 @@ void main() {
     if (uPixel > 0.0 && !keep(K_PIXEL)) s = pixelate(s, vec2(uPixel, uPixel * aspect));
     if (uGlitch > 0.0 && !keep(K_GLITCH)) s = glitch(s, 1.0);
     vec2 z = toZone(s);
+    // the picture's rectangle is decided here, before the warps that keep
+    // to it: those move what the picture shows, never its edges (a fold or
+    // a tear that reaches past the edge reads the edge, the background
+    // stays out), while a warp on the screen above moved the rectangle itself
+    float ins = inside(z);
     if (zk > 0.0) z = (z - 0.5) * (1.0 - zk) + 0.5;
     if (uKaleido > 0.5 && keep(K_KALEIDO)) z = kaleido(z, zaspect);
     if (uPixel > 0.0 && keep(K_PIXEL)) z = pixelate(z, vec2(uPixel, uPixel * aspect) * uZoneK);
     if (uGlitch > 0.0 && keep(K_GLITCH)) z = glitch(z, uZoneK.x);
-    float ins = inside(z);
+    z = clamp(z, 0.0, 1.0);
     vec3 col;
     if (uRgbShift > 0.0) {                           // chromatic aberration
         vec2 d = vec2(uRgbShift, 0.0);
@@ -398,9 +399,11 @@ void main() {
             col = mix(bgc(s), vec3(pic(z - dz).r, pic(z).g, pic(z + dz).b), ins);
         } else {
             vec2 dz = toZone(s + d) - toZone(s);
-            col = vec3(scene(s - d, z - dz).r, scene(s, z).g, scene(s + d, z + dz).b);
+            col = vec3(mix(bgc(s - d), pic(z - dz), inside(z - dz)).r,
+                       mix(bgc(s), pic(z), ins).g,
+                       mix(bgc(s + d), pic(z + dz), inside(z + dz)).b);
         }
-    } else col = scene(s, z);
+    } else col = mix(bgc(s), pic(z), ins);
     if (uGran > 0.0) {
         // the granular picture: the frame is the buffer, now at its right
         // edge, and every grain a band at its spot, as wide as the grain,
@@ -433,8 +436,8 @@ void main() {
             vec2 d = 1.0 / uRes;
             vec2 dzx = toZone(s + vec2(d.x, 0.0)) - toZone(s);
             vec2 dzy = toZone(s + vec2(0.0, d.y)) - toZone(s);
-            gx = luma(scene(s + vec2(d.x, 0.0), z + dzx)) - luma(col);
-            gy = luma(scene(s + vec2(0.0, d.y), z + dzy)) - luma(col);
+            gx = luma(mix(bgc(s + vec2(d.x, 0.0)), pic(z + dzx), inside(z + dzx))) - luma(col);
+            gy = luma(mix(bgc(s + vec2(0.0, d.y)), pic(z + dzy), inside(z + dzy))) - luma(col);
         }
         vec3 e = mix(col, vec3(clamp((abs(gx) + abs(gy)) * 12.0, 0.0, 1.0)), uEdges);
         col = ap(K_EDGES, col, e, ins);
