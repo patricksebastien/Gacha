@@ -2109,6 +2109,10 @@ class Main(QMainWindow):
         params_box = self._build_params()
 
         self.generate_btn = QPushButton("Generate song")
+        self.generate_btn.setToolTip("Render a song from the ticked samples with the "
+                                     "Generate and Sections tabs' settings, in a "
+                                     "subprocess (the log follows it); it lands in "
+                                     "output/ and in the list, ready to play")
         self.generate_btn.setObjectName("generate")     # the orange one, see STYLE
         self.generate_btn.setMinimumHeight(36)
         self.generate_btn.clicked.connect(self.generate)
@@ -2176,10 +2180,14 @@ class Main(QMainWindow):
         self.now_playing = QLabel("—")
         self.now_playing.setStyleSheet("font-weight: bold;")
         self.play_btn = QPushButton("Play")
+        self.play_btn.setToolTip("Play the selected render through the audio stream "
+                                 "and the racks; pressed while playing, pause")
         self.play_btn.clicked.connect(self.toggle_play)
         stop_btn = QPushButton("Stop")
+        stop_btn.setToolTip("Stop the render and go back to its start")
         stop_btn.clicked.connect(self.player.stop)
         self.pos_slider = SeekSlider(Qt.Horizontal)
+        self.pos_slider.setToolTip("Where the render is; click anywhere on it to jump there")
         self.pos_slider.sliderMoved.connect(self.player.setPosition)
         self.time_lbl = QLabel("0:00 / 0:00")
         self.vol = QSlider(Qt.Horizontal, maximumWidth=100)
@@ -4513,6 +4521,8 @@ class Main(QMainWindow):
                            "or two for a JUCE plugin, the interface waits)")
         add_btn.clicked.connect(self._vst_add)
         rescan = QPushButton("rescan")
+        rescan.setToolTip("Look again in vst/ and the system's VST3 folders, after a "
+                          "plugin was installed or copied in")
         rescan.clicked.connect(self._vst_rescan)
         self.vst_bypass = QCheckBox("bypass all")
         self.vst_bypass.setToolTip("The whole chain out of the path, faded over one block")
@@ -5419,6 +5429,11 @@ class Main(QMainWindow):
         form = QFormLayout()
         self.video_jump = QCheckBox("jump to a random spot on every section")
         self.video_jump.setChecked(True)
+        self.video_jump.setToolTip("The backdrop video seeks to a random place when a "
+                                   "song's section changes (every 8 bars of the live "
+                                   "clock too), so the picture moves with the music "
+                                   "instead of running through; unticked it plays on. "
+                                   "Instant on transcoded videos.")
         form.addRow("Playback", self.video_jump)
         self.video_switch = QCheckBox("switch between the ticked videos on "
                                       "drops, now and then on sections")
@@ -5501,6 +5516,10 @@ class Main(QMainWindow):
         self.auto_hide = QCheckBox("hide the interface when a song starts, "
                                    "and again after")
         self.auto_hide.setChecked(True)
+        self.auto_hide.setToolTip("The picture takes the whole window when a song "
+                                  "starts; moving the mouse brings the interface back, "
+                                  "and it goes again after the seconds next to it, for "
+                                  "as long as the song plays.")
         self.auto_hide.toggled.connect(self._arm_hide)
         self.hide_after = QDoubleSpinBox(minimum=0.5, maximum=10.0,
                                          singleStep=0.5, decimals=1,
@@ -5554,6 +5573,10 @@ class Main(QMainWindow):
             lambda v: setattr(self.backdrop, "shader_mix", v))
         self.shader_blend = QComboBox()
         self.shader_blend.addItems(BLEND_MODES)
+        self.shader_blend.setToolTip("How the shader layer meets the video at its "
+                                     "opacity: mix is a plain crossfade, add and screen "
+                                     "lay the two over each other (add clips bright on "
+                                     "bright, screen never clips)")
         self.shader_blend.currentIndexChanged.connect(
             lambda i: setattr(self.backdrop, "shader_blend", i))
         form.addRow("Shader layer", self._row([("opacity", self.shader_mix),
@@ -6412,6 +6435,8 @@ class Main(QMainWindow):
         row.setContentsMargins(0, 0, 0, 0)
         for text, on in (("all", True), ("none", False)):
             b = QPushButton(text)
+            b.setToolTip("Every box ticked: the whole pool in the show" if on
+                         else "Every box unticked: nothing of this kind in the show")
             b.setObjectName("small")
             b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             b.clicked.connect(lambda _c=False, on=on: [cb.setChecked(on) for cb in boxes.values()])
@@ -6909,18 +6934,33 @@ class Main(QMainWindow):
         form = QFormLayout()
         self.duration = QSpinBox(minimum=10, maximum=600, value=180,
                                  suffix=" s")
+        self.duration.setToolTip("Songs only: the length Generate aims for; sections are "
+                                 "added until it is reached, so it lands within a "
+                                 "section of it")
         form.addRow("Song duration", self.duration)
 
         self.seed_random = QCheckBox("random")
         self.seed_random.setChecked(True)
+        self.seed_random.setToolTip("Songs only: every Generate rolls a new seed; untick "
+                                    "to set one and get the same song again from the "
+                                    "same samples and settings")
         self.seed = QSpinBox(minimum=0, maximum=999999, value=42)
+        self.seed.setToolTip("The seed of the song's every random choice: the same "
+                             "number with the same samples and settings renders the "
+                             "same song, so a good one can be made again after a "
+                             "tweak.")
         self.seed.setEnabled(False)
         self.seed_random.toggled.connect(lambda on: self.seed.setEnabled(not on))
         form.addRow("Seed", self._pair(self.seed, self.seed_random))
 
         self.all_samples = QCheckBox("use all")
         self.all_samples.setChecked(True)
+        self.all_samples.setToolTip("Songs only: every ticked sample goes into the "
+                                    "render; untick to draw a number of them at random "
+                                    "per song, for variety between renders")
         self.num_samples = QSpinBox(minimum=1, maximum=9999, value=10)
+        self.num_samples.setToolTip("How many of the ticked samples a song draws, at "
+                                    "random, when 'use all' is off")
         self.num_samples.setEnabled(False)
         self.all_samples.toggled.connect(
             lambda on: self.num_samples.setEnabled(not on))
@@ -7395,10 +7435,24 @@ class Main(QMainWindow):
                                   "boom-bap", "halftime", "dnb", "minimal",
                                   "ukg", "dembow", "one-drop", "footwork",
                                   "clave", "idm"])
+        self.drum_style.setToolTip(
+            "The kit's pattern family, for the songs and the live sections alike: "
+            "four-floor (a kick on every beat, house), breakbeat (syncopated, the "
+            "snare off the grid, lots of ghosts), boom-bap (hip hop's lazy "
+            "backbeat), halftime (the snare on beat 3 only, trap hats), dnb "
+            "(two-step, the kick on 1 and the and of 3), minimal (a few hits), ukg "
+            "(2-step garage, no kick on beat 3, skippy hats), dembow (reggaeton's "
+            "boom-ch-boom), one-drop (dub and reggae, everything on beat 3), "
+            "footwork (juke, cells of kicks and a sparse clap), clave (afro-latin, "
+            "the son clave 3-2 over a bombo kick), idm (irregular). random picks "
+            "one per song, or per live section.")
         form.addRow("Drum style", self.drum_style)
 
         self.swing_random = QCheckBox("random (0–0.06)")
         self.swing_random.setChecked(True)
+        self.swing_random.setToolTip("A swing drawn per song (or per live section) "
+                                     "between none and 0.06 of a step, a light shuffle; "
+                                     "untick to set one.")
         self.swing = QDoubleSpinBox(minimum=0.0, maximum=0.5, singleStep=0.01,
                                     decimals=2, value=0.1)
         self.swing.setToolTip("Delay of every offbeat 16th, as a fraction "
@@ -7437,6 +7491,13 @@ class Main(QMainWindow):
             self.gain[role].setValue(val)
         self.gain["ohat"].setToolTip("Open hihat, carved from the same sample "
                                      "as the closed one. 0 = no open hats")
+        for role, what in (("kick", "the kick"), ("snare", "the snare"),
+                           ("hihat", "the closed hihat"), ("ride", "the ride")):
+            self.gain[role].setToolTip(
+                f"Level of {what} carved out of the samples (each hit is a slice of "
+                "a sample shaped into that drum), 1 = as carved, 0 = the voice left "
+                "out of the pattern. Live, the Perform tab's M buttons mute a voice "
+                "without a render.")
         form.addRow("Samples", self._row([(r, w) for r, w in self.gain.items()]))
 
         # synthesized 909/808-style kit, layered on the same patterns
@@ -7505,9 +7566,20 @@ class Main(QMainWindow):
         self.intro_style.addItems(["random", "ambient", "sparse", "none", "build",
                                    "drums-first", "reverse-swell", "collage",
                                    "filtered"])
+        self.intro_style.setToolTip(
+            "How a song opens, and what a live intro section is shaped like: "
+            "ambient (textures, the drums often left out), sparse (one voice, one "
+            "texture), none (a plain groove from the start), build (the voices stack "
+            "up bar by bar), drums-first (the kit alone, no textures), reverse-swell "
+            "(a long reversed sample crescendos into the drop), collage (one-shots "
+            "scattered like a field recording, no beat), filtered (a lowpass opens "
+            "bar by bar, the club door). random picks one.")
         form.addRow("Intro style", self.intro_style)
 
         self.intro_cap = QCheckBox("cap at")
+        self.intro_cap.setToolTip("Songs only: tick to cap the intro at the bars next to "
+                                  "it; unticked the intro takes a section length of its "
+                                  "own. A live intro is always 8 bars.")
         self.intro_bars = QSpinBox(minimum=0, maximum=8, value=4,
                                    suffix=" bars")
         self.intro_bars.setToolTip("0 = no intro section at all")
@@ -7529,6 +7601,9 @@ class Main(QMainWindow):
 
         self.outro_tail_auto = QCheckBox("auto")
         self.outro_tail_auto.setChecked(True)
+        self.outro_tail_auto.setToolTip("The ring-out's length from the outro style "
+                                        "(2.5 to 7 s); untick to set it. A live outro "
+                                        "keeps it inside its 8 bars, 4 bars at most.")
         self.outro_tail = QDoubleSpinBox(minimum=0.5, maximum=12.0,
                                          singleStep=0.5, decimals=1,
                                          suffix=" s")
@@ -7567,6 +7642,7 @@ class Main(QMainWindow):
         self.fade_in = QDoubleSpinBox(minimum=0.0, maximum=10.0,
                                       singleStep=0.1, decimals=2, suffix=" s")
         self.fade_in.setValue(0.3)
+        self.fade_in.setToolTip("Songs only: a fade on the whole song's start")
         self.fade_out = QDoubleSpinBox(minimum=0.0, maximum=20.0,
                                        singleStep=0.5, decimals=2, suffix=" s")
         self.fade_out.setValue(0.03)
@@ -7711,6 +7787,14 @@ class Main(QMainWindow):
         form = QFormLayout()
         self.layers_min = QSpinBox(minimum=0, maximum=8, value=1)
         self.layers_max = QSpinBox(minimum=0, maximum=8, value=3)
+        for w in (self.layers_min, self.layers_max):
+            w.setToolTip(
+                "A texture is a long cut of a sample looped under the drums for the "
+                "whole section (the layers stem): maybe reversed, maybe stretched to "
+                "whole bars, through a random effect chain, panned, at a level from "
+                "the row below. A groove section gets between min and max of them, "
+                "drawn at random; a break more, a sparse or build section one, some "
+                "intros none. 0 and 0 = no textures at all.")
         form.addRow("Textures / section",
                     self._row([("min", self.layers_min),
                                ("max", self.layers_max)]))
@@ -7725,6 +7809,9 @@ class Main(QMainWindow):
         self.chop_gain = QDoubleSpinBox(minimum=0.0, maximum=2.0,
                                         singleStep=0.05, decimals=2)
         self.chop_gain.setValue(0.4)
+        self.chop_gain.setToolTip("Level of the chops: a sample cut into eight slices "
+                                  "and replayed on a 16th-note pattern, through one "
+                                  "effect chain (the chops stem)")
         form.addRow("Chops", self._row([("chance", self.chop_chance),
                                         ("gain", self.chop_gain)]))
 
@@ -7753,12 +7840,26 @@ class Main(QMainWindow):
 
         self.fx_min = QSpinBox(minimum=1, maximum=9, value=1)
         self.fx_max = QSpinBox(minimum=1, maximum=9, value=3)
+        for w in (self.fx_min, self.fx_max):
+            w.setToolTip(
+                "Every texture, chop layer and one-shot goes through a chain of "
+                "effects drawn at random from a pool (a tempo-synced delay, reverb, "
+                "chorus, phaser, the saturator, bitcrush, a resonant filter, a pitch "
+                "shift): between min and max of them, in a random order. 1 to 1 is "
+                "one effect, cleaner; 3 and up is a wash.")
         form.addRow("Effects / chain", self._row([("min", self.fx_min),
                                                   ("max", self.fx_max)]))
 
         self.pan_drums = self._pan_spin(0.3)
         self.pan_layers = self._pan_spin(0.6)
         self.pan_events = self._pan_spin(0.5)
+        self.pan_drums.setToolTip("How far from the centre a drum hit may land, 0 to 1 "
+                                  "(the kick stays in the middle; the hat stutter "
+                                  "sweeps across): each hit drawn at random within it")
+        self.pan_layers.setToolTip("How far from the centre a texture may sit, 0 to 1, "
+                                   "drawn at random per texture")
+        self.pan_events.setToolTip("How far from the centre the one-shots, the chops "
+                                   "and the collage hits may land, 0 to 1")
         form.addRow("Pan", self._row([("drums", self.pan_drums),
                                       ("layers", self.pan_layers),
                                       ("events", self.pan_events)]))
@@ -7795,16 +7896,26 @@ class Main(QMainWindow):
         self.arrangement.itemDoubleClicked.connect(self._audition_section)
 
         add_btn = QPushButton("Add to final →")
+        add_btn.setToolTip("The selected section of the render on the left onto the "
+                           "end of the final arrangement; sections from different "
+                           "renders can be mixed, and one added as often as wanted")
         add_btn.clicked.connect(self._arr_add)
         up_btn = QPushButton("↑")
+        up_btn.setToolTip("Move the selected section of the final one place earlier")
         up_btn.clicked.connect(lambda: self._arr_move(-1))
         down_btn = QPushButton("↓")
+        down_btn.setToolTip("Move the selected section of the final one place later")
         down_btn.clicked.connect(lambda: self._arr_move(1))
         del_btn = QPushButton("Remove")
+        del_btn.setToolTip("Take the selected section out of the final arrangement")
         del_btn.clicked.connect(self._arr_remove)
         clear_btn = QPushButton("Clear")
+        clear_btn.setToolTip("Empty the final arrangement")
         clear_btn.clicked.connect(self.arrangement.clear)
         render_btn = QPushButton("Render final")
+        render_btn.setToolTip("Write the arrangement as one stitched track, the "
+                              "sections joined with seamless crossfades, listed with "
+                              "the renders")
         render_btn.setMinimumHeight(32)
         render_btn.clicked.connect(self._render_final)
 
