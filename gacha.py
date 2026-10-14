@@ -5151,7 +5151,9 @@ program.</li>
             "Shape of the next section. groove: full kit, one to three layers, "
             "maybe chops. break: one or two drum voices under more layers. "
             "build: the voices stack up bar by bar. sparse: one voice, one layer. "
-            "random: one of those four. intro and outro: 8 bars shaped by the intro "
+            "dense: sparse's opposite, everything in: the full kit with the ride, a "
+            "layer over the max, chops for sure and thicker, more one-shots and "
+            "stutters, a fill. random: one of those five. intro and outro: 8 bars shaped by the intro "
             "and outro styles above; an outro is entered at bar 5, ends in silence and "
             "stops the sections on its last bar.")
         # the live clock's bpm box again (the Sections tab's), the two one value
@@ -8336,8 +8338,8 @@ program.</li>
                 "whole section (the layers stem): maybe reversed, maybe stretched to "
                 "whole bars, through a random effect chain, panned, at a level from "
                 "the row below. A groove section gets between min and max of them, "
-                "drawn at random; a break more, a sparse or build section one, some "
-                "intros none. 0 and 0 = no textures at all.")
+                "drawn at random; a break more, a sparse or build section one, a "
+                "dense one max plus one, some intros none. 0 and 0 = no textures at all.")
         form.addRow("Textures / section",
                     self._row([("min", self.layers_min),
                                ("max", self.layers_max)]))

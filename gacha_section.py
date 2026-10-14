@@ -36,6 +36,7 @@ groove of 8 bars renders in about a second on a 2-take bank once the
 material is carved.
 """
 import random
+from dataclasses import replace
 
 import numpy as np
 from scipy.signal import resample_poly
@@ -44,7 +45,7 @@ import gacha_engine as E
 from gacha_engine import SR
 from gacha_fx import VOICES
 
-KINDS = ("groove", "break", "build", "sparse")      # what "random" picks from
+KINDS = ("groove", "break", "build", "sparse", "dense")   # what "random" picks from
 EXTRA_KINDS = ("intro", "outro")                      # picked by name only
 INTRO_STYLES = ("random", "ambient", "sparse", "none", "build", "drums-first",
                 "reverse-swell", "collage", "filtered")
@@ -194,7 +195,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     """One looping section as stems + events. `kind`: groove (full kit, one
     to three layers, maybe chops), break (one or two drum voices, more
     layers), build (voices stack up bar by bar), sparse (one voice, one
-    layer), intro (the song intro of `intro_style`, see the module note),
+    layer), dense (sparse's opposite: the full kit with the ride, a layer
+    over the knobs' max, chops for sure and thicker, more one-shots, more
+    stutters and a fill, the feel turned up), intro (the song intro of `intro_style`, see the module note),
     outro (a groove ending in `outro_style`, silent by the last bar).
 
     The four parts (STEMS: the drums, the layers, the chops, the events)
@@ -228,6 +231,10 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         drum_style = rng.choice(E.DRUM_STYLES)        # the shape: every part follows it
     feel_name = E.resolve_feel(feel, drum_style, rng)
     feel = E.style_feel(feel_name)
+    if kind == "dense":                               # everything in: the feel turned up
+        feel = replace(feel, ride=1.0, fill=max(feel.fill, 0.8), glitch=feel.glitch * 2,
+                       chop_density=min(1.0, feel.chop_density * 1.5),
+                       events=(feel.events[1], feel.events[1] + 2))
     humanize = min(1.0, k.humanize * feel.humanize)
     intro_kind = intro_style if kind == "intro" and intro_style in INTRO_STYLES else None
     if intro_kind == "random":
@@ -281,7 +288,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         build_from = {"hihat": 0, "kick": max(1, bars // 3), "snare": max(2, (2 * bars) // 3)}
     if not active and "drums" in force:               # shuffled into an intro without them
         active = ["kick", "snare", "hihat"]
-    if kind in ("groove", "outro") and rd.random() < feel.ride:
+    if kind in ("groove", "outro", "dense") and rd.random() < feel.ride:
         active.append("ride")
     if "hihat" in active and kind != "sparse" and intro_kind != "sparse":
         active.append("ohat")
@@ -395,6 +402,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         n_layers = min(max(2, k.layers_min), k.layers_max)
     elif kind in ("build", "sparse"):
         n_layers = 1
+    elif kind == "dense":                             # one over the top of the range
+        n_layers = max(2, E.layer_range(k, feel)[1] + 1) if k.layers_max > 0 else 0
     else:
         n_layers = rl.randint(*E.layer_range(k, feel))
     if "layers" in force:                             # shuffled into a section without them
@@ -445,7 +454,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     # ---- chops: slice a sample, replay on the grid (never in an intro) ----
     chop_roll = rc.random()                           # drawn either way: the stream stays in step
     chops_in = (kind in ("groove", "outro") and chop_roll < k.chop_chance * feel.chop
-                or kind == "break" and chop_roll < 0.5 * feel.chop)
+                or kind == "break" and chop_roll < 0.5 * feel.chop
+                or kind == "dense" and k.chop_chance > 0)
     if mat.names and (chops_in or "chops" in force):
         src = rc.choice(mat.names)
         clip = mat.bank[src]
