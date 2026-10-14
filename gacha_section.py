@@ -45,8 +45,13 @@ import gacha_engine as E
 from gacha_engine import SR
 from gacha_fx import VOICES
 
-KINDS = ("groove", "break", "build", "sparse", "dense", "insane")   # what "random" picks from
-TURN_UP = {"dense": 1, "insane": 2}                  # the kinds above groove, how far
+KINDS = ("groove", "break", "build", "sparse", "dense", "insane", "overload")   # what "random" picks from
+TURN_UP = {"dense": 1, "insane": 2, "overload": 3}   # the kinds above groove, how far
+LAYERS_OVER = {1: (1, 2), 2: (3, 4), 3: (5, 6)}      # per rung: over the knobs' max, and at least
+# the chop sources a rung adds to the feel's own: (density on any step, gain)
+CHOPS_OVER = {1: (), 2: ((0.6, 0.8), (0.4, 0.6)),
+              3: ((0.8, 0.8), (0.6, 0.7), (0.5, 0.6), (0.4, 0.5))}
+STUTTERS = {1: 1, 2: 1, 3: 3}                        # stutter rolls per bar
 EXTRA_KINDS = ("intro", "outro")                      # picked by name only
 INTRO_STYLES = ("random", "ambient", "sparse", "none", "build", "drums-first",
                 "reverse-swell", "collage", "filtered")
@@ -201,7 +206,11 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     stutters, a fill), insane (everything: hats on every 16th, ghosts
     under the snare, three layers over the max and louder, chops from
     three samples on any step, one-shots by the handful on the 16ths, six
-    times the stutters, the sub every bar), intro (the song intro of `intro_style`, see the module note),
+    times the stutters, the sub every bar), overload (past the limit: the
+    kick doubled on the offbeat 8ths, the snare on nearly every 16th, hats
+    hard on every 16th and more of them open, three stutter rolls a bar,
+    five layers over the max and half again as loud, chops from five
+    samples, one-shots by the dozen), intro (the song intro of `intro_style`, see the module note),
     outro (a groove ending in `outro_style`, silent by the last bar).
 
     The four parts (STEMS: the drums, the layers, the chops, the events)
@@ -246,6 +255,11 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         feel = replace(feel, ride=1.0, fill=1.0, glitch=feel.glitch * 6, mutation=feel.mutation * 2.0,
                        sub=3.0, layer_level=feel.layer_level * 1.3, chop_density=1.0,
                        events=(feel.events[1] + 5, feel.events[1] + 8), event_grid="16th")
+    elif up == 3:
+        feel = replace(feel, ride=1.0, fill=1.0, glitch=feel.glitch * 12, mutation=feel.mutation * 3.0,
+                       sub=3.0, layer_level=feel.layer_level * 1.5, chop_density=1.0,
+                       chop_len=(1, 1, 2), events=(feel.events[1] + 10, feel.events[1] + 16),
+                       event_grid="16th", event_len=(0.2, 2.0))
     humanize = min(1.0, k.humanize * feel.humanize)
     intro_kind = intro_style if kind == "intro" and intro_style in INTRO_STYLES else None
     if intro_kind == "random":
@@ -286,7 +300,17 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         pats["hihat"] = [v if v > 0 else rd.uniform(0.4, 0.7) for v in pats["hihat"]]
         pats["snare"] = [v if v > 0 else (rd.uniform(0.2, 0.45) if rd.random() < 0.5 else 0.0)
                          for v in pats["snare"]]
+    elif up == 3:                                     # the kick doubled, the snare nearly everywhere
+        pats["hihat"] = [v if v > 0 else rd.uniform(0.6, 0.9) for v in pats["hihat"]]
+        pats["snare"] = [v if v > 0 else (rd.uniform(0.3, 0.6) if rd.random() < 0.9 else 0.0)
+                         for v in pats["snare"]]
+        pats["kick"] = [v if v > 0 else (rd.uniform(0.6, 0.8) if st % 4 == 2 else 0.0)
+                        for st, v in enumerate(pats["kick"])]
     pats["hihat"], pats["ohat"] = E.open_hat_pattern(rd, pats["hihat"], drum_style)
+    if up == 3:                                       # more of the hats open, any step
+        for st in range(16):
+            if pats["hihat"][st] > 0 and pats["ohat"][st] == 0 and rd.random() < 0.35:
+                pats["ohat"][st], pats["hihat"][st] = max(pats["hihat"][st], 0.8), 0.0
     active = ["kick", "snare", "hihat"]
     build_from = {}
     # an intro the songs drop the drums from: ambient now and then, the
@@ -346,7 +370,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 if role != "kick" and pan_drums > 0:
                     hit = E.panned(hit, rd.uniform(-pan_drums, pan_drums))
                 _place_wrap(stems[role], hit, max(0, pos), vel * gains[role])
-        if "hihat" in active and rd.random() < k.glitch_chance * feel.glitch:
+        for _roll in range(STUTTERS.get(up, 1)):
+            if "hihat" not in active or rd.random() >= k.glitch_chance * feel.glitch:
+                continue
             s = rd.randrange(16)
             n_rep = rd.choice([6, 8, 12, 16])
             spacing = max(1, int(step_len * SR / rd.choice([2, 3, 4, 6])))
@@ -417,9 +443,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         n_layers = min(max(2, k.layers_min), k.layers_max)
     elif kind in ("build", "sparse"):
         n_layers = 1
-    elif up:                                          # one (dense) or three (insane) over the top
-        n_layers = max(2 * up, E.layer_range(k, feel)[1] + (1 if up == 1 else 3)) \
-            if k.layers_max > 0 else 0
+    elif up:                                          # over the top of the range, by the rung
+        over, least = LAYERS_OVER[up]
+        n_layers = max(least, E.layer_range(k, feel)[1] + over) if k.layers_max > 0 else 0
     else:
         n_layers = rl.randint(*E.layer_range(k, feel))
     if "layers" in force:                             # shuffled into a section without them
@@ -474,10 +500,10 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 or bool(up) and k.chop_chance > 0)
     if mat.names and (chops_in or "chops" in force):
         chop_feels = [feel]
-        if up == 2:                                   # two more sources, short pieces on any step
-            for dens, gain in ((0.6, 0.8), (0.4, 0.6)):
-                chop_feels.append(replace(feel, chop_steps=None, chop_period=None, chop_density=dens,
-                                          chop_len=(1, 1, 2), chop_gain=feel.chop_gain * gain))
+        for dens, gain in CHOPS_OVER.get(up, ()):     # more sources, short pieces on any step
+            chop_feels.append(replace(feel, chop_steps=None, chop_period=None, chop_density=dens,
+                                      chop_len=(1, 1, 2), chop_gain=feel.chop_gain * gain,
+                                      chop_rev=max(feel.chop_rev, 0.3 if up == 3 else 0.0)))
         for cf in chop_feels:
             src = rc.choice(mat.names)
             clip = mat.bank[src]

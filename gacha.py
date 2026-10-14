@@ -5155,8 +5155,12 @@ program.</li>
             "chops for sure and thicker, more one-shots and stutters, a fill. insane: "
             "everything, hats on every 16th, ghosts under the snare, three layers over "
             "the max and louder, chops from three samples on any step, one-shots by the "
-            "handful on the 16ths, six times the stutters, the sub every bar. random: one "
-            "of those six. intro and outro: 8 bars shaped by the intro "
+            "handful on the 16ths, six times the stutters, the sub every bar. overload: "
+            "past the limit, the kick doubled on the offbeat 8ths, the snare on nearly "
+            "every 16th, hats hard on every 16th and more of them open, three stutter "
+            "rolls a bar, five layers over the max and half again as loud, chops from "
+            "five samples, one-shots by the dozen; it takes a while to render. random: "
+            "one of those seven. intro and outro: 8 bars shaped by the intro "
             "and outro styles above; an outro is entered at bar 5, ends in silence and "
             "stops the sections on its last bar.")
         # the live clock's bpm box again (the Sections tab's), the two one value
@@ -8342,7 +8346,8 @@ program.</li>
                 "whole bars, through a random effect chain, panned, at a level from "
                 "the row below. A groove section gets between min and max of them, "
                 "drawn at random; a break more, a sparse or build section one, a "
-                "dense one max plus one, an insane one max plus three, some intros none. 0 and 0 = no textures at all.")
+                "dense one max plus one, an insane one max plus three, an overload max "
+                "plus five, some intros none. 0 and 0 = no textures at all.")
         form.addRow("Textures / section",
                     self._row([("min", self.layers_min),
                                ("max", self.layers_max)]))
