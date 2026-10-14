@@ -5116,8 +5116,9 @@ program.</li>
                  "section (the one playing shows in the meter), and a randomize keeps it."),
                 (self.perf_feel, self.feel,
                  "The feel the next section's layers, chops, events, swing, fills and "
-                 "sub play in: same as style follows the drums box, random draws one per "
-                 "section, or any style's feel under any kit. The Sections tab's box.")):
+                 "sub play in: same as style follows the drums box, default is the way "
+                 "they were before the feels, random draws a style's per section, or any "
+                 "style's feel under any kit. The Sections tab's box.")):
             # the same names but none (a live intro or outro always has a
             # shape), so the pair is kept by name: the Generate tab on none
             # leaves this box where it was, and the live render reads this one
@@ -7975,9 +7976,10 @@ program.</li>
         self.feel.setToolTip(
             "The feel the layers, chops, events, swing, fills and sub play in, "
             "apart from the kit's pattern: same as style follows the Drum style box "
-            "(the usual), random draws one per song or section, or any style's own "
-            "feel under any kit, a four-floor kit in the hypnotic feel. The README's "
-            "feel table says what each does.")
+            "(the usual), default is the way they were before the feels (the knobs "
+            "alone, every style alike), random draws a style's feel per song or "
+            "section, or any style's own feel under any kit, a four-floor kit in the "
+            "hypnotic feel. The README's feel table says what each does.")
         form.addRow("Drum style", self._row([("", self.drum_style), ("feel", self.feel)]))
 
         self.swing_random = QCheckBox("random (0–0.06)")

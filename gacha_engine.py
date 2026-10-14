@@ -1236,7 +1236,8 @@ STYLE_FEEL = {
 
 DEFAULT_FEEL = Feel()
 FEEL_SAME = "same as style"         # the Feel box's default: the drum style's own feel
-FEEL_CHOICES = [FEEL_SAME, "random"] + DRUM_STYLES
+FEEL_DEFAULT = "default"            # the renderer as it was before the feels: the knobs alone
+FEEL_CHOICES = [FEEL_SAME, FEEL_DEFAULT, "random"] + DRUM_STYLES
 
 
 def style_feel(style):
@@ -1247,12 +1248,14 @@ def style_feel(style):
 def resolve_feel(feel, drum_style, rng):
     """The name of the feel a song or section plays in, from the Feel box:
     the drum style's own (FEEL_SAME, None or a name without a feel), one
-    drawn from `rng` ("random"), or the named style's. A feel is named
-    after the style it belongs to, so a four-floor kit can play in the
+    drawn from `rng` ("random", a style's), the named style's, or
+    FEEL_DEFAULT, the layers, chops and events the way they were before
+    the feels (style_feel gives Feel() for it). A feel is named after
+    the style it belongs to, so a four-floor kit can play in the
     hypnotic feel."""
     if feel == "random":
         return rng.choice(DRUM_STYLES)
-    if feel in STYLE_FEEL:
+    if feel in STYLE_FEEL or feel == FEEL_DEFAULT:
         return feel
     return drum_style
 
