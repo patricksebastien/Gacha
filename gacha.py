@@ -3223,6 +3223,9 @@ MIDI cell to learn there, Delete clears it. <b>Erae</b> lays the pads out on an 
         outer = QVBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(4)
+        title = QLabel("Elektron Model:Cycles")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; padding: 2px 8px;")
+        outer.addWidget(title)
         hint = self._info(
             "The box's sound from here, over CC on the MIDI out's port (Controls tab, on "
             "and pointed at the box; its notes' side of the box is the row below, the hits "
@@ -3238,7 +3241,6 @@ MIDI cell to learn there, Delete clears it. <b>Erae</b> lays the pads out on an 
             "pitch cell is left alone, and in slice mode the note picks the slice "
             f"({CYCLES_SLICE_NOTE} is slice 1, the root {CYCLES_ROOT} slice "
             f"{CYCLES_ROOT - CYCLES_SLICE_NOTE + 1}).")
-        outer.addWidget(hint)
         # the MIDI out's side of the box (the port itself is the Controls tab's):
         # the hits on the track channels, the voicing, the octaves per track
         self.midi_out_cycles = QCheckBox("hits on the tracks")
@@ -3417,6 +3419,7 @@ MIDI cell to learn there, Delete clears it. <b>Erae</b> lays the pads out on an 
             pairs.append((label, w))
         form.addRow("delay / reverb", self._row(pairs))
         outer.addLayout(form)
+        outer.addWidget(hint)                  # the notes at the end of the page
         w = QWidget()
         w.setLayout(outer)
         if not MIDI_AVAILABLE:
