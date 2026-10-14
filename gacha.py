@@ -7201,7 +7201,23 @@ class Main(QMainWindow):
             "between pieces. Remembered.")
         self.keep_takes.setChecked(self.settings.value("takes/keep", True, type=bool))
         self.keep_takes.toggled.connect(lambda on: self.settings.setValue("takes/keep", on))
+        self.level_takes = QCheckBox("level the takes: every take at -14 LUFS for the "
+                                     "section engine, like the sample sets")
+        self.level_takes.setToolTip(
+            "A tape's level is whatever it was: with this ticked, each take's sound "
+            "is brought to -14 LUFS integrated (ITU-R BS.1770, the silence gated "
+            "out) before the section engine carves it, the loudness the sample sets "
+            "are cut at, so a quiet tape and a loud one give drums at one level. "
+            "The gain stops where the take's peak would pass -0.1 dBFS, so a take "
+            "of hiss with one burst is not pushed into clipping; the log says what "
+            "each take got. The files written to videos/ stay as recorded. Applies "
+            "to the takes in RAM at once (the material is built again at the next "
+            "N). Remembered.")
+        self.level_takes.setChecked(self.settings.value("takes/level", True, type=bool))
+        self.level_takes.toggled.connect(self._level_takes_changed)
+        self.takes.set_level(self.level_takes.isChecked())
         form.addRow("Takes", self.keep_takes)
+        form.addRow("", self.level_takes)
         form.addRow("Audio analysis", self.live_on)
         form.addRow("", self._row([("device", self.live_device),
                                    ("level", self.live_level)]))
@@ -7478,6 +7494,7 @@ class Main(QMainWindow):
         # the Perform tab and the takes
         self.take_pre.setValue(sv("takes/pre_roll", 0.0, type=float))
         self.keep_takes.setChecked(sv("takes/keep", True, type=bool))
+        self.level_takes.setChecked(sv("takes/level", True, type=bool))
         self.perf_gap.setChecked(sv("perform/gap", False, type=bool))
         combo(self.rep_div, "perform/rep_div", REPEAT_DEFAULT)
         combo(self.speed_sync, "perform/speed_sync", SPEED_SYNC_DEFAULT)
@@ -10082,10 +10099,23 @@ class Main(QMainWindow):
                 + (", the recording dropped" if was_rec else "")
                 + "  ·  files already in videos/ stay")
 
+    def _level_takes_changed(self, on):
+        """The Settings tick: the takes levelled or left as recorded, the
+        ones in RAM included; the material is carved again at the next N."""
+        self.settings.setValue("takes/level", on)
+        self.takes.set_level(on)
+        self._perf_material = None
+        self.log.appendPlainText("takes: levelled to -14 LUFS for the sections" if on
+                                 else "takes: as recorded")
+
     def _log_take(self, take):
+        level = ""
+        if take.level and len(take.audio):
+            take.engine_audio()                       # levelled now, the gain known
+            level = f", {take.level_db:+.1f} dB to -14 LUFS"
         self.log.appendPlainText(
             f"{take.name}: {take.seconds:.1f} s, {len(take.frames)} frames, "
-            f"{take.nbytes / 1e9:.2f} GB  ·  {len(self.takes.takes)} takes, "
+            f"{take.nbytes / 1e9:.2f} GB{level}  ·  {len(self.takes.takes)} takes, "
             f"{self.takes.nbytes / 1e9:.1f} GB in RAM"
             + ("  (limit reached)" if self.takes.limit_hit else ""))
 

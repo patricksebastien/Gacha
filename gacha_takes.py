@@ -41,6 +41,8 @@ from scipy.signal import resample_poly
 from gacha_engine import NO_WINDOW, ffmpeg_exe
 
 ENGINE_SR = 44100
+LEVEL_LUFS = -14.0          # a levelled take's loudness: what the sample sets are cut at
+LEVEL_PEAK_DB = -0.1        # ...unless that would push its peak past this: the peak wins
 
 
 class Take:
@@ -52,7 +54,9 @@ class Take:
         self.frames = frames                # [Frame] with .arr (h, w, 4) and .t
         self.video_lag = video_lag          # s: frame .t minus the world time it shows
         self.saved = False                  # written to disk (by the archive worker)
-        self._bank = None
+        self.level = False                  # engine_audio() levelled to LEVEL_LUFS
+        self.level_db = 0.0                 # the gain that took, for the log
+        self._bank = None                   # (levelled?, audio) as the engine wants it
 
     @property
     def seconds(self):
@@ -71,16 +75,32 @@ class Take:
         return f"take{self.idx:02d}"
 
     def engine_audio(self):
-        """The audio as the engine wants it: stereo float32 at 44.1 kHz."""
-        if self._bank is None:
+        """The audio as the engine wants it: stereo float32 at 44.1 kHz, and
+        with `level` brought to LEVEL_LUFS integrated (ITU-R BS.1770, the
+        tape's silence gated out) the way the sample sets are, so a quiet
+        tape and a loud one carve drums at one level; the gain is capped
+        where the peak would pass LEVEL_PEAK_DB, so a take of hiss with one
+        burst is not pushed into clipping. Once per take, cached; the file
+        on disk stays as recorded."""
+        if self._bank is None or self._bank[0] != self.level:
             if self.sr == ENGINE_SR or not len(self.audio):
-                self._bank = self.audio
+                data = self.audio
             else:
                 from math import gcd
                 g = gcd(ENGINE_SR, self.sr)
-                self._bank = resample_poly(self.audio, ENGINE_SR // g, self.sr // g,
-                                           axis=0).astype(np.float32)
-        return self._bank
+                data = resample_poly(self.audio, ENGINE_SR // g, self.sr // g,
+                                     axis=0).astype(np.float32)
+            self.level_db = 0.0
+            if self.level and len(data):
+                from gacha_bank import integrated_lufs
+                peak = float(np.abs(data).max())
+                if peak > 0:
+                    gain_db = LEVEL_LUFS - integrated_lufs(data, ENGINE_SR)
+                    ceiling = LEVEL_PEAK_DB - 20 * np.log10(peak)
+                    self.level_db = min(gain_db, ceiling)
+                    data = (data * (10 ** (self.level_db / 20))).astype(np.float32)
+            self._bank = (self.level, data)
+        return self._bank[1]
 
     def frame_at(self, offset_s):
         """The frame showing the world at `offset_s` into the audio."""
@@ -170,6 +190,7 @@ class TakeStore(QObject):
         self.archive_dir = Path(archive_dir) if archive_dir else None
         self.archive_on_stop = bool(archive_on_stop)
         self.takes = []
+        self.level = False                       # new takes levelled (see Take.engine_audio)
         self.recording = False
         self.limit_hit = False
         self.started = None
@@ -247,6 +268,7 @@ class TakeStore(QObject):
             sr, audio, t0 = ENGINE_SR, np.zeros((0, 2), np.float32), None
         self._n += 1
         take = Take(self._n, audio, sr, t0, frames, lag)
+        take.level = self.level
         self.takes.append(take)
         self._enforce_cap()
         if self.archive_dir is not None and self.archive_on_stop:
@@ -331,6 +353,13 @@ class TakeStore(QObject):
         return n
 
     # ------------------------------------------------------------ material
+    def set_level(self, on):
+        """Every take levelled (or not) from now on, the ones in RAM too:
+        their engine audio is made again on the next bank()."""
+        self.level = bool(on)
+        for t in self.takes:
+            t.level = self.level
+
     def bank(self):
         """{take name: stereo float32 at 44.1 kHz} of every take with sound:
         the sample bank the engine works from."""
