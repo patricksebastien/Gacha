@@ -2771,8 +2771,8 @@ class Main(QMainWindow):
         self._mark_modes(self._mode_forms)
         tabs.addTab(perform, "Perform")
         tabs.addTab(sections, "Sections")
-        tabs.addTab(video, "Video")
         tabs.addTab(self._tab_canvas(), "Canvas")
+        tabs.addTab(video, "Video")
         audio_fx = self._tab_audio_fx()  # built here, shown after Video FX
         cycles = self._tab_cycles()  # built here, shown after Macros
         tabs.addTab(self._tab_video_fx(), "Video FX")
