@@ -114,7 +114,8 @@ IDM_STEPS = (0, 3, -5, 7, -2, 12, 5, -7, 2, -3, 9, -4, 4, -12, 6, -1)
 STYLE_VOICING = {
     "hypnotic": "the pulse (snare) climbs the harmonic series over the bar, a harmonic "
                 "per eighth: Tenney's pulse rate as pitch, the rising figure the "
-                "pattern's ramp only hints at",
+                "pattern's ramp only hints at (the fifth harmonic a minor third in a "
+                "minor key)",
     "footwork": "the cells' kicks off the beat a fourth up in the first half of the bar, "
                 "a fifth in the second: the kick as toms",
     "halftime": "every kick but the one a fourth down: the 808's slide",
@@ -123,18 +124,22 @@ STYLE_VOICING = {
     "breakbeat": "the snare's ghosts (under half velocity) three semitones down, the "
                  "sampler's trick",
     "dnb": "the snare's ghosts three semitones down, as in breakbeat",
-    "ukg": "the skippy 16th hats (the odd steps) a major third up",
+    "ukg": "the skippy 16th hats (the odd steps) a third up, the key's own (major or "
+           "minor)",
     "one-drop": "the rim (the snare at full) a fifth up, the ghost as it is",
     "idm": "the kick and the snare on a pitch of their own per step, fixed for the song",
 }
 # With the voicing on the whole kit is moved into the section's key as well:
-# every hit's note takes the root's shift (the sub bass's note, read off the
-# layers; a song's per section), so the box, each track tuned so that the
-# map's note sounds a C, is tuned to the samples. And the root itself goes
-# out once a bar on the one, held for most of the bar, on the tracks of
-# ROOT_ROLES (the box's T5 and T6, a Tone and a Chord machine by default):
-# the key under the kit, besides those tracks' own hits. Those are "root"
-# rows of the hit table, sent on the track channels only (a Model:Cycles).
+# every hit's note takes the root's shift (the key's tonic, read off the
+# layers with the Krumhansl profiles, gacha_engine.chroma_key; a song's per
+# section), so the box, each track tuned so that the map's note sounds a C,
+# is tuned to the samples. And the sub bass's note goes out once a bar on
+# the one, held for most of the bar, on the tracks of ROOT_ROLES (the box's
+# T5 and T6, a Tone and a Chord machine by default): the key under the kit,
+# besides those tracks' own hits. It is what the sub plays that bar (the
+# root, its fifth on the rolled bars, the bar's own pitch with the per-bar
+# follow on), the root on a bar without a sub note. Those are "root" rows
+# of the hit table, sent on the track channels only (a Model:Cycles).
 ROOT_ROLES = ("ride", "glitch")
 ROOT_VEL = 0.8
 _PCS = {"C": 0, "C#": 1, "D": 2, "D#": 3, "E": 4, "F": 5, "F#": 6, "G": 7, "G#": 8, "A": 9,
@@ -150,13 +155,17 @@ def root_shift(root):
     return pc - 12 if pc > 6 else pc
 
 
-def style_offset(style, role, step, vel):
+def style_offset(style, role, step, vel, mode="major"):
     """Semitones from the map's note for one hit of `role` at 16th `step`
-    of the bar with velocity `vel` (0..1), in `style` (STYLE_VOICING)."""
+    of the bar with velocity `vel` (0..1), in `style` (STYLE_VOICING).
+    `mode` is the section's key, "major" or "minor": the styles that
+    reach a third take the key's own."""
     s = int(step) % 16
+    minor = mode == "minor"
     if style == "hypnotic":
         if role == "snare":
-            return HARMONIC_LADDER[s // 2]
+            semis = HARMONIC_LADDER[s // 2]
+            return semis - 1 if minor and semis == 28 else semis
     elif style == "footwork":
         if role == "kick" and s % 4:
             return 5 if s < 8 else 7
@@ -174,7 +183,7 @@ def style_offset(style, role, step, vel):
             return -3
     elif style == "ukg":
         if role == "hihat" and s % 2:
-            return 4
+            return 3 if minor else 4
     elif style == "one-drop":
         if role == "snare" and vel >= 0.5:
             return 7

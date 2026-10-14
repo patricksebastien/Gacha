@@ -136,7 +136,8 @@ class Material:
 
 class Section:
     def __init__(self, kind, bpm, bars, seed, stems, events, notes, root=None,
-                 drum_style=None, style=None, salts=None, force=(), kit_salts=None):
+                 drum_style=None, style=None, salts=None, force=(), kit_salts=None,
+                 mode=None, sub_notes=None):
         self.kind, self.bpm, self.bars, self.seed = kind, bpm, bars, seed
         self.salts = dict(salts or {})  # {stem: int}: each part's stream of chance (a shuffle)
         self.kit_salts = dict(kit_salts or {})   # {voice: int}: the drum carved again (its sound)
@@ -147,6 +148,8 @@ class Section:
         self.events = events            # [[t, src, off, dur, rate, role]] t in s
         self.notes = notes              # human-readable what-went-in
         self.root = root                # note name of the layers ("A#"), for the sub and the tint
+        self.mode = mode                # its key's "major" or "minor", for the voicing
+        self.sub_notes = dict(sub_notes or {})   # bar -> the sub's note name, for the MIDI out
         self.n = len(next(iter(stems.values())))
 
     @property
@@ -466,11 +469,12 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     #      note per bar on its first kick, as in a song. Its own rng, so
     #      toggling the sub leaves the rest of the section unchanged ----
     root_rng = random.Random(seed ^ 0x5B)
-    pc = section_root(stems["layers"])
-    if pc is None:
-        pc = root_rng.randrange(12)
+    chroma = section_chroma(stems["layers"], whole=k.sub_follow)
+    pc, mode = E.chroma_key(chroma) if chroma is not None else (root_rng.randrange(12), "major")
     root = E.NOTE_NAMES[pc]
+    sub_notes = {}                                   # bar -> the note's name (the MIDI out)
     if k.sub_level > 0 and kick_hits:
+        bar_pc = E.bar_pcs(chroma, bars, int(bar * SR), pc, mode) if k.sub_follow else None
         first_kick = {}                              # bar -> (pos, step)
         for pos, bar_i, s in kick_hits:
             if bar_i not in first_kick or s < first_kick[bar_i][1]:
@@ -478,10 +482,14 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         starts = []
         for bar_i in sorted(first_kick):
             if root_rng.random() < k.sub_chance:     # weighted occurrence
-                midi = E.sub_midi(pc)
-                if root_rng.random() < 0.2:          # some bars sit on the fifth
-                    midi = midi + 7 if midi + 7 <= E.SUB_HI else midi - 5
+                if bar_pc is not None:               # the bar's own pitch
+                    midi = E.sub_midi(bar_pc[bar_i])
+                else:
+                    midi = E.sub_midi(pc)
+                    if root_rng.random() < 0.2:      # some bars sit on the fifth
+                        midi = midi + 7 if midi + 7 <= E.SUB_HI else midi - 5
                 starts.append((first_kick[bar_i][0], midi))
+                sub_notes[bar_i] = E.NOTE_NAMES[(midi - E.SUB_LO) % 12]
         hits = []
         note_len = int((beat + k.sub_release) * SR)  # one-beat hold + release
         for i, (pos, midi) in enumerate(starts):
@@ -502,7 +510,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 ref = E.rms(mix) or E.rms(drums)
                 sub *= k.sub_level * ref / E.rms(sub[active])
                 stems["sub"] += sub
-                notes.append(f"sub {root}: {len(hits)} notes over {len(first_kick)} bars")
+                played = " ".join(sub_notes[b] for b in sorted(sub_notes))
+                notes.append(f"sub {root} {mode}: {len(hits)} notes over {len(first_kick)} "
+                             f"bars ({played})")
 
     # ---- filtered intro: a lowpass opens bar by bar (the club door) ----
     if intro_kind == "filtered":
@@ -555,17 +565,17 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     events.sort(key=lambda e: e[0])
     return Section(kind, bpm, bars, seed, stems, events, notes, root=root,
                    drum_style=drum_style, style=style, salts=salts, force=force,
-                   kit_salts=kit_salts)
+                   kit_salts=kit_salts, mode=mode, sub_notes=sub_notes)
 
 
 SECTION_ROOT_MAX_S = 8.0     # the chroma looks at this much of the layers at most
 
 
-def section_root(layers):
-    """Dominant pitch class of the layers stem (E.section_root, on no more
-    than SECTION_ROOT_MAX_S seconds so a render stays quick), or None when
-    the layers are silent."""
-    return E.section_root(layers[: int(SECTION_ROOT_MAX_S * SR)])
+def section_chroma(layers, whole=False):
+    """The chroma of the layers stem (E.section_chroma, on no more than
+    SECTION_ROOT_MAX_S seconds so a render stays quick, or the whole loop
+    for the per-bar follow), or None when the layers are silent."""
+    return E.section_chroma(layers if whole else layers[: int(SECTION_ROOT_MAX_S * SR)])
 
 
 def cut_burst(audio, sr, off_s, len_s, out_sr=None, fade_s=0.003):

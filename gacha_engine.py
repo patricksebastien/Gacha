@@ -109,6 +109,8 @@ class Knobs:
     sub_pan: float = 0.3              # dry osc to the right, phased to the left
     sub_chance: float = 0.6           # per bar: a sub note on its first kick
     sub_release: float = 1.5          # seconds of release after a one-beat hold
+    sub_follow: bool = False          # per bar: the sub on the bar's own pitch (the key's
+                                      # tonic, fifth, fourth or relative), not the roll
     # sections
     break_chance: float = 0.25        # a middle section becomes a break
     section_bars: list = field(
@@ -501,15 +503,84 @@ def apply_outro(song, style, beat, tail_sec=None, onset_n=None, wet=1.0,
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 
-def section_root(tonal_seg):
-    """Dominant pitch class of a tonal segment via chroma, or None if the
-    segment is essentially silent."""
+# Krumhansl-Kessler key profiles (1982): how much each scale degree is
+# heard as belonging to a key, from the tonic up; the key of a segment is
+# the rotation, major or minor, whose profile correlates best with the
+# segment's mean chroma. The tonic from the whole profile, then, where the
+# loudest bin alone was the fifth or the third of a chord as often as not.
+KEY_MAJOR = (6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88)
+KEY_MINOR = (6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.39, 3.17)
+CHROMA_HOP = 2048
+# the pitch classes a bar's sub may sit on, from the key's tonic: the tonic,
+# the fifth, the fourth and the relative key (the sixth of a major, the
+# third of a minor); and how much louder than the tonic's bin one of the
+# others must be in the bar's chroma to take the bar
+BAR_DEGREES = {"major": (0, 7, 5, 9), "minor": (0, 7, 5, 3)}
+BAR_MARGIN = 1.2
+
+
+def section_chroma(tonal_seg):
+    """The chroma frames (12, frames; CHROMA_HOP apart) of a tonal segment,
+    or None if the segment is essentially silent."""
     m = mono(tonal_seg)
     if len(m) < 4096 or rms(m) < 1e-4:
         return None
-    chroma = librosa.feature.chroma_cqt(y=m.astype("float32"), sr=SR,
-                                        hop_length=2048)
-    return int(np.argmax(chroma.mean(axis=1)))
+    return librosa.feature.chroma_cqt(y=m.astype("float32"), sr=SR,
+                                      hop_length=CHROMA_HOP)
+
+
+def chroma_key(chroma):
+    """(tonic pitch class, "major" | "minor") of a chroma, the best of the
+    24 Krumhansl profiles against its mean."""
+    prof = np.asarray(chroma, dtype="float64")
+    if prof.ndim == 2:
+        prof = prof.mean(axis=1)
+    prof = prof - prof.mean()
+    if not np.any(prof):
+        return 0, "major"
+    best, best_r = (0, "major"), -np.inf
+    for mode, template in (("major", KEY_MAJOR), ("minor", KEY_MINOR)):
+        t = np.asarray(template) - np.mean(template)
+        t /= np.linalg.norm(t)                    # Pearson: the two templates' norms differ
+        for pc in range(12):
+            r = float(np.dot(prof, np.roll(t, pc)))
+            if r > best_r:
+                best, best_r = (pc, mode), r
+    return best
+
+
+def section_root(tonal_seg):
+    """Tonic pitch class and mode of a tonal segment, or None if the
+    segment is essentially silent."""
+    chroma = section_chroma(tonal_seg)
+    if chroma is None:
+        return None
+    return chroma_key(chroma)
+
+
+def bar_pcs(chroma, n_bars, bar_samples, pc, mode):
+    """The sub's pitch class per bar with the per-bar follow on: among the
+    key's BAR_DEGREES, the one the bar's chroma has most of, the tonic
+    unless another beats it by BAR_MARGIN. The tonic everywhere without
+    a chroma (silence)."""
+    out = [pc] * n_bars
+    if chroma is None or n_bars <= 0:
+        return out
+    per_bar = bar_samples / CHROMA_HOP
+    degs = BAR_DEGREES[mode]
+    for b in range(n_bars):
+        a, z = int(round(b * per_bar)), int(round((b + 1) * per_bar))
+        seg = chroma[:, a:min(z, chroma.shape[1])]
+        if seg.shape[1] == 0:
+            continue
+        prof = seg.mean(axis=1)
+        best, best_v = pc, float(prof[pc]) * BAR_MARGIN
+        for d in degs[1:]:
+            v = float(prof[(pc + d) % 12])
+            if v > best_v:
+                best, best_v = (pc + d) % 12, v
+        out[b] = best
+    return out
 
 
 SUB_LO, SUB_HI = 24, 35     # C1 33 Hz .. B1 62 Hz: sub-bass, never a "note"
@@ -1639,17 +1710,24 @@ def compose(seed, duration, sample_files, intro_bars=None,
     #      GUI's visuals; computed even when the sub is off -----------------
     root_rng = random.Random(seed ^ 0x5B)        # isolated: toggling the sub
     roots = {}                                   # leaves the song unchanged
+    bar_pc = {}                                  # global bar -> the sub's pitch class (follow)
     last = None
     for m in sections_meta:
         a, b = int(m["start_sec"] * SR), int(m["end_sec"] * SR)
-        pc = section_root(tonal[a:b])
-        if pc is None:
-            pc = last if last is not None else root_rng.randrange(12)
-        roots[m["i"]] = last = pc
-        m["root"] = NOTE_NAMES[pc]
-    print(f"  roots {' '.join(m['root'] for m in sections_meta)}")
+        chroma = section_chroma(tonal[a:b])
+        key = chroma_key(chroma) if chroma is not None else None
+        if key is None:
+            key = last if last is not None else (root_rng.randrange(12), "major")
+        roots[m["i"]] = last = key
+        m["root"], m["mode"] = NOTE_NAMES[key[0]], key[1]
+        if k.sub_follow:
+            for bi, pc in enumerate(bar_pcs(chroma, m["bars"], int(bar * SR), *key)):
+                bar_pc[m["start_bar"] + bi] = pc
+    print("  roots " + " ".join(m["root"] + ("m" if m["mode"] == "minor" else "")
+                                for m in sections_meta))
 
     # ---- sub bass: one note per bar on its first kick ---------------------
+    sub_notes = {}                               # global bar -> the note's name (the MIDI out)
     if k.sub_level > 0 and kick_hits:
         sub_rng = root_rng
         # one candidate per bar: its first kick (the start of the sequence)
@@ -1663,10 +1741,14 @@ def compose(seed, duration, sample_files, intro_bars=None,
         for bar_i in sorted(first_kick):
             if sub_rng.random() < k.sub_chance:  # weighted occurrence
                 pos, si, _ = first_kick[bar_i]
-                midi = sub_midi(roots[si])
-                if sub_rng.random() < 0.2:       # some bars sit on the fifth
-                    midi = midi + 7 if midi + 7 <= SUB_HI else midi - 5
+                if k.sub_follow:                 # the bar's own pitch
+                    midi = sub_midi(bar_pc.get(bar_i, roots[si][0]))
+                else:
+                    midi = sub_midi(roots[si][0])
+                    if sub_rng.random() < 0.2:   # some bars sit on the fifth
+                        midi = midi + 7 if midi + 7 <= SUB_HI else midi - 5
                 starts.append((pos, midi))
+                sub_notes[bar_i] = NOTE_NAMES[(midi - SUB_LO) % 12]
         hits = []
         note_len = int((beat + k.sub_release) * SR)   # one-beat hold + release
         for i, (pos, midi) in enumerate(starts):
@@ -1782,6 +1864,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
             "knobs": asdict(k),
             "samples": names,
             "sections": sections_meta,
+            "sub_notes": [[b, sub_notes[b]] for b in sorted(sub_notes)],
             "events": sorted(events, key=lambda e: e[0]),
             "video_sources": {n: str(v) for n, v in (video_sources or {}).items()
                               if n in bank}}

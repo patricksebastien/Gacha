@@ -293,36 +293,49 @@ def _device_index(name, kind, api=None):
     raise RuntimeError(f"{name}: not found (unplugged?)")
 
 
-def drum_table(events, sr, style=None, bpm=None, root=None, length_s=None):
+def drum_table(events, sr, style=None, bpm=None, root=None, length_s=None, mode=None,
+               sub=None):
     """The drum hits of an event timeline ([t, src, off, dur, rate, role,
     (vel)] with t in seconds) as (frames int64 sorted, roles, velocities
     0..1, semitones), for the MIDI out; None when there is none. The
     semitones are the style voicing (gacha_midi.style_offset) of each hit
     from the drum style the hits were patterned in and the tempo, by its
     16th step in the bar, plus the key: `root`, a note name (a section's)
-    or a list of (start_s, end_s, name) (a song's sections), moves every
-    hit into that key (gacha_midi.root_shift). With a root and `length_s`
-    (the loop's or the song's length) a "root" row sits on every bar's
-    one as well, the root note itself for the box's tone and chord tracks
-    (ROOT_ROLES). Semitones 0 everywhere without a style and a tempo."""
+    or a list of (start_s, end_s, name[, mode]) (a song's sections), moves
+    every hit into that key (gacha_midi.root_shift); `mode` ("major" or
+    "minor", a section's; a song's ride in the list) picks the key's own
+    third where a style reaches one. With a root and `length_s` (the
+    loop's or the song's length) a "root" row sits on every bar's one as
+    well, for the box's tone and chord tracks (ROOT_ROLES): the sub
+    bass's note that bar when `sub` ({bar: name}, the loop's bars or the
+    song's) has one, else the root itself. Semitones 0 everywhere without
+    a style and a tempo."""
     rows = []
     step_s = 60.0 / bpm / 4 if style and bpm else None
     if isinstance(root, str) or root is None:
-        spans = [(-1e9, 1e9, root_shift(root))]
+        spans = [(-1e9, 1e9, root_shift(root), mode or "major")]
     else:
-        spans = [(float(a), float(b), root_shift(r)) for a, b, r in root]
-    key = (lambda t: next((k for a, b, k in spans if a <= t < b), 0)) if step_s else (lambda t: 0)
+        spans = [(float(sp[0]), float(sp[1]), root_shift(sp[2]),
+                  sp[3] if len(sp) > 3 and sp[3] else "major") for sp in root]
+    span_of = (lambda t: next((sp for sp in spans if sp[0] <= t < sp[1]), None)) \
+        if step_s else (lambda t: None)
     for e in events or ():
         if len(e) < 6 or e[5] not in DRUM_ROLES:
             continue
         vel = min(1.0, max(0.0, float(e[6]) if len(e) > 6 else 1.0))
         t = float(e[0])
-        semis = style_offset(style, e[5], int(round(t / step_s)), vel) if step_s else 0
-        rows.append((int(round(t * sr)), e[5], vel, semis + key(t)))
+        sp = span_of(t)
+        key, md = (sp[2], sp[3]) if sp else (0, "major")
+        semis = style_offset(style, e[5], int(round(t / step_s)), vel, md) if step_s else 0
+        rows.append((int(round(t * sr)), e[5], vel, semis + key))
     if step_s and root and length_s:
         bar_s = step_s * 16
+        sub = sub or {}
         for b in range(int(round(length_s / bar_s))):
-            rows.append((int(round(b * bar_s * sr)), "root", ROOT_VEL, key(b * bar_s)))
+            sp = span_of(b * bar_s)
+            name = sub.get(b, sub.get(str(b)))
+            semis = root_shift(name) if name else (sp[2] if sp else 0)
+            rows.append((int(round(b * bar_s * sr)), "root", ROOT_VEL, semis))
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])
@@ -1011,7 +1024,7 @@ class SectionPlayer:
         self.fill_armed = None
 
     def queue(self, stems, events, bpm, bars, bar_t0=None, start_bar=0, style=None,
-              root=None):
+              root=None, mode=None, sub=None):
         """The next section: on the loop's next bar while one plays, else
         from the next block, or, `bar_t0` given (monotonic seconds, the
         Link session's bar), exactly then as heard: the block's `now` is
@@ -1022,23 +1035,25 @@ class SectionPlayer:
         just passed, the loop entered that far in.
         `start_bar`: the loop entered that many bars in (an outro, from
         its second half). `style`: the drum style the hits were patterned
-        in, and `root` the section's note name, for the MIDI out's style
-        voicing."""
+        in, `root` the section's note name and `mode` its major or minor,
+        for the MIDI out's style voicing; `sub` the sub bass's note per
+        bar ({bar: name}) for the root rows."""
         self.pending = (stems, events, bpm, bars, bar_t0,
-                        drum_table(events, self.sr, style, bpm, root, bars * 240.0 / bpm),
+                        drum_table(events, self.sr, style, bpm, root, bars * 240.0 / bpm,
+                                   mode, sub),
                         int(start_bar))
         self._pend_covered = 0
         self.frag.prepare(stems)             # its stacked copy, here and not on the audio thread
 
-    def replace(self, stems, events, style=None, root=None):
+    def replace(self, stems, events, style=None, root=None, mode=None, sub=None):
         """The playing section's stems and events anew, the loop where it
         is: a shuffle (one part rendered again, the rest the same arrays).
         Lands on the next bar line, a block late at most; the same length
         as the loop or it is dropped. A section queued meanwhile wins, it
-        replaces everything anyway; a break waits it out. `style` and
-        `root` as in queue()."""
+        replaces everything anyway; a break waits it out. `style`, `root`,
+        `mode` and `sub` as in queue()."""
         self._replace = (stems, events, drum_table(events, self.sr, style, self.bpm, root,
-                                                   self.bars * 240.0 / self.bpm))
+                                                   self.bars * 240.0 / self.bpm, mode, sub))
         self.frag.prepare(stems)
 
     def waiting_for(self):
@@ -1443,14 +1458,15 @@ class SongPlayer:
         self.lookahead = 0
         self.hits = []
 
-    def set_events(self, events, style=None, bpm=None, roots=None):
+    def set_events(self, events, style=None, bpm=None, roots=None, sub=None):
         """The render's event timeline (its meta's `events`), for the MIDI
-        out; its drum style and tempo (the meta's `style` and `bpm`) and
-        its sections' roots ([(start_s, end_s, name)]) for the style
-        voicing."""
+        out; its drum style and tempo (the meta's `style` and `bpm`), its
+        sections' keys ([(start_s, end_s, name, mode)]) for the style
+        voicing and the sub bass's note per bar ({bar: name}, the meta's
+        `sub_notes`) for the root rows."""
         self.bpm = float(bpm) if bpm else None
-        end = max((float(b) for _a, b, _r in roots or ()), default=0.0)
-        self._ev = drum_table(events, self.sr, style, bpm, roots, end or None)
+        end = max((float(sp[1]) for sp in roots or ()), default=0.0)
+        self._ev = drum_table(events, self.sr, style, bpm, roots, end or None, None, sub)
 
     def load(self, path, play=True):
         self._gen += 1

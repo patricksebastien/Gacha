@@ -3161,8 +3161,11 @@ class Main(QMainWindow):
             "into the section's key, the root the sub bass plays (a song's per "
             "section): every hit's note takes the root's shift, B one down, G a "
             "fourth down, so with each track tuned so the map's note sounds a C "
-            "the box is tuned to the samples. With the tracks tick the root "
-            "itself goes out on the one of every bar, held for most of the bar, on "
+            "the box is tuned to the samples; a style that reaches a third takes "
+            "the key's own, major or minor. With the tracks tick the sub bass's "
+            "note goes out on the one of every bar (the root, its fifth on the "
+            "rolled bars, the bar's own pitch with the per-bar tick of the Sections "
+            "tab; the root on a bar without a sub), held for most of the bar, on "
             "the ride's and the hat stutter's tracks, T5 and T6, a Tone and a Chord "
             "machine by default: the key under the kit, besides those tracks' own "
             "hits in key. The drum pads are never shifted. Off by default, "
@@ -7907,10 +7910,19 @@ class Main(QMainWindow):
                                           suffix=" s")
         self.sub_release.setValue(1.5)
         self.sub_release.setToolTip("Release after a one-beat hold")
+        self.sub_follow = QCheckBox("per bar")
+        self.sub_follow.setToolTip(
+            "Off: every sub note is the section's key note, two bars in ten its "
+            "fifth, rolled. On: each bar's note is read off the textures of that "
+            "bar, the key note unless the bar has clearly more of the fifth, the "
+            "fourth or the relative key (a minor's third, a major's sixth), so the "
+            "sub follows a loop that moves. The MIDI out's root notes (T5 and T6 "
+            "on a Model:Cycles) play what the sub plays either way.")
         form.addRow("Sub notes", self._row([("chance", self.sub_chance),
-                                            ("release", self.sub_release)]))
-        hint = QLabel("pitched to each section's root note, on the first kick "
-                      "of a bar")
+                                            ("release", self.sub_release),
+                                            ("", self.sub_follow)]))
+        hint = QLabel("pitched to each section's key (the Krumhansl profiles on the "
+                      "textures' chroma, major or minor), on the first kick of a bar")
         hint.setProperty("role", "sub")
         form.addRow("", hint)
         return form
@@ -8574,7 +8586,8 @@ class Main(QMainWindow):
                  "sub_phaser": self.sub_phaser.value(),
                  "sub_pan": self.sub_pan.value(),
                  "sub_chance": self.sub_chance.value(),
-                 "sub_release": self.sub_release.value()}
+                 "sub_release": self.sub_release.value(),
+                 "sub_follow": self.sub_follow.isChecked()}
         for role, w in self.gain.items():
             knobs[f"gain_{role}"] = w.value()
         for role, w in self.synth.items():
@@ -9290,7 +9303,8 @@ class Main(QMainWindow):
         pl = la.player if la is not None and la.running else None
         if self._perf_playing is sec and pl is not None and pl.playing:
             pl.replace(out, events, style=getattr(sec, "drum_style", None),
-                       root=getattr(sec, "root", None))
+                       root=getattr(sec, "root", None), mode=getattr(sec, "mode", None),
+                       sub=getattr(sec, "sub_notes", None))
             self._shuffle_landing.append(part)
             self.log.appendPlainText(f"randomize {part}: {what}; on the bar")
         else:
@@ -9340,7 +9354,8 @@ class Main(QMainWindow):
         # the ending effect and the ring-out, then the stop
         start_bar = sec.bars // 2 if sec.kind == "outro" else 0
         pl.queue(stems, sec.events, sec.bpm, sec.bars, bar_t0, start_bar,
-                 style=getattr(sec, "drum_style", None), root=getattr(sec, "root", None))
+                 style=getattr(sec, "drum_style", None), root=getattr(sec, "root", None),
+                 mode=getattr(sec, "mode", None), sub=getattr(sec, "sub_notes", None))
         if self._shuffle_landing:                     # the queued section replaces everything
             self._shuffle_landing = []
             self._shuffle_faces()
@@ -10033,6 +10048,8 @@ class Main(QMainWindow):
             self.perf_status.setText(f"{big}  ·  bar {bar}/{pl.bars}  ·  {ready}")
         else:
             root = f" in {sec.root}" if getattr(sec, "root", None) else ""
+            if root and getattr(sec, "mode", None) == "minor":
+                root += " minor"
             spd = self._speed_note(pl)
             self.perf_status.setText(
                 f"playing {sec.kind}{root} {pl.bpm:.0f} bpm{spd}  ·  bar {bar}/{pl.bars}"
@@ -10827,8 +10844,9 @@ class Main(QMainWindow):
             if self.through is not None:     # its drum hits, for the MIDI out
                 self.through.song.set_events(
                     meta.get("events") or [], meta.get("style"), meta.get("bpm"),
-                    [(s["start_sec"], s["end_sec"], s.get("root"))
-                     for s in meta.get("sections") or [] if "start_sec" in s])
+                    [(s["start_sec"], s["end_sec"], s.get("root"), s.get("mode"))
+                     for s in meta.get("sections") or [] if "start_sec" in s],
+                    {int(b): str(name) for b, name in meta.get("sub_notes") or []})
             self._sections = meta["sections"]
             self._sec_bounds = [int(s["start_sec"] * 1000)
                                 for s in self._sections]
