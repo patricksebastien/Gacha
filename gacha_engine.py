@@ -636,12 +636,19 @@ def filter_sweep(clip, f_start, f_end, n_chunks=16, highpass=False):
     """Chunked filter whose cutoff glides geometrically from f_start to
     f_end over the clip. Each chunk is filtered with a little context so
     the filter has settled by the time the chunk starts."""
+    return filter_path(clip, np.geomspace(f_start, f_end, n_chunks), highpass)
+
+
+def filter_path(clip, cutoffs, highpass=False, wrap=False):
+    """Chunked filter along a path of cutoffs, one per chunk, each chunk
+    filtered with a little context before it so the filter has settled.
+    `wrap` takes the first chunk's context from the clip's end: a loop."""
     n = len(clip)
-    if n == 0:
+    n_chunks = len(cutoffs)
+    if n == 0 or n_chunks == 0:
         return clip
     out = clip.copy()
     step = max(1, n // n_chunks)
-    cutoffs = np.geomspace(f_start, f_end, n_chunks)
     Filt = HighpassFilter if highpass else LowpassFilter
     for i in range(n_chunks):
         a = i * step
@@ -649,10 +656,28 @@ def filter_sweep(clip, f_start, f_end, n_chunks=16, highpass=False):
         if a >= b:
             break
         pre = max(0, a - 2048)
+        seg_in = clip[pre:b]
+        ctx = a - pre
+        if wrap and a == 0 and n > 2048:
+            seg_in = np.vstack([clip[-2048:], seg_in])
+            ctx = 2048
         seg = Pedalboard([Filt(cutoff_frequency_hz=float(cutoffs[i]))])(
-            clip[pre:b].T, SR).T
-        out[a:b] = seg[a - pre:]
+            seg_in.T, SR).T
+        out[a:b] = seg[ctx:]
     return out
+
+
+def breathe(rng, loop, n_chunks=32):
+    """A lowpass opening over the loop's first half and closing over the
+    second, from a few hundred Hz up to the top and back, so the loop
+    closes on itself: the filter house and techno ride on, slowed to the
+    loop's length (Feel.breathe)."""
+    f_lo = rng.uniform(200.0, 500.0)
+    f_hi = rng.uniform(4000.0, 12000.0)
+    half = max(1, n_chunks // 2)
+    up = np.geomspace(f_lo, f_hi, half)
+    path = np.concatenate([up, up[::-1]])
+    return filter_path(loop, path, wrap=True)
 
 
 def cymbal_swell(rng, hit, length):
@@ -1028,6 +1053,285 @@ OPEN_HAT = {
 }
 
 
+# ---------------------------------------------------------------- the feel
+# A drum style is more than its kit's pattern: a style's textures loop a
+# certain way, its chops sit on their own steps, its one-shots are short
+# or long, its swing lazy or none, its echoes dub or slapback. Feel holds
+# every such number for the parts the patterns do not reach (the layers,
+# the chops, the events, the drums' time, the sub), one Feel per style in
+# STYLE_FEEL; Feel() alone is the renderer as it was, so a style with no
+# entry sounds as before. Each field bends the Generate tab's knob of the
+# same matter (a multiplier on its chance, a range inside its range) and
+# never replaces it: a knob at 0 stays 0 in every style. compose() and
+# gacha_section.render_section() both read it (style_feel), the live
+# player's parts each from their own stream of chance as before, so a
+# shuffle of one part leaves the others as they were.
+
+@dataclass(frozen=True)
+class Feel:
+    note: str = ""                    # one line, what the style does outside the kit
+    # the drums' time
+    swing: tuple = (0.0, 0.06)        # the swing drawn when the knob is none, of a 16th
+    humanize: float = 1.0             # x the humanize knob (timing and velocity), capped at 1
+    mutation: float = 1.0             # x the per-bar mutation chance
+    glitch: float = 1.0               # x the hat stutter's chance
+    fill: float = 0.6                 # a snare fill on a section's last bar
+    ride: float = 0.35                # a ride in a groove
+    sub: float = 1.0                  # x the sub's per-bar chance, capped at 1
+    ratchet: float = 0.0              # a hit's chance of being a roll inside its 16th (the hats
+                                      # most, the snare, the ride and the kick less, RATCHET_ROLE)
+    ratchet_counts: tuple = (2, 2, 3, 4)   # the roll's hits, 32nds to 64ths
+    # the layers (the textures)
+    layers: tuple | None = None       # (lo, hi) textures a groove gets, inside the knobs' range
+    layer_bars: tuple | None = None   # a texture cut to a loop of so many bars; None: as it comes
+    reverse: float = 1.0              # x the reverse chance
+    stretch: float = 1.0              # x the stretch chance
+    stretch_bars: tuple = (1, 2, 4)   # the bars a stretched texture is fitted to
+    layer_level: float = 1.0          # x the texture level
+    breathe: float = 0.0              # a lowpass opening over the loop's first half, closing over the second
+    # the effect chains (the textures', the chops', the one-shots')
+    pitch: tuple = (-12, -7, -5, 0, 5, 7, 12)   # the chain's pitch shift, in semitones
+    favour: tuple = ()                # effects (by name) a chain reaches for first
+    avoid: tuple = ()                 # effects a chain never holds
+    delay: tuple | None = None        # the synced delay's tiers: short, med, long, dub
+    # the chops
+    chop: float = 1.0                 # x the chop chance (and the break's 0.5)
+    chop_steps: tuple | None = None   # the 16ths a chop may land on; None: any
+    chop_period: tuple | None = None  # a count instead: a chop every 3, 5, 6 or 7 16ths across the section
+    chop_density: float = 0.4         # the chance each candidate step holds a chop
+    chop_pick: int = 8                # how many of the sample's 8 slices a pattern draws from
+    chop_len: tuple = (1, 2, 2, 4)    # a piece's longest length, in 16ths
+    chop_rev: float = 0.2             # a piece played backwards
+    chop_swing: bool = False          # the chops' odd 16ths swung with the drums
+    chop_gain: float = 1.0            # x the chop gain
+    # the events (the one-shots)
+    events: tuple = (1, 3)            # how many a section gets
+    event_len: tuple = (1.0, 4.0)     # seconds of material
+    event_grid: str = "beat"          # where they land: 16th, beat, half (beats 1 and 3), bar
+    event_rev: float = 0.4            # played backwards
+    event_gain: float = 1.0           # x the one-shot's level
+
+
+STYLE_FEEL = {
+    "four-floor": Feel(
+        note="house: textures in 2, 4 or 8 bar loops, a filter breathing on the loop, "
+             "the chops a stab on the 8ths",
+        swing=(0.0, 0.05), ratchet=0.05, layers=(1, 3), layer_bars=(2, 4, 8), breathe=0.3,
+        favour=("Chorus", "Reverb", "Delay"), pitch=(-12, 0, 0, 5, 7, 12),
+        chop_steps=(0, 2, 4, 6, 8, 10, 12, 14), chop_density=0.45, chop_pick=3,
+        chop_len=(2, 2, 4)),
+    "breakbeat": Feel(
+        note="the break's own grit: short loops, stretched breaks, crushed and driven "
+             "chains, chops anywhere and short, more mutation and stutter",
+        swing=(0.03, 0.1), humanize=1.2, mutation=1.3, glitch=1.2, ratchet=0.08,
+        layers=(1, 2), layer_bars=(1, 2, 2), reverse=1.2, stretch=1.2, stretch_bars=(1, 2),
+        favour=("Saturator", "Bitcrush"), pitch=(-12, -5, -2, 0, 2, 5),
+        chop=1.2, chop_density=0.45, chop_len=(1, 1, 2), chop_rev=0.3,
+        event_len=(0.5, 2.5), event_rev=0.5),
+    "boom-bap": Feel(
+        note="hip hop: a lazy swing the chops follow, the sample loop (1, 2 or 4 bars) "
+             "dusty and pitched down, a few long chops, few fills, hardly a ride",
+        swing=(0.08, 0.16), humanize=1.4, mutation=0.7, glitch=0.4, fill=0.4, ride=0.1,
+        layers=(1, 2), layer_bars=(1, 2, 2, 4), reverse=0.3, stretch=0.3, stretch_bars=(2, 4),
+        favour=("Bitcrush", "Saturator", "Ladder"), pitch=(-5, -3, -2, 0, 0, 2),
+        delay=("short", "med"),
+        chop=1.3, chop_density=0.35, chop_pick=4, chop_len=(2, 4, 4), chop_rev=0.1,
+        chop_swing=True, events=(1, 2), event_len=(0.5, 2.0), event_rev=0.15),
+    "halftime": Feel(
+        note="trap: the sub on nearly every bar, hat rolls, octave-down and octave-up "
+             "textures in 2 or 4 bar loops, sparse chops, a riser on the one",
+        swing=(0.0, 0.04), humanize=0.6, glitch=1.5, fill=0.5, ride=0.1, sub=1.4, ratchet=0.2,
+        layers=(1, 2), layer_bars=(2, 4), reverse=0.8, stretch_bars=(2, 4),
+        favour=("Reverb", "PitchShift"), pitch=(-12, -12, -7, 0, 12), delay=("med", "long"),
+        chop=0.8, chop_steps=(0, 3, 6, 8, 11, 14), chop_pick=2, chop_len=(2, 4, 4),
+        events=(1, 2), event_len=(2.0, 5.0), event_grid="bar", event_rev=0.5),
+    "dnb": Feel(
+        note="the stretch is the sound: textures time-stretched to 1 or 2 bars, driven "
+             "and filtered, the sub on most bars, short chops, fills on most last bars",
+        swing=(0.0, 0.03), humanize=0.6, mutation=1.2, glitch=1.3, fill=0.8, ride=0.2, sub=1.3,
+        ratchet=0.1,
+        layers=(1, 2), layer_bars=(2, 4), stretch=1.5, stretch_bars=(1, 2),
+        favour=("Saturator", "Ladder", "Phaser", "PitchShift"), pitch=(-12, -7, -5, 0, 12),
+        delay=("short", "med"),
+        chop=1.1, chop_len=(1, 1, 2), chop_rev=0.3,
+        event_len=(0.5, 3.0), event_rev=0.5),
+    "minimal": Feel(
+        note="one short loop, a filter breathing, delays and phasers, a chop or two "
+             "of the same slice, hardly an event, nothing moves much",
+        swing=(0.0, 0.03), humanize=0.5, mutation=0.5, glitch=0.6, fill=0.2, ride=0.2,
+        ratchet=0.03, layers=(1, 1), layer_bars=(1, 1, 2), reverse=0.6, stretch=0.8, layer_level=0.9,
+        breathe=0.5, favour=("Delay", "Phaser", "Ladder"), pitch=(-12, 0, 0, 12),
+        delay=("short", "med", "med"),
+        chop=0.8, chop_density=0.25, chop_pick=2, chop_len=(1, 1, 2), chop_rev=0.1,
+        events=(0, 1), event_len=(0.3, 1.5), event_grid="16th", event_rev=0.3),
+    "ukg": Feel(
+        note="2-step: a heavy shuffle the chops take too, chopped and pitched-up "
+             "textures in 1 or 2 bar loops, skippy chops on the 16ths off the beat",
+        swing=(0.1, 0.2), humanize=0.9, ride=0.1, sub=1.2, ratchet=0.08,
+        layers=(1, 2), layer_bars=(1, 2, 2), reverse=0.6, stretch=0.8,
+        favour=("Chorus", "Reverb", "PitchShift"), pitch=(0, 5, 7, 12, 12),
+        delay=("short", "med"),
+        chop=1.4, chop_steps=(2, 3, 6, 7, 10, 11, 14, 15), chop_density=0.5, chop_pick=3,
+        chop_len=(1, 1, 2), chop_rev=0.15, chop_swing=True,
+        event_len=(0.3, 1.5), event_grid="16th", event_rev=0.3),
+    "dembow": Feel(
+        note="reggaeton: straight time, the chops on the figure's own steps (the "
+             "boom-ch-boom), short loops, the sub on most bars",
+        swing=(0.0, 0.02), humanize=0.5, mutation=0.5, glitch=0.5, fill=0.4, ride=0.1, sub=1.2,
+        ratchet=0.05,
+        layers=(1, 2), layer_bars=(1, 2), reverse=0.5, stretch=0.6,
+        favour=("Reverb", "Delay", "Saturator"), pitch=(-5, 0, 0, 5, 7), delay=("short", "med"),
+        chop=1.1, chop_steps=(0, 3, 6, 8, 11, 14), chop_density=0.5, chop_pick=2,
+        chop_len=(1, 2, 2), chop_rev=0.1,
+        events=(1, 2), event_len=(0.5, 2.0)),
+    "one-drop": Feel(
+        note="dub: the bass on nearly every bar, two or three textures in long loops "
+             "through dub echoes and the chamber, the chop a skank on the offbeat 8ths "
+             "(one slice, swung), echoing one-shots on beats 1 and 3",
+        swing=(0.04, 0.1), humanize=1.3, mutation=0.6, glitch=0.3, fill=0.3, ride=0.3, sub=1.5,
+        layers=(2, 3), layer_bars=(2, 4, 4), reverse=0.8, stretch=0.7, stretch_bars=(2, 4),
+        layer_level=1.1, breathe=0.3,
+        favour=("Delay", "Reverb", "Phaser"), avoid=("Bitcrush", "GSM"),
+        pitch=(-12, -5, 0, 0, 7), delay=("dub", "dub", "long"),
+        chop=0.9, chop_steps=(2, 6, 10, 14), chop_density=0.8, chop_pick=1, chop_len=(1, 2),
+        chop_rev=0.0, chop_swing=True,
+        events=(2, 4), event_len=(1.0, 4.0), event_grid="half", event_rev=0.3, event_gain=1.1),
+    "footwork": Feel(
+        note="juke: the chops in cells of three (the same slice, over and over), "
+             "pitched-up textures in short loops, stutters, tiny one-shots on the 16ths",
+        swing=(0.0, 0.02), humanize=0.4, mutation=1.3, glitch=1.6, fill=0.5, ride=0.1, sub=1.3,
+        ratchet=0.15, ratchet_counts=(2, 3, 3, 4),
+        layers=(1, 2), layer_bars=(1, 2), reverse=0.7, stretch_bars=(1, 2),
+        favour=("PitchShift", "Saturator", "Bitcrush"), pitch=(-12, 0, 5, 7, 12, 12),
+        delay=("short", "short", "med"),
+        chop=1.5, chop_steps=(0, 3, 6, 8, 11, 14), chop_density=0.7, chop_pick=2,
+        chop_len=(1, 1, 2),
+        event_len=(0.2, 1.0), event_grid="16th", event_rev=0.3),
+    "clave": Feel(
+        note="afro-latin: the chops on the son clave's five steps, loose timing, a "
+             "ride more often, bright chains",
+        swing=(0.0, 0.05), humanize=1.2, mutation=0.6, glitch=0.4, fill=0.5, ride=0.4,
+        ratchet=0.05, layers=(1, 2), layer_bars=(2, 4), reverse=0.6, stretch=0.6,
+        favour=("Reverb", "Chorus", "Delay"), pitch=(-5, 0, 0, 5, 7), delay=("short", "med"),
+        chop_steps=(0, 3, 6, 10, 12), chop_density=0.8, chop_pick=2, chop_len=(1, 2),
+        chop_rev=0.1, event_len=(0.5, 2.0)),
+    "idm": Feel(
+        note="structured chaos: everything mutates and stutters, textures reversed and "
+             "stretched through crushers and codecs, chops anywhere and often backwards, "
+             "many tiny one-shots on the 16ths",
+        swing=(0.0, 0.1), mutation=1.8, glitch=1.8, ratchet=0.2,
+        layers=(1, 2), reverse=1.4, stretch=1.3,
+        favour=("Bitcrush", "GSM", "PitchShift"), pitch=(-12, -7, -5, -2, 0, 2, 5, 7, 12),
+        chop=1.2, chop_density=0.45, chop_len=(1, 1, 2, 4), chop_rev=0.45,
+        events=(2, 5), event_len=(0.1, 1.5), event_grid="16th", event_rev=0.5),
+    "hypnotic": Feel(
+        note="Rrose: one sound, held. A single texture the length of the loop, "
+             "stretched long, up the harmonic series, a filter breathing over the loop; "
+             "no swing, no fills, nothing mutates; the sub on every bar; the chop one "
+             "slice at a count of 3, 5, 6 or 7 running across the bars; at most one "
+             "event, a long slow swell on the one",
+        swing=(0.0, 0.0), humanize=0.25, mutation=0.0, glitch=0.3, fill=0.0, ride=0.4, sub=1.6,
+        layers=(1, 1), reverse=0.5, stretch=1.6, stretch_bars=(4, 4, 8),
+        layer_level=1.25, breathe=0.85,
+        favour=("Reverb", "Phaser", "Ladder", "Delay"), avoid=("Bitcrush", "GSM", "Chorus"),
+        pitch=(0, 0, 12, 19, 24), delay=("med", "long"),
+        chop=0.7, chop_period=(3, 5, 6, 7), chop_density=1.0, chop_pick=1, chop_len=(2, 4, 4),
+        chop_rev=0.0, chop_gain=0.8,
+        events=(0, 1), event_len=(3.0, 6.0), event_grid="bar", event_rev=0.7, event_gain=0.9),
+}
+
+DEFAULT_FEEL = Feel()
+FEEL_SAME = "same as style"         # the Feel box's default: the drum style's own feel
+FEEL_DEFAULT = "default"            # the renderer as it was before the feels: the knobs alone
+FEEL_CHOICES = [FEEL_SAME, FEEL_DEFAULT, "random"] + DRUM_STYLES
+
+
+def style_feel(style):
+    """The Feel of a drum style; the renderer as it was for a style without one."""
+    return STYLE_FEEL.get(style, DEFAULT_FEEL)
+
+
+def resolve_feel(feel, drum_style, rng):
+    """The name of the feel a song or section plays in, from the Feel box:
+    the drum style's own (FEEL_SAME, None or a name without a feel), one
+    drawn from `rng` ("random", a style's), the named style's, or
+    FEEL_DEFAULT, the layers, chops and events the way they were before
+    the feels (style_feel gives Feel() for it). A feel is named after
+    the style it belongs to, so a four-floor kit can play in the
+    hypnotic feel."""
+    if feel == "random":
+        return rng.choice(DRUM_STYLES)
+    if feel in STYLE_FEEL or feel == FEEL_DEFAULT:
+        return feel
+    return drum_style
+
+
+def layer_range(k, feel):
+    """How many textures a groove draws: the style's range (Feel.layers)
+    kept inside the knobs' (layers_min..layers_max), the knobs alone
+    without one. A knob range of 0..0 gives none in every style."""
+    if feel.layers is None:
+        return k.layers_min, k.layers_max
+    lo = min(max(int(feel.layers[0]), k.layers_min), k.layers_max)
+    hi = max(min(int(feel.layers[1]), k.layers_max), k.layers_min)
+    return lo, max(lo, hi)
+
+
+def chop_pattern(rng, feel, bars, n_slices=8):
+    """Where a section's chops land and which slice each plays: a list of
+    (step, slice) over the section's bars * 16 steps, and a piece's
+    longest length in 16ths. The style says which steps may hold one
+    (Feel.chop_steps, a bar's pattern repeated every bar), or a count
+    instead (Feel.chop_period: the same slice every 3, 5, 6 or 7 16ths
+    from a random start, running across the bars, Tenney's pulse), how
+    many of the 8 slices the pattern draws from, and how long a piece is."""
+    picks = rng.sample(range(n_slices), max(1, min(n_slices, int(feel.chop_pick))))
+    out = []
+    if feel.chop_period:
+        period = rng.choice(feel.chop_period)
+        for st in range(rng.randrange(period), bars * 16, period):
+            if rng.random() < feel.chop_density:
+                out.append((st, rng.choice(picks)))
+    else:
+        steps = feel.chop_steps if feel.chop_steps is not None else range(16)
+        pat = [(s, rng.choice(picks)) for s in steps
+               if 0 <= s < 16 and rng.random() < feel.chop_density]
+        for bi in range(bars):
+            out.extend((bi * 16 + s, idx) for s, idx in pat)
+    return out, rng.choice(feel.chop_len)
+
+
+RATCHET_ROLE = {"hihat": 1.0, "snare": 0.6, "ride": 0.3, "kick": 0.2}   # x Feel.ratchet per voice
+
+
+def ratchet_steps(rng, pat, role, chance, counts=(2, 2, 3, 4)):
+    """The steps of a bar's pattern that roll: {step: hits}, drawn per hit
+    at `chance` weighed by the voice (RATCHET_ROLE; the open hat never).
+    Nothing is drawn at chance 0, so a feel without ratchets leaves the
+    stream of chance as it was."""
+    w = RATCHET_ROLE.get(role, 0.0) * chance
+    if w <= 0:
+        return {}
+    return {s: rng.choice(counts) for s, v in enumerate(pat) if v > 0 and rng.random() < w}
+
+
+def ratchet_hits(pos, vel, n, step_n):
+    """A hit as a roll of n inside its step: [(pos, vel)] spaced step_n / n,
+    the velocity rising to the last, the drum machine's ratchet; one hit
+    at n <= 1."""
+    if n <= 1:
+        return [(pos, vel)]
+    return [(pos + int(i * step_n / n), vel * (0.65 + 0.35 * i / (n - 1))) for i in range(n)]
+
+
+EVENT_GRID = {"16th": 0.25, "beat": 1.0, "half": 2.0, "bar": 4.0}   # in beats
+
+
+def event_grid_beats(feel):
+    """The grid a style's one-shots land on, in beats (Feel.event_grid)."""
+    return EVENT_GRID.get(feel.event_grid, 1.0)
+
+
 def open_hat_pattern(rng, hihat, style):
     """Split a hihat pattern into (closed, open): some candidate steps
     become open hats and are removed from the closed pattern. About one
@@ -1248,11 +1552,16 @@ def mutate(rng, pat, amount=0.15):
 
 # ---------------------------------------------------------------- fx chains
 
-def synced_delay(rng, beat):
+def synced_delay(rng, beat, tiers=None):
     """Tempo-synced delay: very short / medium / long, all on the 16th grid.
-    Feedback and mix scale down as the delay time grows."""
-    tier = rng.choice(["short", "med", "med", "long"])
-    if tier == "short":
+    Feedback and mix scale down as the delay time grows. `tiers` picks
+    which (a style's, Feel.delay); "dub" is a dotted echo with the
+    feedback up, the dub chamber's."""
+    tier = rng.choice(list(tiers) if tiers else ["short", "med", "med", "long"])
+    if tier == "dub":
+        t = beat * rng.choice([0.75, 1.5, 3])      # dotted 8th, dotted 4th, dotted half
+        fb, mix = rng.uniform(0.45, 0.6), rng.uniform(0.3, 0.45)
+    elif tier == "short":
         t = beat * rng.choice([0.125, 0.25])       # 1/32, 1/16: slapback
         fb, mix = rng.uniform(0.15, 0.35), rng.uniform(0.25, 0.5)
     elif tier == "med":
@@ -1266,10 +1575,17 @@ def synced_delay(rng, beat):
     return Delay(delay_seconds=t, feedback=fb, mix=mix), min(ring, 8.0)
 
 
-def random_texture_board(rng, beat, fx_min=1, fx_max=3, saturation=0.5):
+def _fx_named(fx, words):
+    return any(w in type(fx).__name__ for w in words)
+
+
+def random_texture_board(rng, beat, fx_min=1, fx_max=3, saturation=0.5, feel=None):
     """A randomized effect chain for background layers, fx_min..fx_max
-    effects deep. Returns (chain, tail_seconds) so delay echoes ring out."""
-    delay_fx, delay_tail = synced_delay(rng, beat)
+    effects deep. Returns (chain, tail_seconds) so delay echoes ring out.
+    A style's Feel bends it: its pitch shifts, its delay tiers, the
+    effects it reaches for first (favour) and never holds (avoid)."""
+    feel = feel or DEFAULT_FEEL
+    delay_fx, delay_tail = synced_delay(rng, beat, feel.delay)
     pool = [
         Reverb(room_size=rng.uniform(0.4, 0.95), wet_level=rng.uniform(0.2, 0.5),
                dry_level=rng.uniform(0.4, 0.8), width=1.0),
@@ -1285,11 +1601,16 @@ def random_texture_board(rng, beat, fx_min=1, fx_max=3, saturation=0.5):
         LadderFilter(mode=LadderFilter.Mode.LPF12,
                      cutoff_hz=rng.uniform(400, 4000),
                      resonance=rng.uniform(0.1, 0.6)),
-        PitchShift(semitones=rng.choice([-12, -7, -5, 0, 5, 7, 12])),
+        PitchShift(semitones=float(rng.choice(feel.pitch))),
     ]
     if saturation <= 0:
         pool = [fx for fx in pool if not isinstance(fx, Saturator)]
+    if feel.avoid:
+        pool = [fx for fx in pool if not _fx_named(fx, feel.avoid)] or pool
     rng.shuffle(pool)
+    if feel.favour:                                   # the favoured ones first, in a random order
+        pool = [fx for fx in pool if _fx_named(fx, feel.favour)] \
+            + [fx for fx in pool if not _fx_named(fx, feel.favour)]
     depth = rng.randint(max(1, fx_min), min(max(fx_min, fx_max), len(pool)))
     chain = pool[:depth]
     chain.append(Compressor(threshold_db=-18, ratio=3))
@@ -1302,7 +1623,7 @@ def random_texture_board(rng, beat, fx_min=1, fx_max=3, saturation=0.5):
 def compose(seed, duration, sample_files, intro_bars=None,
             intro_style="ambient", bpm=None, pan_drums=0.3, pan_layers=0.6,
             pan_events=0.5, num_samples=None, drum_style="random", knobs=None,
-            outro_style="random", video_sources=None):
+            outro_style="random", video_sources=None, feel=FEEL_SAME):
     """Render one song. Besides the audio, the meta records `events`: every
     placed sound that came from a sample, as [t, src, off, dur, rate, role]
     (song seconds, sample name, source seconds at the start of the event,
@@ -1351,13 +1672,20 @@ def compose(seed, duration, sample_files, intro_bars=None,
         place(buf, clip, start, gain)
         place(stems[stem], clip, start, gain)
     kick_hits = []                                  # (pos, section, bar, step)
-    swing_frac = k.swing if k.swing is not None else rng.uniform(0.0, 0.06)
+    feel_name = resolve_feel(feel, drum_style, rng)   # the style outside the kit
+    feel = style_feel(feel_name)
+    swing_frac = k.swing if k.swing is not None else rng.uniform(*feel.swing)
     swing = swing_frac * step_len * SR                # 16th-note swing
+    humanize = min(1.0, k.humanize * feel.humanize)
+    layers_lo, layers_hi = layer_range(k, feel)
 
-    print(f"BPM {bpm} | {n_bars} bars | ~{n_bars * bar:.0f}s | style {drum_style}")
+    print(f"BPM {bpm} | {n_bars} bars | ~{n_bars * bar:.0f}s | style {drum_style}"
+          + (f" | feel {feel_name}" if feel_name != drum_style else ""))
     print(f"  swing {swing_frac:.3f} | sections {k.section_bars} | "
-          f"layers {k.layers_min}-{k.layers_max} | fx {k.fx_min}-{k.fx_max} | "
+          f"layers {layers_lo}-{layers_hi} | fx {k.fx_min}-{k.fx_max} | "
           f"saturation {k.saturation}")
+    if feel.note:
+        print(f"  feel: {feel.note}")
 
     # ---- drum kit carved from random samples --------------------------
     # each role draws from samples no other role has claimed, so kick,
@@ -1450,7 +1778,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 build_from = {"hihat": 0, "kick": max(1, length // 3),
                               "snare": max(2, (2 * length) // 3)}
             # ride shows up in some sections only
-            if not is_intro and rng.random() < 0.35:
+            if not is_intro and rng.random() < feel.ride:
                 active.append("ride")
             # the open hat comes with the closed one, except in sparse intros
             if "hihat" in active and intro_kind != "sparse":
@@ -1463,16 +1791,18 @@ def compose(seed, duration, sample_files, intro_bars=None,
             for bi in range(length):
                 bar_start = sec_start + int(bi * bar * SR)
                 bar_pats = {r: (mutate(rng, pats[r], k.mutation_amount)
-                                if rng.random() < k.mutation_chance
+                                if rng.random() < k.mutation_chance * feel.mutation
                                 else pats[r]) for r in active}
                 # drum fill on the last bar of a section
-                if bi == length - 1 and rng.random() < 0.6 and "snare" in active:
+                if bi == length - 1 and rng.random() < feel.fill and "snare" in active:
                     p = list(bar_pats["snare"])
                     for s in range(12, 16):
                         p[s] = rng.uniform(0.5, 1.0)
                     bar_pats["snare"] = p
                 ohat_pat = bar_pats.get("ohat", [0.0] * 16)
                 closed_pat = bar_pats.get("hihat", [0.0] * 16)
+                rolls = {r: ratchet_steps(rng, bar_pats[r], r, feel.ratchet, feel.ratchet_counts)
+                         for r in active}
                 for role in active:
                     if bi < build_from.get(role, 0):
                         continue
@@ -1484,8 +1814,9 @@ def compose(seed, duration, sample_files, intro_bars=None,
                         pos = bar_start + int(s * step_len * SR)
                         if s % 2 == 1:
                             pos += int(swing)
-                        pos += humanize_time(rng, k.humanize)
-                        vel = humanize_vel(rng, vel, s, k.humanize)
+                        pos += humanize_time(rng, humanize)
+                        vel = humanize_vel(rng, vel, s, humanize)
+                        reps = ratchet_hits(pos, vel, rolls[role].get(s, 1), step_len * SR)
                         if role == "kick":
                             kick_hits.append((max(0, pos), si,
                                               start_bar + bi, s))
@@ -1496,8 +1827,9 @@ def compose(seed, duration, sample_files, intro_bars=None,
                             layers.append((pick_layer(kit[role][vi], vel),
                                            gains[role]))
                             ksrc, onset = kit_src[role][vi]
-                            ev(max(0, pos), ksrc, onset, len(kit[role][vi][1]),
-                               1.0, role, vel)
+                            for rp, rv in reps:
+                                ev(max(0, rp), ksrc, onset, len(kit[role][vi][1]),
+                                   1.0, role, rv)
                         if sgains[role] > 0 and synth:
                             layers.append((pick_layer(synth[role], vel),
                                            sgains[role]))
@@ -1512,9 +1844,10 @@ def compose(seed, duration, sample_files, intro_bars=None,
                                 hit = choke(hit, int((nxt - s) * step_len * SR))
                             if pan:
                                 hit = panned(hit, pan)
-                            put("drums", hit, max(0, pos), vel * gain)
+                            for rp, rv in reps:
+                                put("drums", hit, max(0, rp), rv * gain)
                 # hihat glitch: a burst of very fast retriggers (1/32-1/96)
-                if "hihat" in active and rng.random() < k.glitch_chance:
+                if "hihat" in active and rng.random() < k.glitch_chance * feel.glitch:
                     s = rng.randrange(16)
                     n_rep = rng.choice([6, 8, 12, 16])
                     spacing = max(1, int(step_len * SR / rng.choice([2, 3, 4, 6])))
@@ -1575,7 +1908,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 c_dur = len(clip)
                 clip = clip * envelope(len(clip), attack=0.02, decay_curve=1.5)
                 board, tail = random_texture_board(rng, beat, k.fx_min, k.fx_max,
-                                               k.saturation)
+                                               k.saturation, feel)
                 clip = apply_fx(clip, board, tail=min(tail, 2.0))
                 spread = max(pan_events, 0.6)
                 clip = panned(clip, rng.uniform(-spread, spread))
@@ -1592,19 +1925,24 @@ def compose(seed, duration, sample_files, intro_bars=None,
         elif is_intro or is_break:
             n_layers = min(max(2, k.layers_min), k.layers_max)
         else:
-            n_layers = rng.randint(k.layers_min, k.layers_max)
+            n_layers = rng.randint(layers_lo, layers_hi)
         for _ in range(n_layers):
             src = rng.choice(long_names or names)
             used.add(src)
             clip = random_window(rng, bank[src], sec_len,
                                  k.random_start == "all").copy()
-            w_off, w_len = len(bank[src]) - len(clip), len(clip)
+            w_off = len(bank[src]) - len(clip)    # the window is a suffix of the sample
             ops = []
+            if feel.layer_bars:                   # the style's loop length
+                cut = int(rng.choice(feel.layer_bars) * bar * SR)
+                if len(clip) > cut:
+                    clip = clip[:cut].copy(); ops.append(f"{round(cut / (bar * SR))}bar")
+            w_len = len(clip)
             rev, rate = False, 1.0
-            if rng.random() < k.reverse_chance:
+            if rng.random() < k.reverse_chance * feel.reverse:
                 clip = clip[::-1].copy(); ops.append("rev"); rev = True
-            if rng.random() < k.stretch_chance and len(clip) > SR:   # stretch to bars
-                n_target_bars = rng.choice([1, 2, 4])
+            if rng.random() < k.stretch_chance * feel.stretch and len(clip) > SR:   # stretch to bars
+                n_target_bars = rng.choice(feel.stretch_bars)
                 target = int(n_target_bars * bar * SR)
                 chunk = clip[: min(len(clip), target * 2)]
                 rate = len(chunk) / target
@@ -1613,9 +1951,11 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 clip = st.astype("float32"); ops.append(f"stretch{n_target_bars}bar")
             mat_n = len(clip)                 # material before the fx tail
             board, tail = random_texture_board(rng, beat, k.fx_min, k.fx_max,
-                                               k.saturation)
+                                               k.saturation, feel)
             clip = apply_fx(clip, board, tail=tail)
             loop = crossfade_loop(clip, sec_len)
+            if rng.random() < feel.breathe:   # a filter opening and closing over the section
+                loop = breathe(rng, loop); ops.append("breathe")
             # one event per loop pass, the way crossfade_loop tiles the clip
             n_fade = min(int(0.05 * SR), len(clip) // 4)
             step_n = (len(clip) - n_fade) or len(clip)
@@ -1628,7 +1968,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
             loop[:fade] *= np.linspace(0, 1, fade)[:, None]
             loop[-fade:] *= np.linspace(1, 0, fade)[:, None]
             lvl = rng.uniform(k.layer_level_min, k.layer_level_max) \
-                * (1.4 if (is_intro or is_break) else 1.0)
+                * (1.4 if (is_intro or is_break) else 1.0) * feel.layer_level
             if pan_layers > 0:
                 loop = panned(loop, rng.uniform(-pan_layers, pan_layers))
             put("layers", loop, sec_start, lvl)
@@ -1636,7 +1976,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
             print(f"  sec{si} bg <- {src} [{','.join(ops) or 'loop'}]")
 
         # ---- rhythmic chop layer: slice a sample, replay on the grid ----
-        if not is_intro and rng.random() < k.chop_chance:
+        if not is_intro and rng.random() < k.chop_chance * feel.chop:
             src = rng.choice(names)
             used.add(src)
             clip = bank[src]
@@ -1644,29 +1984,26 @@ def compose(seed, duration, sample_files, intro_bars=None,
             sl = max(1, len(clip) // n_slices)
             slices = [clip[i * sl:(i + 1) * sl] for i in range(n_slices)]
             board, tail = random_texture_board(rng, beat, k.fx_min, k.fx_max,
-                                               k.saturation)
+                                               k.saturation, feel)
             tail = min(tail, 4 * beat)   # let echoes ring up to one bar
-            chop_pat = [rng.randrange(n_slices) if rng.random() < 0.4 else None
-                        for _ in range(16)]
-            max_slice = int(step_len * SR * rng.choice([1, 2, 2, 4]))
-            for bi in range(length):
-                bar_start = sec_start + int(bi * bar * SR)
-                for s, idx in enumerate(chop_pat):
-                    if idx is None:
-                        continue
-                    piece = slices[idx][:max_slice]
-                    p_off, p_rate = idx * sl, 1.0
-                    if rng.random() < 0.2:
-                        piece = piece[::-1]
-                        p_off, p_rate = idx * sl + len(piece), -1.0
-                    p_dur = len(piece)
-                    piece = piece * envelope(len(piece), decay_curve=2.0)
-                    piece = apply_fx(piece, board, tail=tail)
-                    if pan_events > 0:
-                        piece = panned(piece, rng.uniform(-pan_events, pan_events))
-                    cpos = bar_start + int(s * step_len * SR)
-                    put("chops", piece, cpos, k.chop_gain)
-                    ev(cpos, src, p_off, p_dur, p_rate, "chop")
+            chop_pat, piece_steps = chop_pattern(rng, feel, length, n_slices)
+            max_slice = int(step_len * SR * piece_steps)
+            for st, idx in chop_pat:
+                piece = slices[idx][:max_slice]
+                p_off, p_rate = idx * sl, 1.0
+                if rng.random() < feel.chop_rev:
+                    piece = piece[::-1]
+                    p_off, p_rate = idx * sl + len(piece), -1.0
+                p_dur = len(piece)
+                piece = piece * envelope(len(piece), decay_curve=2.0)
+                piece = apply_fx(piece, board, tail=tail)
+                if pan_events > 0:
+                    piece = panned(piece, rng.uniform(-pan_events, pan_events))
+                cpos = sec_start + int(st * step_len * SR)
+                if feel.chop_swing and st % 2 == 1:
+                    cpos += int(swing)
+                put("chops", piece, cpos, k.chop_gain * feel.chop_gain)
+                ev(cpos, src, p_off, p_dur, p_rate, "chop")
             print(f"  sec{si} chops <- {src}")
 
         # ---- filtered intro: a lowpass opens bar by bar (club-door) ----
@@ -1685,24 +2022,25 @@ def compose(seed, duration, sample_files, intro_bars=None,
     # ---- guarantee every sample appears at least once ------------------
     leftovers = [n for n in names if n not in used]
     print(f"Placing {len(leftovers)} unused samples as one-shot events...")
+    grid = event_grid_beats(feel) * beat * SR     # the style's grid for them
     for src in leftovers:
         clip = bank[src]
         L, rev = len(clip), False
-        if rng.random() < 0.4:
+        if rng.random() < feel.event_rev:
             clip = clip[::-1].copy(); rev = True
-        cut = int(min(len(clip), rng.uniform(1, 5) * SR))
+        cut = int(min(len(clip), rng.uniform(*feel.event_len) * SR))
         clip = random_window(rng, clip, cut, k.random_start != "off")
         o_off = L - len(clip)                 # offset within the (maybe reversed) clip
         clip = clip[:cut]
         clip = clip * envelope(len(clip), attack=0.05, decay_curve=1.5)
         board, tail = random_texture_board(rng, beat, k.fx_min, k.fx_max,
-                                               k.saturation)
+                                               k.saturation, feel)
         clip = apply_fx(clip, board, tail=tail)
         pos = int(rng.uniform(0.05, 0.9) * n_bars * bar * SR)
-        pos = int(round(pos / (beat * SR)) * beat * SR)   # snap to the beat
+        pos = int(round(pos / grid) * grid)   # snap to the style's grid
         if pan_events > 0:
             clip = panned(clip, rng.uniform(-pan_events, pan_events))
-        put("events", clip, pos, rng.uniform(0.25, 0.45))
+        put("events", clip, pos, rng.uniform(0.25, 0.45) * feel.event_gain)
         ev(pos, src, L - o_off if rev else o_off, cut, -1.0 if rev else 1.0,
            "oneshot")
 
@@ -1739,7 +2077,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                 first_kick[bar_i] = (pos, si, s)
         starts = []
         for bar_i in sorted(first_kick):
-            if sub_rng.random() < k.sub_chance:  # weighted occurrence
+            if sub_rng.random() < k.sub_chance * feel.sub:   # weighted occurrence
                 pos, si, _ = first_kick[bar_i]
                 if k.sub_follow:                 # the bar's own pitch
                     midi = sub_midi(bar_pc.get(bar_i, roots[si][0]))
@@ -1855,7 +2193,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
     if speak > 0:
         for st in stems.values():
             st *= 0.95 / speak
-    meta = {"seed": seed, "bpm": bpm, "style": drum_style,
+    meta = {"seed": seed, "bpm": bpm, "style": drum_style, "feel": feel_name,
             "duration_sec": round(len(out) / SR, 3),
             "intro_style": intro_style, "outro": outro_meta,
             "swing": round(swing_frac, 4),
@@ -1873,7 +2211,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
 
 COMPOSE_KEYS = ("intro_bars", "intro_style", "bpm", "pan_drums",
                 "pan_layers", "pan_events", "num_samples", "drum_style",
-                "outro_style")
+                "outro_style", "feel")
 
 
 def run_job(job):
