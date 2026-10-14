@@ -482,6 +482,8 @@ class MidiOut:
         self.label = None
         self._port = None
         self._heap = []               # (due, seq, kind, channel 1-16, note, velocity)
+        self._off_seq = {}            # (channel, note) -> (due, seq) of its pending off
+        self._dropped = set()         # seqs of offs pulled forward: skipped when popped
         self._seq = 0
         self._sounding = set()        # (channel, note) with a note off still to come
         self._cond = threading.Condition()
@@ -621,8 +623,14 @@ class MidiOut:
             return
         velocity = max(1, min(127, int(velocity)))
         with self._cond:
+            key = (channel, note)
+            prev = self._off_seq.get(key)
+            if prev is not None and prev[0] > due:    # fired again inside its gate (a ratchet,
+                self._dropped.add(prev[1])            # a stutter): the off goes just before
+                self._push(due - 0.001, "off", channel, note, 0)
             self._push(due, "on", channel, note, velocity)
             self._push(due + gate, "off", channel, note, 0)
+            self._off_seq[key] = (due + gate, self._seq)
             self._cond.notify()
 
     def cc(self, channel, cc, value, force=False):
@@ -718,6 +726,8 @@ class MidiOut:
 
     def _all_off_locked(self, port):
         self._heap.clear()
+        self._off_seq.clear()
+        self._dropped.clear()
         self._retrigs.clear()
         self._cc_pending.clear()
         self._cc_due = None
@@ -852,6 +862,9 @@ class MidiOut:
                         self._cc_flush_locked(port, time.perf_counter())
                         continue
                     due, _seq, kind, ch, note, vel = heapq.heappop(self._heap)
+                    if _seq in self._dropped:        # an off already sent ahead of its note again
+                        self._dropped.discard(_seq)
+                        continue
                     if kind == "on":
                         msg = mido.Message("note_on", channel=ch - 1, note=note, velocity=vel)
                         self._sounding.add((ch, note))
@@ -861,6 +874,8 @@ class MidiOut:
                     elif kind == "off":
                         msg = mido.Message("note_off", channel=ch - 1, note=note, velocity=0)
                         self._sounding.discard((ch, note))
+                        if self._off_seq.get((ch, note), (0, -1))[1] == _seq:
+                            del self._off_seq[(ch, note)]
                     elif kind == "start":
                         self._running = True
                         if self.transport_on:

@@ -247,16 +247,19 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     up = TURN_UP.get(kind, 0)                         # dense: the feel turned up; insane: all of it
     if up == 1:
         feel = replace(feel, ride=1.0, fill=max(feel.fill, 0.8), glitch=feel.glitch * 2.5,
+                       ratchet=max(feel.ratchet, 0.15),
                        mutation=feel.mutation * 1.2, sub=feel.sub * 1.3,
                        layer_level=feel.layer_level * 1.1,
                        chop_density=min(1.0, feel.chop_density * 1.5),
                        events=(feel.events[1] + 1, feel.events[1] + 3))
     elif up == 2:
         feel = replace(feel, ride=1.0, fill=1.0, glitch=feel.glitch * 6, mutation=feel.mutation * 2.0,
+                       ratchet=max(feel.ratchet, 0.35),
                        sub=3.0, layer_level=feel.layer_level * 1.3, chop_density=1.0,
                        events=(feel.events[1] + 5, feel.events[1] + 8), event_grid="16th")
     elif up == 3:
         feel = replace(feel, ride=1.0, fill=1.0, glitch=feel.glitch * 12, mutation=feel.mutation * 3.0,
+                       ratchet=max(feel.ratchet, 0.6), ratchet_counts=(2, 3, 4, 4),
                        sub=3.0, layer_level=feel.layer_level * 1.5, chop_density=1.0,
                        chop_len=(1, 1, 2), events=(feel.events[1] + 10, feel.events[1] + 16),
                        event_grid="16th", event_len=(0.2, 2.0))
@@ -346,6 +349,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
             bar_pats["snare"] = p
         ohat_pat = bar_pats.get("ohat", [0.0] * 16)
         closed_pat = bar_pats.get("hihat", [0.0] * 16)
+        rolls = {r: E.ratchet_steps(rd, bar_pats[r], r, feel.ratchet, feel.ratchet_counts)
+                 for r in active}                     # the steps that ratchet this bar
         for role in active:
             if bi < build_from.get(role, 0):
                 continue
@@ -357,19 +362,22 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                     pos += int(swing)
                 pos += E.humanize_time(rd, humanize)
                 vel = E.humanize_vel(rd, vel, s, humanize)
+                reps = E.ratchet_hits(pos, vel, rolls[role].get(s, 1), step_len * SR)
                 if role == "kick":
                     kick_hits.append((max(0, pos), bi, s))
                 kv, ksr = kits[role]
                 vi = rd.randrange(len(kv))
                 hit = E.pick_layer(kv[vi], vel)
                 ksrc, onset = ksr[vi]
-                ev(pos, ksrc, onset, len(kv[vi][1]), 1.0, role, vel)
+                for rp, rv in reps:
+                    ev(rp, ksrc, onset, len(kv[vi][1]), 1.0, role, rv)
                 if role == "ohat":
                     nxt = next((t for t in range(s + 1, 16) if closed_pat[t] > 0), 16)
                     hit = E.choke(hit, int((nxt - s) * step_len * SR))
                 if role != "kick" and pan_drums > 0:
                     hit = E.panned(hit, rd.uniform(-pan_drums, pan_drums))
-                _place_wrap(stems[role], hit, max(0, pos), vel * gains[role])
+                for rp, rv in reps:
+                    _place_wrap(stems[role], hit, max(0, rp), rv * gains[role])
         for _roll in range(STUTTERS.get(up, 1)):
             if "hihat" not in active or rd.random() >= k.glitch_chance * feel.glitch:
                 continue

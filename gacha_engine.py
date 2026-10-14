@@ -1078,6 +1078,9 @@ class Feel:
     fill: float = 0.6                 # a snare fill on a section's last bar
     ride: float = 0.35                # a ride in a groove
     sub: float = 1.0                  # x the sub's per-bar chance, capped at 1
+    ratchet: float = 0.0              # a hit's chance of being a roll inside its 16th (the hats
+                                      # most, the snare, the ride and the kick less, RATCHET_ROLE)
+    ratchet_counts: tuple = (2, 2, 3, 4)   # the roll's hits, 32nds to 64ths
     # the layers (the textures)
     layers: tuple | None = None       # (lo, hi) textures a groove gets, inside the knobs' range
     layer_bars: tuple | None = None   # a texture cut to a loop of so many bars; None: as it comes
@@ -1113,14 +1116,14 @@ STYLE_FEEL = {
     "four-floor": Feel(
         note="house: textures in 2, 4 or 8 bar loops, a filter breathing on the loop, "
              "the chops a stab on the 8ths",
-        swing=(0.0, 0.05), layers=(1, 3), layer_bars=(2, 4, 8), breathe=0.3,
+        swing=(0.0, 0.05), ratchet=0.05, layers=(1, 3), layer_bars=(2, 4, 8), breathe=0.3,
         favour=("Chorus", "Reverb", "Delay"), pitch=(-12, 0, 0, 5, 7, 12),
         chop_steps=(0, 2, 4, 6, 8, 10, 12, 14), chop_density=0.45, chop_pick=3,
         chop_len=(2, 2, 4)),
     "breakbeat": Feel(
         note="the break's own grit: short loops, stretched breaks, crushed and driven "
              "chains, chops anywhere and short, more mutation and stutter",
-        swing=(0.03, 0.1), humanize=1.2, mutation=1.3, glitch=1.2,
+        swing=(0.03, 0.1), humanize=1.2, mutation=1.3, glitch=1.2, ratchet=0.08,
         layers=(1, 2), layer_bars=(1, 2, 2), reverse=1.2, stretch=1.2, stretch_bars=(1, 2),
         favour=("Saturator", "Bitcrush"), pitch=(-12, -5, -2, 0, 2, 5),
         chop=1.2, chop_density=0.45, chop_len=(1, 1, 2), chop_rev=0.3,
@@ -1137,7 +1140,7 @@ STYLE_FEEL = {
     "halftime": Feel(
         note="trap: the sub on nearly every bar, hat rolls, octave-down and octave-up "
              "textures in 2 or 4 bar loops, sparse chops, a riser on the one",
-        swing=(0.0, 0.04), humanize=0.6, glitch=1.5, fill=0.5, ride=0.1, sub=1.4,
+        swing=(0.0, 0.04), humanize=0.6, glitch=1.5, fill=0.5, ride=0.1, sub=1.4, ratchet=0.2,
         layers=(1, 2), layer_bars=(2, 4), reverse=0.8, stretch_bars=(2, 4),
         favour=("Reverb", "PitchShift"), pitch=(-12, -12, -7, 0, 12), delay=("med", "long"),
         chop=0.8, chop_steps=(0, 3, 6, 8, 11, 14), chop_pick=2, chop_len=(2, 4, 4),
@@ -1146,6 +1149,7 @@ STYLE_FEEL = {
         note="the stretch is the sound: textures time-stretched to 1 or 2 bars, driven "
              "and filtered, the sub on most bars, short chops, fills on most last bars",
         swing=(0.0, 0.03), humanize=0.6, mutation=1.2, glitch=1.3, fill=0.8, ride=0.2, sub=1.3,
+        ratchet=0.1,
         layers=(1, 2), layer_bars=(2, 4), stretch=1.5, stretch_bars=(1, 2),
         favour=("Saturator", "Ladder", "Phaser", "PitchShift"), pitch=(-12, -7, -5, 0, 12),
         delay=("short", "med"),
@@ -1155,7 +1159,7 @@ STYLE_FEEL = {
         note="one short loop, a filter breathing, delays and phasers, a chop or two "
              "of the same slice, hardly an event, nothing moves much",
         swing=(0.0, 0.03), humanize=0.5, mutation=0.5, glitch=0.6, fill=0.2, ride=0.2,
-        layers=(1, 1), layer_bars=(1, 1, 2), reverse=0.6, stretch=0.8, layer_level=0.9,
+        ratchet=0.03, layers=(1, 1), layer_bars=(1, 1, 2), reverse=0.6, stretch=0.8, layer_level=0.9,
         breathe=0.5, favour=("Delay", "Phaser", "Ladder"), pitch=(-12, 0, 0, 12),
         delay=("short", "med", "med"),
         chop=0.8, chop_density=0.25, chop_pick=2, chop_len=(1, 1, 2), chop_rev=0.1,
@@ -1163,7 +1167,7 @@ STYLE_FEEL = {
     "ukg": Feel(
         note="2-step: a heavy shuffle the chops take too, chopped and pitched-up "
              "textures in 1 or 2 bar loops, skippy chops on the 16ths off the beat",
-        swing=(0.1, 0.2), humanize=0.9, ride=0.1, sub=1.2,
+        swing=(0.1, 0.2), humanize=0.9, ride=0.1, sub=1.2, ratchet=0.08,
         layers=(1, 2), layer_bars=(1, 2, 2), reverse=0.6, stretch=0.8,
         favour=("Chorus", "Reverb", "PitchShift"), pitch=(0, 5, 7, 12, 12),
         delay=("short", "med"),
@@ -1174,6 +1178,7 @@ STYLE_FEEL = {
         note="reggaeton: straight time, the chops on the figure's own steps (the "
              "boom-ch-boom), short loops, the sub on most bars",
         swing=(0.0, 0.02), humanize=0.5, mutation=0.5, glitch=0.5, fill=0.4, ride=0.1, sub=1.2,
+        ratchet=0.05,
         layers=(1, 2), layer_bars=(1, 2), reverse=0.5, stretch=0.6,
         favour=("Reverb", "Delay", "Saturator"), pitch=(-5, 0, 0, 5, 7), delay=("short", "med"),
         chop=1.1, chop_steps=(0, 3, 6, 8, 11, 14), chop_density=0.5, chop_pick=2,
@@ -1195,6 +1200,7 @@ STYLE_FEEL = {
         note="juke: the chops in cells of three (the same slice, over and over), "
              "pitched-up textures in short loops, stutters, tiny one-shots on the 16ths",
         swing=(0.0, 0.02), humanize=0.4, mutation=1.3, glitch=1.6, fill=0.5, ride=0.1, sub=1.3,
+        ratchet=0.15, ratchet_counts=(2, 3, 3, 4),
         layers=(1, 2), layer_bars=(1, 2), reverse=0.7, stretch_bars=(1, 2),
         favour=("PitchShift", "Saturator", "Bitcrush"), pitch=(-12, 0, 5, 7, 12, 12),
         delay=("short", "short", "med"),
@@ -1205,7 +1211,7 @@ STYLE_FEEL = {
         note="afro-latin: the chops on the son clave's five steps, loose timing, a "
              "ride more often, bright chains",
         swing=(0.0, 0.05), humanize=1.2, mutation=0.6, glitch=0.4, fill=0.5, ride=0.4,
-        layers=(1, 2), layer_bars=(2, 4), reverse=0.6, stretch=0.6,
+        ratchet=0.05, layers=(1, 2), layer_bars=(2, 4), reverse=0.6, stretch=0.6,
         favour=("Reverb", "Chorus", "Delay"), pitch=(-5, 0, 0, 5, 7), delay=("short", "med"),
         chop_steps=(0, 3, 6, 10, 12), chop_density=0.8, chop_pick=2, chop_len=(1, 2),
         chop_rev=0.1, event_len=(0.5, 2.0)),
@@ -1213,7 +1219,7 @@ STYLE_FEEL = {
         note="structured chaos: everything mutates and stutters, textures reversed and "
              "stretched through crushers and codecs, chops anywhere and often backwards, "
              "many tiny one-shots on the 16ths",
-        swing=(0.0, 0.1), mutation=1.8, glitch=1.8,
+        swing=(0.0, 0.1), mutation=1.8, glitch=1.8, ratchet=0.2,
         layers=(1, 2), reverse=1.4, stretch=1.3,
         favour=("Bitcrush", "GSM", "PitchShift"), pitch=(-12, -7, -5, -2, 0, 2, 5, 7, 12),
         chop=1.2, chop_density=0.45, chop_len=(1, 1, 2, 4), chop_rev=0.45,
@@ -1293,6 +1299,29 @@ def chop_pattern(rng, feel, bars, n_slices=8):
         for bi in range(bars):
             out.extend((bi * 16 + s, idx) for s, idx in pat)
     return out, rng.choice(feel.chop_len)
+
+
+RATCHET_ROLE = {"hihat": 1.0, "snare": 0.6, "ride": 0.3, "kick": 0.2}   # x Feel.ratchet per voice
+
+
+def ratchet_steps(rng, pat, role, chance, counts=(2, 2, 3, 4)):
+    """The steps of a bar's pattern that roll: {step: hits}, drawn per hit
+    at `chance` weighed by the voice (RATCHET_ROLE; the open hat never).
+    Nothing is drawn at chance 0, so a feel without ratchets leaves the
+    stream of chance as it was."""
+    w = RATCHET_ROLE.get(role, 0.0) * chance
+    if w <= 0:
+        return {}
+    return {s: rng.choice(counts) for s, v in enumerate(pat) if v > 0 and rng.random() < w}
+
+
+def ratchet_hits(pos, vel, n, step_n):
+    """A hit as a roll of n inside its step: [(pos, vel)] spaced step_n / n,
+    the velocity rising to the last, the drum machine's ratchet; one hit
+    at n <= 1."""
+    if n <= 1:
+        return [(pos, vel)]
+    return [(pos + int(i * step_n / n), vel * (0.65 + 0.35 * i / (n - 1))) for i in range(n)]
 
 
 EVENT_GRID = {"16th": 0.25, "beat": 1.0, "half": 2.0, "bar": 4.0}   # in beats
@@ -1772,6 +1801,8 @@ def compose(seed, duration, sample_files, intro_bars=None,
                     bar_pats["snare"] = p
                 ohat_pat = bar_pats.get("ohat", [0.0] * 16)
                 closed_pat = bar_pats.get("hihat", [0.0] * 16)
+                rolls = {r: ratchet_steps(rng, bar_pats[r], r, feel.ratchet, feel.ratchet_counts)
+                         for r in active}
                 for role in active:
                     if bi < build_from.get(role, 0):
                         continue
@@ -1785,6 +1816,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
                             pos += int(swing)
                         pos += humanize_time(rng, humanize)
                         vel = humanize_vel(rng, vel, s, humanize)
+                        reps = ratchet_hits(pos, vel, rolls[role].get(s, 1), step_len * SR)
                         if role == "kick":
                             kick_hits.append((max(0, pos), si,
                                               start_bar + bi, s))
@@ -1795,8 +1827,9 @@ def compose(seed, duration, sample_files, intro_bars=None,
                             layers.append((pick_layer(kit[role][vi], vel),
                                            gains[role]))
                             ksrc, onset = kit_src[role][vi]
-                            ev(max(0, pos), ksrc, onset, len(kit[role][vi][1]),
-                               1.0, role, vel)
+                            for rp, rv in reps:
+                                ev(max(0, rp), ksrc, onset, len(kit[role][vi][1]),
+                                   1.0, role, rv)
                         if sgains[role] > 0 and synth:
                             layers.append((pick_layer(synth[role], vel),
                                            sgains[role]))
@@ -1811,7 +1844,8 @@ def compose(seed, duration, sample_files, intro_bars=None,
                                 hit = choke(hit, int((nxt - s) * step_len * SR))
                             if pan:
                                 hit = panned(hit, pan)
-                            put("drums", hit, max(0, pos), vel * gain)
+                            for rp, rv in reps:
+                                put("drums", hit, max(0, rp), rv * gain)
                 # hihat glitch: a burst of very fast retriggers (1/32-1/96)
                 if "hihat" in active and rng.random() < k.glitch_chance * feel.glitch:
                     s = rng.randrange(16)
