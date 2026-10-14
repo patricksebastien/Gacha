@@ -1601,9 +1601,9 @@ class LiveAudio:
                                              # off: every hit goes out, the receiver mutes
         self.midi_voicing = False            # the hits' style voicing (gacha_midi.style_offset)
                                              # added to the map's notes
-        self.midi_root_oct = {}              # role -> octaves (-2..2) on the box's tone and chord
-                                             # tracks (ROOT_ROLES) with the voicing on: the root
-                                             # notes and those tracks' own hits
+        self.midi_root_oct = {}              # role -> octaves (-5..5) per drum with the voicing on:
+                                             # its hits and, on ROOT_ROLES, the root
+                                             # notes too
         self.midi_sent = 0
         self.running = False
         self.error = None
