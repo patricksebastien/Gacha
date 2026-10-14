@@ -11263,7 +11263,36 @@ class Main(QMainWindow):
                          close_fds=True)                  # a fresh Gacha with the defaults
 
 
+# the console's greeting: plain ASCII, so any terminal shows it
+BANNER = r"""
+     .---------------------------------------.
+     |                                       |
+     |    ____    _    ____ _   _    _       |
+     |   / ___|  / \  / ___| | | |  / \      |
+     |  | |  _  / _ \| |   | |_| | / _ \     |
+     |  | |_| |/ ___ \ |___|  _  |/ ___ \    |
+     |   \____/_/   \_\____|_| |_/_/   \_\   |
+     |                                       |
+     |        a slot machine for songs       |
+     |                                       |
+     |          [ 7 ]  [ * ]  [ 7 ]          |
+     |      every pull a brand-new track     |
+     |                                       |
+     '---------------------------------------'
+"""
+
+
+def greet():
+    """The logo on the console at launch; nothing when there is none
+    (pythonw) or it cannot take the text."""
+    try:
+        print(BANNER, flush=True)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 if __name__ == "__main__":
+    greet()
     app = QApplication(sys.argv)
     win = Main()
     win.showMaximized()                         # the whole screen from the start
