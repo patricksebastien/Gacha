@@ -33,6 +33,12 @@ adds its own. A shader that only makes sense when it replaces the picture
 rather than mixing with it can pin its minimum opacity with a comment
 directive, e.g. `// gacha: opacity=1.0` (see `mirrorhall.frag`).
 
+The Canvas tab has a tick per shader: ticked, the shader keeps to the
+canvas (`iResolution` is the picture's own size, `iChannel0` the picture
+alone, and the output is laid back into the picture's place on the
+screen); unticked, it sees the whole screen with the picture a part of
+it and the background around, so it may run out onto the background.
+
 House style: borrow the video's own colours (its average, or a sample from
 `iChannel0`) rather than inventing a palette, react to `iBeat`/`iLoud`, and
 give `iDrop` a moment.
