@@ -140,12 +140,13 @@ class Material:
 class Section:
     def __init__(self, kind, bpm, bars, seed, stems, events, notes, root=None,
                  drum_style=None, style=None, salts=None, force=(), kit_salts=None,
-                 mode=None, sub_notes=None):
+                 mode=None, sub_notes=None, feel=None):
         self.kind, self.bpm, self.bars, self.seed = kind, bpm, bars, seed
         self.salts = dict(salts or {})  # {stem: int}: each part's stream of chance (a shuffle)
         self.kit_salts = dict(kit_salts or {})   # {voice: int}: the drum carved again (its sound)
         self.force = set(force)         # the parts rendered whatever the kind (shuffled once)
         self.drum_style = drum_style    # the style the drums were patterned in
+        self.feel = feel                # the style whose feel the other parts follow
         self.style = style              # an intro's or an outro's style, else None
         self.stems = stems              # {stem: (n, 2) float32 @ SR}, all n equal (SECTION_STEMS)
         self.events = events            # [[t, src, off, dur, rate, role]] t in s
@@ -189,7 +190,7 @@ def _loopify(x, n, fade_s=0.05):
 def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                    pan_layers=0.6, pan_events=0.5, drum_style="random",
                    intro_style="ambient", outro_style="random", salts=None, force=(),
-                   kit_salts=None):
+                   kit_salts=None, feel=E.FEEL_SAME):
     """One looping section as stems + events. `kind`: groove (full kit, one
     to three layers, maybe chops), break (one or two drum voices, more
     layers), build (voices stack up bar by bar), sparse (one voice, one
@@ -208,7 +209,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     (chops outside a groove, layers or drums in an intro without them),
     so a shuffle of a part always gives one to hear. The drum style is
     the section's shape too (`random` is drawn from the seed, not the
-    drums' stream): its Feel reaches every part, so a shuffle keeps it. `kit_salts` ({voice:
+    drums' stream): its Feel reaches every part, so a shuffle keeps it.
+    `feel` (the Feel box, gacha_engine.resolve_feel) plays the other
+    parts in another style's feel: its own by default, or random. `kit_salts` ({voice:
     int}, KIT_PARTS) take a drum's sound from another carving of the
     material (Material.kit_for), the pattern and every draw the same: a
     voice's sound shuffled, the groove kept."""
@@ -223,7 +226,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     rd, rl, rc, rx = (rngs[s] for s in STEMS)        # the drums', the layers', the chops', the events'
     if drum_style == "random" or drum_style not in E.DRUM_STYLES:
         drum_style = rng.choice(E.DRUM_STYLES)        # the shape: every part follows it
-    feel = E.style_feel(drum_style)
+    feel_name = E.resolve_feel(feel, drum_style, rng)
+    feel = E.style_feel(feel_name)
     humanize = min(1.0, k.humanize * feel.humanize)
     intro_kind = intro_style if kind == "intro" and intro_style in INTRO_STYLES else None
     if intro_kind == "random":
@@ -336,7 +340,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 gpos = bar_start + int(s * step_len * SR) + i * spacing
                 _place_wrap(stems["glitch"], h, gpos, g)
                 ev(gpos, gsrc[0], gsrc[1], spacing, 1.0, "glitch", gv)
-    notes.append(f"drums {drum_style}: {', '.join(active) or 'none'}")
+    notes.append(f"drums {drum_style}: {', '.join(active) or 'none'}"
+                 + (f", the {feel_name} feel" if feel_name != drum_style else ""))
 
     # ---- special intro content, as in the songs ----
     if intro_kind == "reverse-swell" and mat.names:
@@ -585,7 +590,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     events.sort(key=lambda e: e[0])
     return Section(kind, bpm, bars, seed, stems, events, notes, root=root,
                    drum_style=drum_style, style=style, salts=salts, force=force,
-                   kit_salts=kit_salts, mode=mode, sub_notes=sub_notes)
+                   kit_salts=kit_salts, mode=mode, sub_notes=sub_notes, feel=feel_name)
 
 
 SECTION_ROOT_MAX_S = 8.0     # the chroma looks at this much of the layers at most

@@ -2704,6 +2704,10 @@ class Main(QMainWindow):
         sec = self._perf_playing
         if sec is not None and getattr(sec, "drum_style", None) and style == "random":
             style = f"random ({sec.drum_style} now)"
+        feel = self.feel.currentText()
+        if feel != E.FEEL_SAME:
+            now = getattr(sec, "feel", None) if sec is not None else None
+            style += f"  feel {feel}" + (f" ({now} now)" if feel == "random" and now else "")
         parts.append(f"next N  {self.perf_kind.currentText()} 8 bars {8 * bar_s:.1f} s  "
                      f"drums {style}")
         intro = self.intro_style.currentText()
@@ -5090,6 +5094,7 @@ program.</li>
         self.perf_intro = QComboBox()
         self.perf_outro = QComboBox()
         self.perf_drum_style = QComboBox()
+        self.perf_feel = QComboBox()
         for mine, theirs, tip in (
                 (self.perf_intro, self.intro_style,
                  "How an intro section is shaped (next kind: intro): random picks one of "
@@ -5108,7 +5113,11 @@ program.</li>
                 (self.perf_drum_style, self.drum_style,
                  "The style of the next section, its drums and the feel of its layers, "
                  "chops and events alike: the Sections tab's box; random picks one per "
-                 "section (the one playing shows in the meter), and a randomize keeps it.")):
+                 "section (the one playing shows in the meter), and a randomize keeps it."),
+                (self.perf_feel, self.feel,
+                 "The feel the next section's layers, chops, events, swing, fills and "
+                 "sub play in: same as style follows the drums box, random draws one per "
+                 "section, or any style's feel under any kit. The Sections tab's box.")):
             # the same names but none (a live intro or outro always has a
             # shape), so the pair is kept by name: the Generate tab on none
             # leaves this box where it was, and the live render reads this one
@@ -5121,7 +5130,7 @@ program.</li>
             theirs.currentTextChanged.connect(
                 lambda t, m=mine: m.setCurrentText(t) if m.findText(t) >= 0 else None)
         form.addRow("Shapes", self._row([("intro", self.perf_intro), ("drums", self.perf_drum_style),
-                                         ("outro", self.perf_outro)]))
+                                         ("feel", self.perf_feel), ("outro", self.perf_outro)]))
         self.perf_material = QComboBox()
         self.perf_material.addItems(["takes, else ticked samples", "takes only",
                                      "ticked samples"])
@@ -7961,7 +7970,15 @@ program.</li>
             "but a soft pulse at a count of 3, 5, 6 or 7 against it, rising or "
             "sinking across the bar, and hats that never stop). random picks "
             "one per song, or per live section.")
-        form.addRow("Drum style", self.drum_style)
+        self.feel = QComboBox()
+        self.feel.addItems(E.FEEL_CHOICES)
+        self.feel.setToolTip(
+            "The feel the layers, chops, events, swing, fills and sub play in, "
+            "apart from the kit's pattern: same as style follows the Drum style box "
+            "(the usual), random draws one per song or section, or any style's own "
+            "feel under any kit, a four-floor kit in the hypnotic feel. The README's "
+            "feel table says what each does.")
+        form.addRow("Drum style", self._row([("", self.drum_style), ("feel", self.feel)]))
 
         self.swing_random = QCheckBox("random (0–0.06)")
         self.swing_random.setChecked(True)
@@ -8761,6 +8778,7 @@ program.</li>
                 "pan_layers": min(1.0, abs(self.pan_layers.value())),
                 "pan_events": min(1.0, abs(self.pan_events.value())),
                 "drum_style": self.drum_style.currentText(),
+                "feel": self.feel.currentText(),
                 "intro_style": self.perf_intro.currentText(),      # the Perform tab's copies:
                 "outro_style": self.perf_outro.currentText()}      # never none
 
@@ -8792,6 +8810,7 @@ program.</li>
                "intro_style": self.intro_style.currentText(),
                "outro_style": self.outro_style.currentText(),
                "drum_style": self.drum_style.currentText(),
+               "feel": self.feel.currentText(),
                "pan_drums": self.pan_drums.value(),
                "pan_layers": self.pan_layers.value(),
                "pan_events": self.pan_events.value(),
@@ -9303,8 +9322,11 @@ program.</li>
                 self._perf_result = ("error", "no material with sound")
                 return
             cur = self._perf_current                  # the playing section's feel, else the box's
-            style = getattr(cur[0], "drum_style", None) if cur else None
-            style = style or (kw or {}).get("drum_style")
+            style = getattr(cur[0], "feel", None) if cur else None
+            if not style:
+                style = (kw or {}).get("feel")
+                if style not in E.STYLE_FEEL:
+                    style = (kw or {}).get("drum_style")
             shot = render_oneshot(mat, random.randrange(1 << 30), 60.0 / key[2],
                                   (kw or {}).get("pan_events", 0.5), E.style_feel(style))
             sr = self.through.sr if self.through is not None else 48000
@@ -10209,6 +10231,8 @@ program.</li>
             big = f"{kind}{root}  ·  {pl.bpm:.0f} bpm{spd}"
             if getattr(sec, "drum_style", None):
                 big += f"  ·  {sec.drum_style}"
+                if getattr(sec, "feel", None) and sec.feel != sec.drum_style:
+                    big += f" / {sec.feel} feel"
             if ready:
                 big += f"  ·  {ready}"
             # an outro: silent by its last bar, the sections stop there

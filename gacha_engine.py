@@ -1235,11 +1235,26 @@ STYLE_FEEL = {
 }
 
 DEFAULT_FEEL = Feel()
+FEEL_SAME = "same as style"         # the Feel box's default: the drum style's own feel
+FEEL_CHOICES = [FEEL_SAME, "random"] + DRUM_STYLES
 
 
 def style_feel(style):
     """The Feel of a drum style; the renderer as it was for a style without one."""
     return STYLE_FEEL.get(style, DEFAULT_FEEL)
+
+
+def resolve_feel(feel, drum_style, rng):
+    """The name of the feel a song or section plays in, from the Feel box:
+    the drum style's own (FEEL_SAME, None or a name without a feel), one
+    drawn from `rng` ("random"), or the named style's. A feel is named
+    after the style it belongs to, so a four-floor kit can play in the
+    hypnotic feel."""
+    if feel == "random":
+        return rng.choice(DRUM_STYLES)
+    if feel in STYLE_FEEL:
+        return feel
+    return drum_style
 
 
 def layer_range(k, feel):
@@ -1576,7 +1591,7 @@ def random_texture_board(rng, beat, fx_min=1, fx_max=3, saturation=0.5, feel=Non
 def compose(seed, duration, sample_files, intro_bars=None,
             intro_style="ambient", bpm=None, pan_drums=0.3, pan_layers=0.6,
             pan_events=0.5, num_samples=None, drum_style="random", knobs=None,
-            outro_style="random", video_sources=None):
+            outro_style="random", video_sources=None, feel=FEEL_SAME):
     """Render one song. Besides the audio, the meta records `events`: every
     placed sound that came from a sample, as [t, src, off, dur, rate, role]
     (song seconds, sample name, source seconds at the start of the event,
@@ -1625,13 +1640,15 @@ def compose(seed, duration, sample_files, intro_bars=None,
         place(buf, clip, start, gain)
         place(stems[stem], clip, start, gain)
     kick_hits = []                                  # (pos, section, bar, step)
-    feel = style_feel(drum_style)                     # the style outside the kit
+    feel_name = resolve_feel(feel, drum_style, rng)   # the style outside the kit
+    feel = style_feel(feel_name)
     swing_frac = k.swing if k.swing is not None else rng.uniform(*feel.swing)
     swing = swing_frac * step_len * SR                # 16th-note swing
     humanize = min(1.0, k.humanize * feel.humanize)
     layers_lo, layers_hi = layer_range(k, feel)
 
-    print(f"BPM {bpm} | {n_bars} bars | ~{n_bars * bar:.0f}s | style {drum_style}")
+    print(f"BPM {bpm} | {n_bars} bars | ~{n_bars * bar:.0f}s | style {drum_style}"
+          + (f" | feel {feel_name}" if feel_name != drum_style else ""))
     print(f"  swing {swing_frac:.3f} | sections {k.section_bars} | "
           f"layers {layers_lo}-{layers_hi} | fx {k.fx_min}-{k.fx_max} | "
           f"saturation {k.saturation}")
@@ -2139,7 +2156,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
     if speak > 0:
         for st in stems.values():
             st *= 0.95 / speak
-    meta = {"seed": seed, "bpm": bpm, "style": drum_style,
+    meta = {"seed": seed, "bpm": bpm, "style": drum_style, "feel": feel_name,
             "duration_sec": round(len(out) / SR, 3),
             "intro_style": intro_style, "outro": outro_meta,
             "swing": round(swing_frac, 4),
@@ -2157,7 +2174,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
 
 COMPOSE_KEYS = ("intro_bars", "intro_style", "bpm", "pan_drums",
                 "pan_layers", "pan_events", "num_samples", "drum_style",
-                "outro_style")
+                "outro_style", "feel")
 
 
 def run_job(job):
