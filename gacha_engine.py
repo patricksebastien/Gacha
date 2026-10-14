@@ -867,7 +867,7 @@ SYNTH_FLAVOUR = {                     # drum style -> synth flavour (auto)
     "four-floor": "house", "ukg": "house", "minimal": "house",
     "one-drop": "house", "boom-bap": "house",
     "halftime": "techno", "idm": "techno", "dembow": "techno", "clave": "techno",
-    "hypnotic": "techno",
+    "hypnotic": "techno", "drone": "techno", "glitch": "techno", "dub": "house",
     "dnb": "dnb", "breakbeat": "dnb", "footwork": "dnb",
 }
 
@@ -1037,7 +1037,7 @@ def humanize_time(rng, amount):
 
 DRUM_STYLES = ["four-floor", "breakbeat", "boom-bap", "halftime", "dnb",
                "minimal", "ukg", "dembow", "one-drop", "footwork", "clave",
-               "idm", "hypnotic"]
+               "idm", "hypnotic", "drone", "glitch", "dub"]
 
 
 # open hat placement per style: candidate steps and the chance each one
@@ -1050,6 +1050,8 @@ OPEN_HAT = {
     "minimal": ((2, 6, 10, 14), 0.15), "footwork": ((14,), 0.3),
     "clave": ((6, 14), 0.3), "idm": (tuple(range(1, 16, 2)), 0.15),
     "hypnotic": ((2, 6, 10, 14), 0.2),
+    "drone": ((8,), 0.3), "glitch": (tuple(range(1, 16, 2)), 0.1),
+    "dub": ((2, 6, 10, 14), 0.5),
 }
 
 
@@ -1238,6 +1240,45 @@ STYLE_FEEL = {
         chop=0.7, chop_period=(3, 5, 6, 7), chop_density=1.0, chop_pick=1, chop_len=(2, 4, 4),
         chop_rev=0.0, chop_gain=0.8,
         events=(0, 1), event_len=(3.0, 6.0), event_grid="bar", event_rev=0.7, event_gain=0.9),
+    "drone": Feel(
+        note="long sounds and short bursts: two or three textures stretched to 4 or 8 "
+             "bars and mostly reversed, a third louder, breathing, an octave down or up "
+             "through reverb, phaser, chorus and the ladder, never a crusher; the chops "
+             "a few one-16th bursts from two slices; one or two swells of 4 to 8 s on a "
+             "bar; no swing, few hits, the sub nearly every bar",
+        swing=(0.0, 0.0), humanize=0.5, mutation=0.3, glitch=0.2, fill=0.0, ride=0.3, sub=1.5,
+        layers=(2, 3), reverse=0.8, stretch=2.0, stretch_bars=(4, 8, 8), layer_level=1.3,
+        breathe=0.6, favour=("Reverb", "Phaser", "Chorus", "Ladder"), avoid=("Bitcrush", "GSM"),
+        pitch=(-12, -12, 0, 12, 19), delay=("long", "dub"),
+        chop=1.2, chop_density=0.12, chop_pick=2, chop_len=(1,), chop_rev=0.3,
+        events=(1, 2), event_len=(4.0, 8.0), event_grid="bar", event_rev=0.6, event_gain=1.2),
+    "glitch": Feel(
+        note="very short bursts: short loops reversed and stretched through crushers, "
+             "the codec and the pitch shift, slapback delays; chops of one 16th from "
+             "any slice, half backwards; three to six one-shots of 50 to 400 ms on the "
+             "16ths; machine timing, twice the mutation, three times the stutters, rolls "
+             "of 3 and 4",
+        swing=(0.0, 0.02), humanize=0.3, mutation=2.0, glitch=3.0, fill=0.5, ride=0.2,
+        ratchet=0.3, ratchet_counts=(3, 4, 4),
+        layers=(1, 2), layer_bars=(1, 1, 2), reverse=1.5, stretch=1.2, stretch_bars=(1, 2),
+        favour=("Bitcrush", "GSM", "PitchShift", "Saturator"),
+        pitch=(-12, -7, -5, -2, 0, 2, 5, 7, 12), delay=("short",),
+        chop=1.5, chop_density=0.5, chop_len=(1,), chop_rev=0.5,
+        events=(3, 6), event_len=(0.05, 0.4), event_grid="16th", event_rev=0.5, event_gain=1.1),
+    "dub": Feel(
+        note="delay and reverse: two or three textures in long loops, reversed more "
+             "often than not, through dub echoes, the chamber, the phaser and the "
+             "ladder, never a crusher; the chops a skank on the offbeat 8ths, swung, "
+             "nearly half backwards; echoing one-shots on beats 1 and 3, mostly "
+             "backwards; a swing, loose, the bass nearly every bar",
+        swing=(0.05, 0.12), humanize=1.2, mutation=0.5, glitch=0.3, fill=0.3, ride=0.3, sub=1.6,
+        layers=(2, 3), layer_bars=(2, 4, 4), reverse=1.6, stretch=0.8, stretch_bars=(2, 4),
+        layer_level=1.1, breathe=0.3,
+        favour=("Delay", "Reverb", "Phaser", "Ladder"), avoid=("Bitcrush", "GSM"),
+        pitch=(-12, -5, 0, 0, 7), delay=("dub", "dub", "dub", "long"),
+        chop=1.2, chop_steps=(2, 6, 10, 14), chop_density=0.7, chop_pick=2, chop_len=(1, 2, 2),
+        chop_rev=0.4, chop_swing=True,
+        events=(2, 4), event_len=(1.0, 4.0), event_grid="half", event_rev=0.6, event_gain=1.1),
 }
 
 DEFAULT_FEEL = Feel()
@@ -1293,9 +1334,11 @@ def chop_pattern(rng, feel, bars, n_slices=8):
             if rng.random() < feel.chop_density:
                 out.append((st, rng.choice(picks)))
     else:
-        steps = feel.chop_steps if feel.chop_steps is not None else range(16)
-        pat = [(s, rng.choice(picks)) for s in steps
-               if 0 <= s < 16 and rng.random() < feel.chop_density]
+        steps = [s for s in (feel.chop_steps if feel.chop_steps is not None else range(16))
+                 if 0 <= s < 16]
+        pat = [(s, rng.choice(picks)) for s in steps if rng.random() < feel.chop_density]
+        if not pat and steps:                         # a sparse feel's empty draw: one chop at least
+            pat = [(rng.choice(steps), rng.choice(picks))]
         for bi in range(bars):
             out.extend((bi * 16 + s, idx) for s, idx in pat)
     return out, rng.choice(feel.chop_len)
@@ -1515,6 +1558,44 @@ def make_pattern(rng, role, style, steps=16):
             for s in range(0, steps, div):
                 t = s / (steps - 1)
                 pat[s] = 0.3 + 0.4 * (t if rise > 0 else 1 - t)
+    elif style == "drone":                          # a kick on the one, little else
+        if role == "kick":
+            pat[0] = 1.0
+            if rng.random() < 0.3:
+                pat[8] = rng.uniform(0.5, 0.7)
+        elif role == "snare":
+            if rng.random() < 0.3:                  # a lone hit, late in the bar
+                pat[rng.choice([10, 12, 14])] = rng.uniform(0.3, 0.5)
+        else:                                       # a tick now and then
+            for s in range(0, steps, 4):
+                if rng.random() < 0.25:
+                    pat[s] = rng.uniform(0.2, 0.4)
+    elif style == "glitch":                         # bursts anywhere
+        if role == "kick":
+            pat[0] = 1.0
+            for s in rng.sample(range(1, steps), rng.randint(2, 5)):
+                pat[s] = rng.uniform(0.5, 1.0)
+        elif role == "snare":
+            for s in rng.sample(range(steps), rng.randint(2, 4)):
+                pat[s] = rng.uniform(0.3, 1.0)
+        else:
+            for s in range(steps):
+                if rng.random() < 0.5:
+                    pat[s] = rng.uniform(0.2, 1.0)
+    elif style == "dub":                            # steppers: the kick on the beat, the rim on 3
+        if role == "kick":
+            for s in (0, 4, 8, 12):
+                pat[s] = 1.0 if s in (0, 8) else rng.uniform(0.7, 0.9)
+        elif role == "snare":
+            pat[8] = 0.9
+            if rng.random() < 0.3:
+                pat[14] = rng.uniform(0.2, 0.4)     # a ghost before the one
+        else:                                       # the offbeat 8ths, light 16ths between
+            for s in (2, 6, 10, 14):
+                pat[s] = rng.uniform(0.6, 0.85)
+            for s in range(1, steps, 2):
+                if pat[s] == 0 and rng.random() < 0.3:
+                    pat[s] = rng.uniform(0.2, 0.4)
     elif style == "idm":                            # structured chaos
         if role == "kick":
             pat[0] = 1.0
