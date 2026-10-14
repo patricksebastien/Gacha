@@ -585,7 +585,7 @@ KEYMAP += [("macro", f"macro_{_n}", "", f"macro {_n}, 0 to 100 %: every knob it 
 # track of the box and a retrig hold, the same set again for the focused
 # track with six focus buttons, the box's delay and reverb, the retrig's
 # settings. The tracks are the box's six, on MIDI channels 1 to 6, each the
-# drum the MIDI out's Model:Cycles tick sends there
+# drum the MIDI out's tracks tick (hits on the tracks) sends there
 MC_TRACKS = tuple(range(1, 7))
 MC_ROLE = {ch: role for role, ch in CYCLES_CHANNELS.items()}
 MC_PARAM = {key: (cc, label, kind, default, what)
@@ -3006,15 +3006,9 @@ class Main(QMainWindow):
         form.addRow("send", self._row([("", self.midi_out_on), ("port", self.midi_out_port),
                                        ("", self.midi_out_status)]))
         self.midi_out_channel = QSpinBox(minimum=1, maximum=16, value=10)
-        self.midi_out_channel.setToolTip("MIDI channel of the notes; 10 is the GM drum channel")
-        self.midi_out_cycles = QCheckBox("Model:Cycles")
-        self.midi_out_cycles.setToolTip(
-            "The receiver is an Elektron Model:Cycles: each drum goes out on its "
-            "own track channel instead of the one channel, kick 1, snare 2, closed "
-            "hat 3, open hat 4, ride 5, hat stutter 6 (the box's default T1-6 IN "
-            "channels; RCV NOTE must be on). A note on a track channel plays that "
-            "track chromatically, so the map below is the pitch of each: M:C puts "
-            "the root (C4, 60) everywhere, which leaves the track's own tuning alone.")
+        self.midi_out_channel.setToolTip("MIDI channel of the notes; 10 is the GM drum channel. "
+                                         "Greyed with the M:C tab's tracks tick on: the hits "
+                                         "go out on the box's six track channels.")
         self.midi_out_lead = QSpinBox(minimum=-100, maximum=500, value=0, suffix=" ms")
         self.midi_out_lead.setToolTip(
             "How early each note leaves, in ms, counted from the moment our "
@@ -3034,52 +3028,11 @@ class Main(QMainWindow):
             "notes out with the sound. Off (the default) every hit goes out "
             "whatever is muted or soloed here: the receiver mutes its own tracks. "
             "Remembered.")
-        self.midi_out_voicing = QCheckBox("style voicing")
-        self.midi_out_voicing.setToolTip(
-            "Ticked, the drum style the section (or the song) was patterned in "
-            "pitches its hits: each note leaves the map's note by some semitones, "
-            "by the hit's role, its 16th step in the bar and its velocity. Meant "
-            "for a receiver whose drum plays chromatically, the Model:Cycles' track "
-            "channels or a sampler's pad: on a GM kit the shifted notes land on "
-            "other drums. " + " ".join(f"{s}: {w}." for s, w in STYLE_VOICING.items())
-            + " The other styles send the map as is. And the whole kit is moved "
-            "into the section's key, the root the sub bass plays (a song's per "
-            "section): every hit's note takes the root's shift, B one down, G a "
-            "fourth down, so with each track tuned so the map's note sounds a C "
-            "the box is tuned to the samples. With the Model:Cycles tick the root "
-            "itself goes out on the one of every bar, held for most of the bar, on "
-            "the ride's and the hat stutter's tracks, T5 and T6, a Tone and a Chord "
-            "machine by default: the key under the kit, besides those tracks' own "
-            "hits in key. The drum pads are never shifted. Off by default, "
-            "remembered.")
         form.addRow("notes", self._row([("channel", self.midi_out_channel),
                                         ("lead", self.midi_out_lead),
                                         ("gate", self.midi_out_gate),
                                         ("", self.midi_out_only),
                                         ("", self.midi_out_follow)]))
-        # the box's own row: the tick, the voicing, the octaves per track and
-        # the map to its root
-        self.midi_out_oct = {}
-        mc_row = [("", self.midi_out_cycles), ("", self.midi_out_voicing)]
-        for i, role in enumerate(DRUM_ROLES):
-            sp = QSpinBox(minimum=-5, maximum=5, value=0, prefix=f"T{i + 1} ")
-            sp.setToolTip(
-                f"Octaves for the {DRUM_LABELS[role]}'s notes (the box's T{i + 1}) with "
-                "the voicing on, up to five either way from the map's note, live: the "
-                "drum's hits and, on the ride's and the hat stutter's tracks, the root "
-                "notes too. On the Model:Cycles that is the track's pitch: a tone or a "
-                "chord machine down there is the bass, up there the pad; how far a "
-                "track really plays is the box's own range. Nothing with the voicing "
-                "off. Remembered.")
-            self.midi_out_oct[role] = sp
-            mc_row.append(("oct" if i == 0 else "", sp))
-        mc = QPushButton("M:C")
-        mc.setToolTip(f"Every drum of the map at the Model:Cycles root note {CYCLES_ROOT}: "
-                      "each track plays at its own tuning. Move one up or down to pitch "
-                      "that track.")
-        mc.clicked.connect(self._midi_out_cycles_root)
-        mc_row.append(("", mc))
-        form.addRow("Model:Cycles", self._row(mc_row))
         self.midi_out_notes = {}
         pairs = []
         for role in DRUM_ROLES:
@@ -3091,7 +3044,8 @@ class Main(QMainWindow):
             pairs.append((DRUM_LABELS[role], sp))
         gm = QPushButton("GM")
         gm.setToolTip("The General MIDI drum notes back: kick 36, snare 38, closed hat 42, "
-                      "open hat 46, ride 51, hat stutter 44 (pedal hat)")
+                      "open hat 46, ride 51, hat stutter 44 (pedal hat). For a Model:Cycles "
+                      "the M:C tab's map to root button instead.")
         gm.clicked.connect(self._midi_out_gm)
         pairs.append(("", gm))
         form.addRow("map", self._row(pairs))
@@ -3168,8 +3122,10 @@ class Main(QMainWindow):
         outer.setSpacing(4)
         hint = self._info(
             "The box's sound from here, over CC on the MIDI out's port (Controls tab, on "
-            "and pointed at the box): a column per track on its channel, 1 to 6, the drum "
-            "the Model:Cycles tick sends there under its number. Every cell is a knob for "
+            "and pointed at the box; its notes' side of the box is the row below, the hits "
+            "on the track channels, the voicing and the octaves): a column per track on "
+            "its channel, 1 to 6, the drum "
+            "the tracks tick above sends there under its number. Every cell is a knob for "
             "the MIDI map, the LFOs, the macros and the scenes; the box needs RCV CC on. "
             "Pitch glides on the box (it slews CC), machine and the LFO menus go out as the "
             "menu's index, to verify by ear. Retrig: hold a track's button, the track's note "
@@ -3180,6 +3136,58 @@ class Main(QMainWindow):
             f"({CYCLES_SLICE_NOTE} is slice 1, the root {CYCLES_ROOT} slice "
             f"{CYCLES_ROOT - CYCLES_SLICE_NOTE + 1}).")
         outer.addWidget(hint)
+        # the MIDI out's side of the box (the port itself is the Controls tab's):
+        # the hits on the track channels, the voicing, the octaves per track
+        # and the Controls tab's map to the box's root
+        self.midi_out_cycles = QCheckBox("hits on the tracks")
+        self.midi_out_cycles.setToolTip(
+            "The MIDI out's receiver is this box: each drum goes out on its own "
+            "track channel instead of the Controls tab's one channel, kick 1, snare 2, "
+            "closed hat 3, open hat 4, ride 5, hat stutter 6 (the box's default T1-6 IN "
+            "channels; RCV NOTE must be on). A note on a track channel plays that "
+            "track chromatically, so the Controls tab's map is the pitch of each: map "
+            f"to root puts the root (C4, {CYCLES_ROOT}) everywhere, which leaves the "
+            "track's own tuning alone (a fresh tick does that by itself when the map is "
+            "still GM). Remembered.")
+        self.midi_out_voicing = QCheckBox("style voicing")
+        self.midi_out_voicing.setToolTip(
+            "Ticked, the drum style the section (or the song) was patterned in "
+            "pitches its hits: each note leaves the map's note by some semitones, "
+            "by the hit's role, its 16th step in the bar and its velocity. Meant "
+            "for a receiver whose drum plays chromatically, the box's track "
+            "channels or a sampler's pad: on a GM kit the shifted notes land on "
+            "other drums. " + " ".join(f"{s}: {w}." for s, w in STYLE_VOICING.items())
+            + " The other styles send the map as is. And the whole kit is moved "
+            "into the section's key, the root the sub bass plays (a song's per "
+            "section): every hit's note takes the root's shift, B one down, G a "
+            "fourth down, so with each track tuned so the map's note sounds a C "
+            "the box is tuned to the samples. With the tracks tick the root "
+            "itself goes out on the one of every bar, held for most of the bar, on "
+            "the ride's and the hat stutter's tracks, T5 and T6, a Tone and a Chord "
+            "machine by default: the key under the kit, besides those tracks' own "
+            "hits in key. The drum pads are never shifted. Off by default, "
+            "remembered.")
+        self.midi_out_oct = {}
+        mc_row = [("", self.midi_out_cycles), ("", self.midi_out_voicing)]
+        for i, role in enumerate(DRUM_ROLES):
+            sp = QSpinBox(minimum=-5, maximum=5, value=0, prefix=f"T{i + 1} ")
+            sp.setToolTip(
+                f"Octaves for the {DRUM_LABELS[role]}'s notes (the box's T{i + 1}) with "
+                "the voicing on, up to five either way from the map's note, live: the "
+                "drum's hits and, on the ride's and the hat stutter's tracks, the root "
+                "notes too. On the box that is the track's pitch: a tone or a chord "
+                "machine down there is the bass, up there the pad; how far a track "
+                "really plays is the box's own range. Nothing with the voicing off. "
+                "Remembered.")
+            self.midi_out_oct[role] = sp
+            mc_row.append(("oct" if i == 0 else "", sp))
+        root_btn = QPushButton("map to root")
+        root_btn.setToolTip(f"Every drum of the Controls tab's map at the box's root note "
+                            f"{CYCLES_ROOT}: each track plays at its own tuning. Move one "
+                            "up or down there to pitch that track.")
+        root_btn.clicked.connect(self._midi_out_cycles_root)
+        mc_row.append(("", root_btn))
+        outer.addWidget(self._row([("MIDI out", mc_row[0][1])] + mc_row[1:]))
         self.mc_status = QLabel("")
         self.mc_status.setProperty("role", "sub")
         self.mc_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
@@ -3211,7 +3219,7 @@ class Main(QMainWindow):
             hdr = QLabel(f"T{t}  {VOICE_SHORT[MC_ROLE[t]]}")
             hdr.setAlignment(Qt.AlignCenter)
             hdr.setToolTip(f"Track {t} of the box, MIDI channel {t}: where the "
-                           f"{DRUM_LABELS[MC_ROLE[t]]} goes with the Model:Cycles tick on")
+                           f"{DRUM_LABELS[MC_ROLE[t]]} goes with the tracks tick on")
             grid.addWidget(hdr, 0, c + 1)
         for r, (key, cc, label, kind, default, what) in enumerate(CYCLES_PARAMS, start=1):
             lbl = QLabel(label)
