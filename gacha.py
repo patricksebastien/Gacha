@@ -43,8 +43,8 @@ from PySide6.QtWidgets import (
     QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QProgressDialog, QPushButton,
     QSlider, QSpinBox,
     QStyle,
-    QScrollArea, QSizePolicy, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout,
+    QScrollArea, QSizePolicy, QSplitter, QTabWidget, QTextBrowser, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout,
     QWidget,
 )
 
@@ -118,7 +118,7 @@ QGroupBox {
     border-radius: 10px; margin-top: 0px; padding-top: 0px;
 }
 QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }
-QListWidget, QTreeWidget, QPlainTextEdit {
+QListWidget, QTreeWidget, QPlainTextEdit, QTextBrowser {
     background: rgba(28, 11, 9, 117); border: 1px solid rgba(255,255,255,35);
     border-radius: 8px;
 }
@@ -2785,7 +2785,7 @@ class Main(QMainWindow):
         tabs.addTab(self._tab_erae(), "Erae")
         tabs.addTab(self._tab_controls(), "Controls")
         tabs.addTab(general, "Settings")
-        tabs.addTab(self._tab_log(), "Log")
+        tabs.addTab(self._tab_log(), "Help")
         HoverTabs(tabs)                  # hover a tab to open it, no click
         self.params_tabs = tabs
         return tabs
@@ -2829,31 +2829,116 @@ class Main(QMainWindow):
                 self._shader_user_off = False
 
     def _show_log(self):
-        """Bring the Log tab to the front."""
+        """Bring the Help tab, the log at its bottom, to the front."""
         self.params_tabs.setCurrentWidget(self.log_page)
 
     def _tab_log(self):
-        """The render log on its own page: the engine's lines, the video and
-        shader messages, the live and MIDI notes; the last 2000 lines."""
-        outer = QVBoxLayout()
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.setSpacing(6)
-        outer.addWidget(self.log, stretch=1)
+        """The Help tab: a short help above (the logo, the credits, what the
+        app does, a quick start, the tools next to it) and the render log
+        below, the engine's lines, the video and shader messages, the live
+        and MIDI notes, the last 2000 lines; a splitter between the two."""
+        help_view = QTextBrowser()
+        help_view.setOpenExternalLinks(True)        # the links in the system browser
+        help_view.setHtml(self._help_html())
+        help_view.setToolTip("What Gacha is and how to start; the full manual is README.md "
+                             "next to the program")
+        log_box = QVBoxLayout()
+        log_box.setContentsMargins(0, 0, 0, 0)
+        log_box.setSpacing(6)
+        log_box.addWidget(self.log, stretch=1)
         clear_btn = QPushButton("clear")
         clear_btn.setToolTip("Empty the log")
         clear_btn.clicked.connect(self.log.clear)
-        hint = QLabel("render engine, video, shaders, live, MIDI: everything "
+        hint = QLabel("log: render engine, video, shaders, live, MIDI: everything "
                       "the app has to say lands here")
         hint.setProperty("role", "sub")
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(hint, stretch=1)
         row.addWidget(clear_btn)
-        outer.addLayout(row)
+        log_box.addLayout(row)
+        log_w = QWidget()
+        log_w.setLayout(log_box)
+        split = QSplitter(Qt.Vertical)
+        split.addWidget(help_view)
+        split.addWidget(log_w)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setChildrenCollapsible(False)
+        outer = QVBoxLayout()
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.addWidget(split)
         w = QWidget()
         w.setLayout(outer)
         self.log_page = w
         return w
+
+    @staticmethod
+    def _help_html():
+        """The Help tab's text: the logo, the credits, what the app does in
+        a few lines, a quick start and the tools that come with it."""
+        import html as _html
+        link = 'style="color: rgb(255, 150, 110);"'
+        tools = (
+            ("Prepare samples\u2026 (Samples tab) / gacha_prep.py",
+             "the one-shot cutter: a recording of single notes (a guitar, a bell, a voice) "
+             "or a video's sound becomes a set of one-shots, each cropped to its own attack "
+             "and decay, pitched and named by its note; drag the cuts, hear them, export"),
+            ("gacha_bank.py",
+             "a sample set out of a folder of long recordings: random excerpts of a few "
+             "seconds each, levelled, into samples/&lt;set&gt;/ (hours of sessions do not "
+             "fit in RAM as they are)"),
+            ("Fetch (Videos tab) / gacha_fetch.py",
+             "a clip from the web into videos/ with yt-dlp, then transcoded"),
+            ("gacha_transcode.py",
+             "every backdrop video to 1080p MJPEG, where a seek lands in 15 ms instead of "
+             "stalling the picture on the downbeat"),
+            ("gacha_syncdemo.py",
+             "a test clip whose picture shows the note you hear, for the picture-follows-"
+             "sound mode"),
+            ("gacha_bench.py",
+             "what one audio block costs offline, state by state, for a block size"),
+        )
+        tool_rows = "".join(f"<tr><td style='padding: 2px 14px 2px 0;'><b>{name}</b></td>"
+                            f"<td style='padding: 2px 0;'>{what}</td></tr>" for name, what in tools)
+        logo = _html.escape(BANNER.strip("\n"))
+        return f"""
+<pre style="color: rgb(255, 150, 110); font-size: 12px; line-height: 1.0;">{logo}</pre>
+<p><b>Gacha</b> &mdash; a slot machine for songs.<br>
+Patrick S&eacute;bastien Coulombe &middot;
+<a {link} href="https://workinprogress.ca">workinprogress.ca</a> &middot;
+<a {link} href="https://github.com/patricksebastien/Gacha">github.com/patricksebastien/Gacha</a></p>
+
+<p><b>What it does.</b> Point it at folders of samples (or record takes of whatever is
+plugged in) and every pull is a new track: a drum kit carved out of random samples,
+textures looped, reversed and run through random effect chains, chops, a sub bass in the
+key the textures land in, breaks and drops, arranged into sections. On stage it renders
+one section at a time from the same material: the next one lands on the bar, the live input
+and the sections blend under the A/B pedal, each stem has its own effect rack, and the
+picture (videos, a camera, shaders) follows the music. Every knob, switch and pad is a key
+and a MIDI binding, and the drum hits can leave as MIDI notes for a drum machine.</p>
+
+<p><b>Quick start.</b></p>
+<ol>
+<li>Put samples in <b>samples/&lt;set&gt;/</b>, one folder per set, and tick them in the
+<b>Samples</b> tab (Refresh after adding files). Videos go in <b>videos/</b>.</li>
+<li><b>Generate</b> renders a whole song into <b>output/</b>, a wav with its section map
+(.json) and stems; the Sections tab's knobs shape it.</li>
+<li>For a show: open the audio output in <b>Settings</b>, then in <b>Perform</b> press
+<b>N</b> for a section (rendered ahead, the next lands on the bar), <b>Shift+N</b> to stop,
+<b>[</b> / <b>]</b> or an expression pedal for A/B, <b>F1</b> to <b>F4</b> for the stems,
+<b>E</b> for a one-shot, <b>A</b> for the live input through, <b>R</b> to record a take as
+new material.</li>
+<li><b>Controls</b> binds any row to a key or a MIDI message: click its MIDI cell and move
+the control (learn). <b>Erae</b> lays the pads out on an Erae 2, <b>M:C</b> drives a
+Model:Cycles over MIDI.</li>
+<li>The manual is <b>README.md</b> next to the program; the box's MIDI surface is in
+<b>MODEL_CYCLES_MIDI.md</b>.</li>
+</ol>
+
+<p><b>Tools.</b></p>
+<table>{tool_rows}</table>
+"""
 
     def _split_dragged(self, *_):
         a, b = self.split.sizes()
@@ -8763,7 +8848,7 @@ class Main(QMainWindow):
         tip = ("Download the video at this URL with yt-dlp into videos/web/ "
                "(best picture up to 1080p, one video, never a whole playlist), "
                "then transcode it for instant seeking when ffprobe is installed. "
-               "Progress in the Log tab; the clip shows up here when done")
+               "Progress in the Help tab's log; the clip shows up here when done")
         if not fetch_available():
             tip += f"  (yt-dlp is not installed: {FETCH_INSTALL_HINT})"
             self.fetch_url.setPlaceholderText(f"yt-dlp missing: {FETCH_INSTALL_HINT}")
