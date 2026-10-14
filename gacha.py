@@ -456,8 +456,9 @@ KEYMAP += [("voices", f"solo_{_v}", f"Ctrl+F{_i}",
 KEYMAP += [("voices", f"random_{_v}", "",
             f"{VOICE_LABELS[_v]}: another sample for its sound, the groove kept (the R button)")
            for _v in KIT_PARTS]
-KEYMAP += [("voices", "voices_reset", "Shift+F8", "every voice back in, no solo, the voice "
-                                                  "racks' effects off and their volumes at 1"),
+KEYMAP += [("voices", "voices_reset", "Shift+F8", "every stem and every voice back in, no solo "
+                                                  "anywhere, the voice racks' effects off "
+                                                  "and their volumes at 1"),
            ("voices", "quant_next", "", "next quantize grid: off, 1/16, 1/8, 1/4, 1/2, bar")]
 for _v in VOICES:
     KEYMAP += [(f"rack_{_v}", f"afx_{_v}_{k}", "", f"{VOICE_LABELS[_v]}: {lbl}")
@@ -5467,9 +5468,10 @@ class Main(QMainWindow):
         if self.perf_quant.findText(str(q)) >= 0:
             self.perf_quant.setCurrentText(str(q))
         self.perf_quant.currentTextChanged.connect(self._quant_changed)
-        reset_btn = QPushButton("all voices in (Shift+F8)")
-        reset_btn.setToolTip("Every drum voice back in, no solo, the voice racks' effects "
-                             "off and their volumes at 1")
+        reset_btn = QPushButton("all in (Shift+F8)")
+        reset_btn.setToolTip("Every stem and every drum voice back in, no solo anywhere, "
+                             "the voice racks' effects off and their volumes at 1; the "
+                             "stems' racks are left as set")
         reset_btn.clicked.connect(self._voices_reset)
         form.insertRow(drums_at + 1, "Quantize",            # under the Drums row
                        self._row([("", self.perf_quant), ("", reset_btn)]))
@@ -9482,7 +9484,11 @@ class Main(QMainWindow):
             self.through.switch("solo", v, on)
 
     def _voices_reset(self):
-        """Shift+F8: every voice in, no solo, the voice racks clean."""
+        """Shift+F8: every stem and every voice in, no solo anywhere, the
+        voice racks clean (the stems' racks are the mix: left alone)."""
+        for stem in STEMS:
+            self.perf_stem_solos[stem].setChecked(False)
+            self.perf_stems[stem].setChecked(False)   # the M off: the stem in
         for v in VOICES:
             self.perf_solos[v].setChecked(False)
             self.perf_voices[v].setChecked(False)     # the M off: the voice in

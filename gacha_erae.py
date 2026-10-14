@@ -766,7 +766,7 @@ def page_section():
             ("drop", WHITE, "button", "drop"), ("kind_next", VIOLET, "button", "next kind")]
     ws += _pads_row(17, 5, row3, gap=1)
     row2 = [(f"voice_{v}", AMBER, "toggle", VOICE_SHORT[v]) for v in VOICES]
-    row2.append(("voices_reset", WHITE, "button", "voices reset"))
+    row2.append(("voices_reset", WHITE, "button", "all in"))
     ws += _pads_row(11, 5, row2, gap=1)
     row1 = [(f"solo_{v}", ORANGE, "toggle", f"solo {VOICE_SHORT[v]}") for v in VOICES]
     row1.append(("quant_next", WHITE, "button", "next quantize"))
