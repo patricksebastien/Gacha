@@ -3052,13 +3052,24 @@ class Main(QMainWindow):
             "machine by default: the key under the kit, besides those tracks' own "
             "hits in key. The drum pads are never shifted. Off by default, "
             "remembered.")
+        self.midi_out_oct = {}
+        for role, track in (("ride", "T5"), ("glitch", "T6")):
+            sp = QSpinBox(minimum=-2, maximum=2, value=0, prefix=f"{track} ")
+            sp.setToolTip(
+                f"Octaves for the box's {track} (the {DRUM_LABELS[role]}'s track) with the "
+                "voicing on: the root notes and the track's own hits an octave or two "
+                "down or up from the map's note, live. A tone or a chord machine down "
+                "there is the bass, up there the pad. Remembered.")
+            self.midi_out_oct[role] = sp
         form.addRow("notes", self._row([("channel", self.midi_out_channel),
                                         ("", self.midi_out_cycles),
                                         ("lead", self.midi_out_lead),
                                         ("gate", self.midi_out_gate),
                                         ("", self.midi_out_only),
                                         ("", self.midi_out_follow),
-                                        ("", self.midi_out_voicing)]))
+                                        ("", self.midi_out_voicing),
+                                        ("oct", self.midi_out_oct["ride"]),
+                                        ("", self.midi_out_oct["glitch"])]))
         self.midi_out_notes = {}
         pairs = []
         for role in DRUM_ROLES:
@@ -3524,6 +3535,8 @@ class Main(QMainWindow):
         self.midi_out_only.setChecked(self.settings.value("midi/out_only", False, type=bool))
         self.midi_out_follow.setChecked(self.settings.value("midi/out_follow", False, type=bool))
         self.midi_out_voicing.setChecked(self.settings.value("midi/out_voicing", False, type=bool))
+        for role, sp in self.midi_out_oct.items():
+            sp.setValue(self.settings.value(f"midi/out_oct_{role}", 0, type=int))
         self.midi_out_cycles.setChecked(self.settings.value("midi/out_cycles", False, type=bool))
         self.midi_out_channel.setEnabled(not self.midi_out_cycles.isChecked())
         self.midi_out_clock.setChecked(self.settings.value("midi/out_clock", False, type=bool))
@@ -3553,6 +3566,8 @@ class Main(QMainWindow):
         self.midi_out_only.toggled.connect(self._midi_out_apply)
         self.midi_out_follow.toggled.connect(self._midi_out_apply)
         self.midi_out_voicing.toggled.connect(self._midi_out_apply)
+        for sp in self.midi_out_oct.values():
+            sp.valueChanged.connect(self._midi_out_apply)
         self.midi_out_cycles.toggled.connect(self._midi_out_cycles_toggled)
         self.midi_out_clock.toggled.connect(self._midi_out_apply)
         self.midi_metro.toggled.connect(self._midi_out_apply)
@@ -3689,6 +3704,8 @@ class Main(QMainWindow):
         self.settings.setValue("midi/out_cycles", self.midi_out_cycles.isChecked())
         self.settings.setValue("midi/out_follow", self.midi_out_follow.isChecked())
         self.settings.setValue("midi/out_voicing", self.midi_out_voicing.isChecked())
+        for role, sp in self.midi_out_oct.items():
+            self.settings.setValue(f"midi/out_oct_{role}", sp.value())
         self.settings.setValue("midi/out_clock", self.midi_out_clock.isChecked())
         self.settings.setValue("midi/out_transport", self.midi_out_transport.isChecked())
         self.settings.setValue("midi/out_notes", json.dumps(notes))
@@ -3713,6 +3730,7 @@ class Main(QMainWindow):
         la.midi_drums_only = self.midi_out_only.isChecked()
         la.midi_follow_mutes = self.midi_out_follow.isChecked()
         la.midi_voicing = self.midi_out_voicing.isChecked()
+        la.midi_root_oct = {role: sp.value() for role, sp in self.midi_out_oct.items()}
         la.metro.on = self.midi_metro.isChecked()
         la.metro.note = self.midi_metro_note.value()
         la.metro.note_one = self.midi_metro_one.value()

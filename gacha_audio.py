@@ -1601,6 +1601,9 @@ class LiveAudio:
                                              # off: every hit goes out, the receiver mutes
         self.midi_voicing = False            # the hits' style voicing (gacha_midi.style_offset)
                                              # added to the map's notes
+        self.midi_root_oct = {}              # role -> octaves (-2..2) on the box's tone and chord
+                                             # tracks (ROOT_ROLES) with the voicing on: the root
+                                             # notes and those tracks' own hits
         self.midi_sent = 0
         self.running = False
         self.error = None
@@ -2238,6 +2241,7 @@ class LiveAudio:
             ch, notes = int(self.midi_channel), self.midi_notes
             chans = self.midi_channels or {}
             voicing = self.midi_voicing
+            octs = self.midi_root_oct if voicing else {}
             w = float(np.sqrt(ab))                            # the section under the pedal
             frozen = self.freeze.active                       # the hits pause under the freeze
             for hits, scale, bpm in ((self.player.hits, w, self.player.bpm),
@@ -2253,7 +2257,8 @@ class LiveAudio:
                             note = notes.get(r, -1)
                             if r not in aud or note is None or note < 0:
                                 continue
-                            mo.note(chans[r], min(127, max(0, note + semis)),
+                            note = note + semis + 12 * int(octs.get(r, 0))
+                            mo.note(chans[r], min(127, max(0, note)),
                                     round(127 * vel * scale), base + off / sr,
                                     0.9 * 240.0 / bpm if bpm else gate)
                             self.midi_sent += 1
@@ -2261,8 +2266,8 @@ class LiveAudio:
                     note = notes.get(role, -1)
                     if role not in aud or note is None or note < 0:
                         continue
-                    if voicing and semis:
-                        note = min(127, max(0, note + semis))
+                    if voicing:
+                        note = min(127, max(0, note + semis + 12 * int(octs.get(role, 0))))
                     mo.note(chans.get(role, ch), note, round(127 * vel * scale),
                             base + off / sr, gate)
                     self.midi_sent += 1
