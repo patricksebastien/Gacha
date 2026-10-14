@@ -116,7 +116,7 @@ from gacha_frag import Fragments
 from gacha_freeze import Freeze
 from gacha_metro import Metronome, VEL as METRO_VEL
 from gacha_fx import ALL_CHANNELS, Rack, STEM_CHANNELS, VOICES
-from gacha_midi import DRUM_NOTES, DRUM_ROLES
+from gacha_midi import DRUM_NOTES, DRUM_ROLES, style_offset
 
 assert VOICES[:len(DRUM_ROLES)] == DRUM_ROLES      # one voice per MIDI role, then the sub
 
@@ -293,31 +293,39 @@ def _device_index(name, kind, api=None):
     raise RuntimeError(f"{name}: not found (unplugged?)")
 
 
-def drum_table(events, sr):
+def drum_table(events, sr, style=None, bpm=None):
     """The drum hits of an event timeline ([t, src, off, dur, rate, role,
     (vel)] with t in seconds) as (frames int64 sorted, roles, velocities
-    0..1), for the MIDI out; None when there is none."""
+    0..1, semitones), for the MIDI out; None when there is none. The
+    semitones are the style voicing (gacha_midi.style_offset) of each hit
+    from the drum style the hits were patterned in and the tempo, by its
+    16th step in the bar; 0 everywhere without them."""
     rows = []
+    step_s = 60.0 / bpm / 4 if style and bpm else None
     for e in events or ():
         if len(e) < 6 or e[5] not in DRUM_ROLES:
             continue
-        vel = float(e[6]) if len(e) > 6 else 1.0
-        rows.append((int(round(float(e[0]) * sr)), e[5], min(1.0, max(0.0, vel))))
+        vel = min(1.0, max(0.0, float(e[6]) if len(e) > 6 else 1.0))
+        t = float(e[0])
+        semis = style_offset(style, e[5], int(round(t / step_s)), vel) if step_s else 0
+        rows.append((int(round(t * sr)), e[5], vel, semis))
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])
     return (np.array([r[0] for r in rows], dtype=np.int64),
-            [r[1] for r in rows], np.array([r[2] for r in rows], dtype=np.float32))
+            [r[1] for r in rows], np.array([r[2] for r in rows], dtype=np.float32),
+            np.array([r[3] for r in rows], dtype=np.int16))
 
 
 def table_hits(table, lo, hi, shift, out):
-    """Append (frame + shift, role, vel) for the table's hits with lo <= frame < hi."""
+    """Append (frame + shift, role, vel, semitones) for the table's hits
+    with lo <= frame < hi."""
     if table is None or hi <= lo:
         return
-    t, roles, vels = table
+    t, roles, vels, semis = table
     i0, i1 = np.searchsorted(t, lo, "left"), np.searchsorted(t, hi, "left")
     for i in range(int(i0), int(i1)):
-        out.append((int(t[i]) + shift, roles[i], float(vels[i])))
+        out.append((int(t[i]) + shift, roles[i], float(vels[i]), int(semis[i])))
 
 
 PHRASE_BARS = 4        # a live break lands on these bars' one (the loop's end too)
@@ -432,7 +440,7 @@ class SectionPlayer:
         self.dropped = False                 # a break just ended in a swap (GUI resets)
         self._ev = None                      # drum_table of the section: the MIDI out
         self.lookahead = 0                   # frames ahead of the block the hits are listed
-        self.hits = []                       # [(block offset, role, vel)] listed by block()
+        self.hits = []                       # [(block offset, role, vel, semitones)] listed by block()
         self._covered = 0                    # loop frame up to which hits were listed
         self._pend_covered = 0               # same for the pending section, from its 0
         # the MIDI clock: the loop frame at this block's start (after `grid_lead`
@@ -836,9 +844,9 @@ class SectionPlayer:
             tmp = []
             self._table_range(int(math.ceil(a)), int(math.ceil(b)), tmp)
             seg = Hx[s:e]
-            for fr, role, v in tmp:
+            for fr, role, v, semis in tmp:
                 j = s + int(np.searchsorted(seg, fr, "left"))
-                self.hits.append((lead + j - L, role, v))
+                self.hits.append((lead + j - L, role, v, semis))
         self._hcov = float(Hx[-1])
 
     def _scale_hits(self, lead, f0, r):
@@ -848,8 +856,8 @@ class SectionPlayer:
         if r == 1.0 and f0 == 0.0:
             return
         L, Lt = self.lookahead, self._L
-        self.hits = [(lead + int(round((off - lead + Lt - f0) / r)) - L, role, v)
-                     for off, role, v in self.hits]
+        self.hits = [(lead + int(round((off - lead + Lt - f0) / r)) - L, role, v, semis)
+                     for off, role, v, semis in self.hits]
 
     def _src_hits(self, lo, cnt, off, rev):
         """The hits of loop frames [lo, lo+cnt) (round the loop's end) to
@@ -862,9 +870,9 @@ class SectionPlayer:
             take = min(cnt - done, n - lo)
             tmp = []
             table_hits(self._ev, lo, lo + take, 0, tmp)
-            for s, role, v in tmp:
+            for s, role, v, semis in tmp:
                 j = (s - lo) + done
-                self.hits.append((off + (cnt - 1 - j if rev else j), role, v))
+                self.hits.append((off + (cnt - 1 - j if rev else j), role, v, semis))
             done += take
             lo = 0
 
@@ -988,7 +996,7 @@ class SectionPlayer:
                       "covered": 0, "after": 0}     # the MIDI out's window, see _fill_hits
         self.fill_armed = None
 
-    def queue(self, stems, events, bpm, bars, bar_t0=None, start_bar=0):
+    def queue(self, stems, events, bpm, bars, bar_t0=None, start_bar=0, style=None):
         """The next section: on the loop's next bar while one plays, else
         from the next block, or, `bar_t0` given (monotonic seconds, the
         Link session's bar), exactly then as heard: the block's `now` is
@@ -998,19 +1006,21 @@ class SectionPlayer:
         heard time: silence up to it inside the block, or, when it has
         just passed, the loop entered that far in.
         `start_bar`: the loop entered that many bars in (an outro, from
-        its second half)."""
-        self.pending = (stems, events, bpm, bars, bar_t0, drum_table(events, self.sr),
-                        int(start_bar))
+        its second half). `style`: the drum style the hits were patterned
+        in, for the MIDI out's style voicing."""
+        self.pending = (stems, events, bpm, bars, bar_t0,
+                        drum_table(events, self.sr, style, bpm), int(start_bar))
         self._pend_covered = 0
         self.frag.prepare(stems)             # its stacked copy, here and not on the audio thread
 
-    def replace(self, stems, events):
+    def replace(self, stems, events, style=None):
         """The playing section's stems and events anew, the loop where it
         is: a shuffle (one part rendered again, the rest the same arrays).
         Lands on the next bar line, a block late at most; the same length
         as the loop or it is dropped. A section queued meanwhile wins, it
-        replaces everything anyway; a break waits it out."""
-        self._replace = (stems, events, drum_table(events, self.sr))
+        replaces everything anyway; a break waits it out. `style` as in
+        queue()."""
+        self._replace = (stems, events, drum_table(events, self.sr, style, self.bpm))
         self.frag.prepare(stems)
 
     def waiting_for(self):
@@ -1155,7 +1165,8 @@ class SectionPlayer:
                 if rev:                                    # frames src0, src0-1, ...
                     tmp = []
                     table_hits(self._ev, src0 - (q - p) + 1, src0 + 1, 0, tmp)
-                    self.hits.extend((p - a0 + (src0 - t), role, v) for t, role, v in tmp)
+                    self.hits.extend((p - a0 + (src0 - t), role, v, semis)
+                                     for t, role, v, semis in tmp)
                 else:
                     table_hits(self._ev, src0, src0 + (q - p), p - a0 - src0, self.hits)
             p = q
@@ -1413,9 +1424,11 @@ class SongPlayer:
         self.lookahead = 0
         self.hits = []
 
-    def set_events(self, events):
-        """The render's event timeline (its meta's `events`), for the MIDI out."""
-        self._ev = drum_table(events, self.sr)
+    def set_events(self, events, style=None, bpm=None):
+        """The render's event timeline (its meta's `events`), for the MIDI
+        out; its drum style and tempo (the meta's `style` and `bpm`) for
+        the style voicing."""
+        self._ev = drum_table(events, self.sr, style, bpm)
 
     def load(self, path, play=True):
         self._gen += 1
@@ -1564,6 +1577,8 @@ class LiveAudio:
         self.midi_drums_only = False         # our own drum voices silent while sending (the sub stays)
         self.midi_follow_mutes = False       # F1, the voice mutes and solos take notes out too;
                                              # off: every hit goes out, the receiver mutes
+        self.midi_voicing = False            # the hits' style voicing (gacha_midi.style_offset)
+                                             # added to the map's notes
         self.midi_sent = 0
         self.running = False
         self.error = None
@@ -2200,16 +2215,19 @@ class LiveAudio:
             gate = self.midi_gate_ms / 1000.0
             ch, notes = int(self.midi_channel), self.midi_notes
             chans = self.midi_channels or {}
+            voicing = self.midi_voicing
             w = float(np.sqrt(ab))                            # the section under the pedal
             frozen = self.freeze.active                       # the hits pause under the freeze
             for hits, scale in ((self.player.hits, w), (self.song.hits, 1.0)):
                 if scale < 0.05 or frozen:
                     continue
-                for off, role, vel in hits:
+                for off, role, vel, semis in hits:
                     aud = aud_after if sw_off is None or off >= sw_off else aud_before
                     note = notes.get(role, -1)
                     if role not in aud or note is None or note < 0:
                         continue
+                    if voicing and semis:
+                        note = min(127, max(0, note + semis))
                     mo.note(chans.get(role, ch), note, round(127 * vel * scale),
                             base + off / sr, gate)
                     self.midi_sent += 1

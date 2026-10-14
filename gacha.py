@@ -69,8 +69,8 @@ from gacha_midi import (CYCLES_CHANNELS, CYCLES_FX_PARAMS, CYCLES_LISTS, CYCLES_
                         CYCLES_PARAMS, CYCLES_RANGES, CYCLES_RETRIG_LENS, CYCLES_RETRIG_RATES,
                         CYCLES_ROOT, CYCLES_SAMPLER_KNOBS, CYCLES_SAMPLER_MODES, CYCLES_SLICE_NOTE,
                         DRUM_LABELS, DRUM_NOTES, DRUM_ROLES, MIDI_AVAILABLE, MidiIn, MidiOut,
-                        cycles_cc_value, format_binding, midi_inputs, midi_outputs,
-                        parse_binding)
+                        STYLE_VOICING, cycles_cc_value, format_binding, midi_inputs,
+                        midi_outputs, parse_binding)
 from gacha_freeze import FREEZE
 from gacha_frag import (FRAG_DIRS, FRAG_DIVS, FRAG_PLAYS, FRAG_RATES, FRAG_UNITS, FRAGMENTS,
                         MAX_VOICES)
@@ -3034,12 +3034,23 @@ class Main(QMainWindow):
             "notes out with the sound. Off (the default) every hit goes out "
             "whatever is muted or soloed here: the receiver mutes its own tracks. "
             "Remembered.")
+        self.midi_out_voicing = QCheckBox("style voicing")
+        self.midi_out_voicing.setToolTip(
+            "Ticked, the drum style the section (or the song) was patterned in "
+            "pitches its hits: each note leaves the map's note by some semitones, "
+            "by the hit's role, its 16th step in the bar and its velocity. Meant "
+            "for a receiver whose drum plays chromatically, the Model:Cycles' track "
+            "channels or a sampler's pad: on a GM kit the shifted notes land on "
+            "other drums. " + " ".join(f"{s}: {w}." for s, w in STYLE_VOICING.items())
+            + " The other styles send the map as is. The drum pads are never "
+            "shifted. Off by default, remembered.")
         form.addRow("notes", self._row([("channel", self.midi_out_channel),
                                         ("", self.midi_out_cycles),
                                         ("lead", self.midi_out_lead),
                                         ("gate", self.midi_out_gate),
                                         ("", self.midi_out_only),
-                                        ("", self.midi_out_follow)]))
+                                        ("", self.midi_out_follow),
+                                        ("", self.midi_out_voicing)]))
         self.midi_out_notes = {}
         pairs = []
         for role in DRUM_ROLES:
@@ -3504,6 +3515,7 @@ class Main(QMainWindow):
         self.midi_out_gate.setValue(self.settings.value("midi/out_gate", 50, type=int))
         self.midi_out_only.setChecked(self.settings.value("midi/out_only", False, type=bool))
         self.midi_out_follow.setChecked(self.settings.value("midi/out_follow", False, type=bool))
+        self.midi_out_voicing.setChecked(self.settings.value("midi/out_voicing", False, type=bool))
         self.midi_out_cycles.setChecked(self.settings.value("midi/out_cycles", False, type=bool))
         self.midi_out_channel.setEnabled(not self.midi_out_cycles.isChecked())
         self.midi_out_clock.setChecked(self.settings.value("midi/out_clock", False, type=bool))
@@ -3667,6 +3679,7 @@ class Main(QMainWindow):
         self.settings.setValue("midi/out_only", self.midi_out_only.isChecked())
         self.settings.setValue("midi/out_cycles", self.midi_out_cycles.isChecked())
         self.settings.setValue("midi/out_follow", self.midi_out_follow.isChecked())
+        self.settings.setValue("midi/out_voicing", self.midi_out_voicing.isChecked())
         self.settings.setValue("midi/out_clock", self.midi_out_clock.isChecked())
         self.settings.setValue("midi/out_transport", self.midi_out_transport.isChecked())
         self.settings.setValue("midi/out_notes", json.dumps(notes))
@@ -3690,6 +3703,7 @@ class Main(QMainWindow):
         la.midi_notes = notes
         la.midi_drums_only = self.midi_out_only.isChecked()
         la.midi_follow_mutes = self.midi_out_follow.isChecked()
+        la.midi_voicing = self.midi_out_voicing.isChecked()
         la.metro.on = self.midi_metro.isChecked()
         la.metro.note = self.midi_metro_note.value()
         la.metro.note_one = self.midi_metro_one.value()
@@ -9235,7 +9249,7 @@ class Main(QMainWindow):
         la = self.through
         pl = la.player if la is not None and la.running else None
         if self._perf_playing is sec and pl is not None and pl.playing:
-            pl.replace(out, events)
+            pl.replace(out, events, style=getattr(sec, "drum_style", None))
             self._shuffle_landing.append(part)
             self.log.appendPlainText(f"randomize {part}: {what}; on the bar")
         else:
@@ -9284,7 +9298,8 @@ class Main(QMainWindow):
         # an outro is entered at its second half: four bars of groove into
         # the ending effect and the ring-out, then the stop
         start_bar = sec.bars // 2 if sec.kind == "outro" else 0
-        pl.queue(stems, sec.events, sec.bpm, sec.bars, bar_t0, start_bar)
+        pl.queue(stems, sec.events, sec.bpm, sec.bars, bar_t0, start_bar,
+                 style=getattr(sec, "drum_style", None))
         if self._shuffle_landing:                     # the queued section replaces everything
             self._shuffle_landing = []
             self._shuffle_faces()
@@ -10769,7 +10784,8 @@ class Main(QMainWindow):
         try:
             meta = json.loads(Path(wav).with_suffix(".json").read_text())
             if self.through is not None:     # its drum hits, for the MIDI out
-                self.through.song.set_events(meta.get("events") or [])
+                self.through.song.set_events(meta.get("events") or [],
+                                             meta.get("style"), meta.get("bpm"))
             self._sections = meta["sections"]
             self._sec_bounds = [int(s["start_sec"] * 1000)
                                 for s in self._sections]

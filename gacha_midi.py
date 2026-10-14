@@ -102,6 +102,65 @@ DRUM_LABELS = {"kick": "kick", "snare": "snare", "hihat": "closed hat", "ohat": 
 # AUTO channel, notes 12 to 60, is a different mapping; 36 was tried first)
 CYCLES_CHANNELS = {"kick": 1, "snare": 2, "hihat": 3, "ohat": 4, "ride": 5, "glitch": 6}
 CYCLES_ROOT = 60
+# Style voicing: a receiver whose drum plays chromatically (the box's track
+# channels, a sampler's pad) can carry more of a drum style than its hits.
+# style_offset() gives each hit its semitones from the map's note, by the
+# style the section was patterned in, the hit's role, its 16th step in the
+# bar and its velocity; the styles below say what, the rest send the map as
+# is. Behind the MIDI out panel's "style voicing" tick, off by default: on a
+# GM kit the shifted notes land on other drums.
+HARMONIC_LADDER = (0, 12, 19, 24, 28, 31, 34, 36)   # harmonics 1 to 8, in semitones
+IDM_STEPS = (0, 3, -5, 7, -2, 12, 5, -7, 2, -3, 9, -4, 4, -12, 6, -1)
+STYLE_VOICING = {
+    "hypnotic": "the pulse (snare) climbs the harmonic series over the bar, a harmonic "
+                "per eighth: Tenney's pulse rate as pitch, the rising figure the "
+                "pattern's ramp only hints at",
+    "footwork": "the cells' kicks off the beat a fourth up in the first half of the bar, "
+                "a fifth in the second: the kick as toms",
+    "halftime": "every kick but the one a fourth down: the 808's slide",
+    "dembow": "the figure's lighter hits (steps 3 and 11) a fourth up",
+    "clave": "the clave on two blocks: the 3 side an octave up, the 2 side a fifth",
+    "breakbeat": "the snare's ghosts (under half velocity) three semitones down, the "
+                 "sampler's trick",
+    "dnb": "the snare's ghosts three semitones down, as in breakbeat",
+    "ukg": "the skippy 16th hats (the odd steps) a major third up",
+    "one-drop": "the rim (the snare at full) a fifth up, the ghost as it is",
+    "idm": "the kick and the snare on a pitch of their own per step, fixed for the song",
+}
+
+
+def style_offset(style, role, step, vel):
+    """Semitones from the map's note for one hit of `role` at 16th `step`
+    of the bar with velocity `vel` (0..1), in `style` (STYLE_VOICING)."""
+    s = int(step) % 16
+    if style == "hypnotic":
+        if role == "snare":
+            return HARMONIC_LADDER[s // 2]
+    elif style == "footwork":
+        if role == "kick" and s % 4:
+            return 5 if s < 8 else 7
+    elif style == "halftime":
+        if role == "kick" and s:
+            return -5
+    elif style == "dembow":
+        if role == "snare" and s in (3, 11):
+            return 5
+    elif style == "clave":
+        if role == "snare":
+            return 12 if s < 8 else 7
+    elif style in ("breakbeat", "dnb"):
+        if role == "snare" and vel < 0.5:
+            return -3
+    elif style == "ukg":
+        if role == "hihat" and s % 2:
+            return 4
+    elif style == "one-drop":
+        if role == "snare" and vel >= 0.5:
+            return 7
+    elif style == "idm":
+        if role in ("kick", "snare"):
+            return IDM_STEPS[s]
+    return 0
 # the box's sound over CC, Appendix A of the manual (MODEL_CYCLES_MIDI.md):
 # (key, cc, label, kind, default, what) per track, on the track's channel.
 # kind: "u" 0..127 sent as is; "b" -64..63, sent + 64; "semi" -24..+24

@@ -260,7 +260,9 @@ The box as Gacha's instrument:
 * Reroll the kit like the samples: machine (CC 70) and random color,
   shape, sweep, contour within ranges at every section start (*CC*).
 * Style to voice: house punchy kick with punch on, techno long and dark,
-  drum and bass tight with the click up (*CC*).
+  drum and bass tight with the click up (*CC*). The notes' side shipped
+  2026-10-13 as the MIDI out's *style voicing* tick (gacha_midi.STYLE_VOICING):
+  the hits pitched by style on the chromatic track channels, no CC.
 * Sub bass tuned to the tape: a Kick machine track with a long decay sent
   the section's root + 60 minus octaves; a Tone machine as synth bass
   (*now*, map only).
