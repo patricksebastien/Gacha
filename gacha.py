@@ -31,8 +31,9 @@ import soundfile as sf
 
 from PySide6.QtCore import (QEvent, QObject, QPoint, QPointF, QSize, Qt, QRectF, QSettings,
                             QThread, QTimer, QUrl, Signal)
-from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPen,
-                           QPolygonF, QRegularExpressionValidator, QShortcut)
+from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence,
+                           QPainter, QPalette, QPen, QPolygonF, QRegularExpressionValidator,
+                           QShortcut)
 from PySide6.QtCore import QRegularExpression
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -2838,10 +2839,16 @@ class Main(QMainWindow):
         below, the engine's lines, the video and shader messages, the live
         and MIDI notes, the last 2000 lines; a splitter between the two."""
         help_view = QTextBrowser()
-        help_view.setOpenExternalLinks(True)        # the links in the system browser
+        help_view.setOpenLinks(False)               # every link through _help_link
+        help_view.anchorClicked.connect(self._help_link)
+        pal = help_view.palette()                   # the manual's links in the accent, not blue
+        pal.setColor(QPalette.Link, QColor(255, 150, 110))
+        pal.setColor(QPalette.LinkVisited, QColor(255, 150, 110))
+        help_view.setPalette(pal)
         help_view.setHtml(self._help_html())
-        help_view.setToolTip("What Gacha is and how to start; the full manual is README.md "
-                             "next to the program")
+        help_view.setToolTip("What Gacha is and how to start; the manual (README.md next to "
+                             "the program) opens here too, from its link")
+        self.help_view = help_view
         log_box = QVBoxLayout()
         log_box.setContentsMargins(0, 0, 0, 0)
         log_box.setSpacing(6)
@@ -2872,6 +2879,35 @@ class Main(QMainWindow):
         w.setLayout(outer)
         self.log_page = w
         return w
+
+    def _help_link(self, url):
+        """A link in the Help tab: gacha:help and gacha:readme switch the
+        pane between the help and the manual, a relative .md next to the
+        program (MODEL_CYCLES_MIDI.md) opens there the same way, anything
+        else goes to the system browser."""
+        if url.scheme() == "gacha":
+            self._help_show(url.path())
+        elif not url.scheme() and url.path().endswith(".md") and (BASE / url.path()).is_file():
+            self._help_show(url.path())
+        else:
+            QDesktopServices.openUrl(url)
+
+    def _help_show(self, what):
+        """The Help tab's pane: the help ("help") or a Markdown file next
+        to the program ("readme" for README.md, else its name), rendered by
+        Qt, a link back to the help at both ends."""
+        if what == "help":
+            self.help_view.setHtml(self._help_html())
+            return
+        name = "README.md" if what == "readme" else what
+        try:
+            text = (BASE / name).read_text(encoding="utf-8")
+        except OSError as e:
+            self.log.appendPlainText(f"help: {name}: {e}")
+            return
+        back = "[← back to the help](gacha:help)\n\n"
+        self.help_view.setMarkdown(back + text + "\n\n" + back)
+        self.help_view.verticalScrollBar().setValue(0)
 
     @staticmethod
     def _help_html():
@@ -2907,7 +2943,8 @@ class Main(QMainWindow):
 <p style="font-size: 26px;"><b>Gacha</b> &mdash; a slot machine for songs</p>
 <p style="font-size: 21px;">Patrick S&eacute;bastien Coulombe<br>
 <a {link} href="https://workinprogress.ca">workinprogress.ca</a> &middot;
-<a {link} href="https://github.com/patricksebastien/Gacha">github.com/patricksebastien/Gacha</a></p>
+<a {link} href="https://github.com/patricksebastien/Gacha">github.com/patricksebastien/Gacha</a> &middot;
+<a {link} href="gacha:readme">the manual</a></p>
 
 <p><b>What it does.</b> Point it at folders of samples (or record takes of whatever is
 plugged in) and every pull is a new track: a drum kit carved out of random samples,
@@ -2935,8 +2972,9 @@ keeps its value; a second Ctrl-click cancels). <b>Alt-click</b> a control to rem
 binding. The <b>Controls</b> tab has every row with its key and its binding: click a row's
 MIDI cell to learn there, Delete clears it. <b>Erae</b> lays the pads out on an Erae 2,
 <b>M:C</b> drives a Model:Cycles over MIDI.</li>
-<li>The manual is <b>README.md</b> next to the program; the box's MIDI surface is in
-<b>MODEL_CYCLES_MIDI.md</b>.</li>
+<li>The manual: <a {link} href="gacha:readme">README.md</a>, opens here; the box's MIDI
+surface: <a {link} href="MODEL_CYCLES_MIDI.md">MODEL_CYCLES_MIDI.md</a>. Both sit next to the
+program.</li>
 </ol>
 
 <p><b>Tools.</b></p>
