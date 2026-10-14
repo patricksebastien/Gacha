@@ -31,7 +31,7 @@ import soundfile as sf
 
 from PySide6.QtCore import (QEvent, QObject, QPoint, QPointF, QSize, Qt, QRectF, QSettings,
                             QThread, QTimer, QUrl, Signal)
-from PySide6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
+from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPen,
                            QPolygonF, QRegularExpressionValidator, QShortcut)
 from PySide6.QtCore import QRegularExpression
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
@@ -2904,8 +2904,8 @@ class Main(QMainWindow):
         logo = _html.escape(BANNER.strip("\n"))
         return f"""
 <pre style="color: rgb(255, 150, 110); font-size: 12px; line-height: 1.0;">{logo}</pre>
-<p><b>Gacha</b> &mdash; a slot machine for songs.<br>
-Patrick S&eacute;bastien Coulombe &middot;
+<p style="font-size: 26px;"><b>Gacha</b> &mdash; a slot machine for songs</p>
+<p style="font-size: 21px;">Patrick S&eacute;bastien Coulombe<br>
 <a {link} href="https://workinprogress.ca">workinprogress.ca</a> &middot;
 <a {link} href="https://github.com/patricksebastien/Gacha">github.com/patricksebastien/Gacha</a></p>
 
@@ -11545,6 +11545,17 @@ BANNER = r"""
 """
 
 
+def app_icon():
+    """The window's and the taskbar's icon: gacha.ico (every size in it)
+    or gacha.png next to the program, drop your own there to change it;
+    Qt's default when both are missing."""
+    for name in ("gacha.ico", "gacha.png"):
+        path = BASE / name
+        if path.exists():
+            return QIcon(str(path))
+    return QIcon()
+
+
 def greet():
     """The logo on the console at launch; nothing when there is none
     (pythonw) or it cannot take the text."""
@@ -11556,7 +11567,16 @@ def greet():
 
 if __name__ == "__main__":
     greet()
+    if sys.platform == "win32":
+        # the taskbar groups the window under this id and shows its icon,
+        # not python.exe's, as with any app of its own
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("workinprogress.gacha")
+        except (AttributeError, OSError):
+            pass
     app = QApplication(sys.argv)
+    app.setWindowIcon(app_icon())
     win = Main()
     win.showMaximized()                         # the whole screen from the start
     sys.exit(app.exec())
