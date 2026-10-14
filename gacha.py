@@ -7744,7 +7744,7 @@ class Main(QMainWindow):
         self.drum_style.addItems(["random", "four-floor", "breakbeat",
                                   "boom-bap", "halftime", "dnb", "minimal",
                                   "ukg", "dembow", "one-drop", "footwork",
-                                  "clave", "idm"])
+                                  "clave", "idm", "hypnotic"])
         self.drum_style.setToolTip(
             "The kit's pattern family, for the songs and the live sections alike: "
             "four-floor (a kick on every beat, house), breakbeat (syncopated, the "
@@ -7754,7 +7754,10 @@ class Main(QMainWindow):
             "(2-step garage, no kick on beat 3, skippy hats), dembow (reggaeton's "
             "boom-ch-boom), one-drop (dub and reggae, everything on beat 3), "
             "footwork (juke, cells of kicks and a sparse clap), clave (afro-latin, "
-            "the son clave 3-2 over a bombo kick), idm (irregular). random picks "
+            "the son clave 3-2 over a bombo kick), idm (irregular), hypnotic "
+            "(Rrose's techno: a kick on every beat that never moves, no backbeat "
+            "but a soft pulse at a count of 3, 5, 6 or 7 against it, rising or "
+            "sinking across the bar, and hats that never stop). random picks "
             "one per song, or per live section.")
         form.addRow("Drum style", self.drum_style)
 
@@ -7825,7 +7828,7 @@ class Main(QMainWindow):
         self.synth_style.setToolTip("Flavour of the synth kit. auto follows "
                                     "the drum style: house for four-floor, "
                                     "ukg, minimal, one-drop, boom-bap; techno "
-                                    "for halftime, idm, dembow, clave; dnb for "
+                                    "for halftime, idm, dembow, clave, hypnotic; dnb for "
                                     "dnb, breakbeat, footwork. Picking a "
                                     "flavour sets the synth volumes to a mix "
                                     "that suits it; auto leaves them alone")

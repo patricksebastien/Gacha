@@ -259,7 +259,7 @@ Everything below lives in the parameter panel of the GUI, grouped in the same ta
 | `gain_ohat` | `0.4` | Open hihat level. `0` removes open hats from the sequence. Any drum volume at `0` drops that voice entirely. |
 | `gain_ride` | `0.3` | Ride level. |
 | `synth_kick`, `synth_snare`, `synth_hihat`, `synth_ohat`, `synth_ride` | `0` | Levels of a synthesized drum machine kit, see below. Each synth voice plays the same pattern as its sample voice, so the two layer; set the sample volumes to 0 for a pure drum machine. |
-| `synth_style` | `auto` | Flavour of the synth kit: `house`, `techno`, `dnb`, or `auto` from the drum style (house for four-floor, ukg, minimal, one-drop, boom-bap; techno for halftime, idm, dembow, clave; dnb for dnb, breakbeat, footwork). In the GUI, picking a flavour also sets the five synth volumes to a mix that suits it (house leans on the open hat, techno on the kick, drum and bass on the snare); `auto` leaves the volumes alone. |
+| `synth_style` | `auto` | Flavour of the synth kit: `house`, `techno`, `dnb`, or `auto` from the drum style (house for four-floor, ukg, minimal, one-drop, boom-bap; techno for halftime, idm, dembow, clave, hypnotic; dnb for dnb, breakbeat, footwork). In the GUI, picking a flavour also sets the five synth volumes to a mix that suits it (house leans on the open hat, techno on the kick, drum and bass on the snare); `auto` leaves the volumes alone. |
 
 Both hats come out of the same source sample, so they read as one instrument. The trick that makes any sample pass for a cymbal: the transient at the onset is mixed with a cloud of tiny grains picked from the whole sample, which turns a flute or a voice into a noisy sizzle in its own colour, then a steep highpass takes the body away. The closed hat is 30 to 70 ms with a snappy decay and a touch of drive. The open hat is 150 to 450 ms with a slow decay, a denser cloud, a resonant band around 7 to 10 kHz for the ring of the cymbal edge, and a small room. Every open hat is cut off by the next closed hat in the bar, or by the next downbeat, with a 5 ms fade.
 
@@ -345,9 +345,11 @@ The ending is a ring-out effect in the spirit of Marmelade's "Ending FX" stage: 
 
 ### Drum styles
 
-`four-floor`, `breakbeat`, `boom-bap`, `halftime`, `dnb`, `minimal`, `ukg`, `dembow`, `one-drop`, `footwork`, `clave`, `idm`
+`four-floor`, `breakbeat`, `boom-bap`, `halftime`, `dnb`, `minimal`, `ukg`, `dembow`, `one-drop`, `footwork`, `clave`, `idm`, `hypnotic`
 
 `random` picks one per song. Tempo is deliberately independent: dnb at 90 BPM is your call.
+
+`hypnotic` is Rrose's techno, the one style without a backbeat: a kick on every beat that never moves, and in the snare's place a soft pulse at an odd count against the four (3, 5, 6 or 7 steps, James Tenney's pulses at harmonic rates), so it lands somewhere else on every beat and closes on the bar. Its velocity ramps across the bar, rising or sinking, so the figure seems to go on climbing bar after bar, the way a Shepard tone does; now and then a second count runs against the first and where the two meet is the accent. The hats are continuous 16ths or 8ths on a ramp of their own, the stillness of a sound that never stops; a few open up on the offbeat 8ths. The synth kit's `auto` reads it as techno. The textures, the chops and the tempo are the material's and the knobs' as in every style: a slow tempo and one long looped layer take it furthest.
 
 ### Intro styles
 

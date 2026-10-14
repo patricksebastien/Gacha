@@ -771,6 +771,7 @@ SYNTH_FLAVOUR = {                     # drum style -> synth flavour (auto)
     "four-floor": "house", "ukg": "house", "minimal": "house",
     "one-drop": "house", "boom-bap": "house",
     "halftime": "techno", "idm": "techno", "dembow": "techno", "clave": "techno",
+    "hypnotic": "techno",
     "dnb": "dnb", "breakbeat": "dnb", "footwork": "dnb",
 }
 
@@ -940,7 +941,7 @@ def humanize_time(rng, amount):
 
 DRUM_STYLES = ["four-floor", "breakbeat", "boom-bap", "halftime", "dnb",
                "minimal", "ukg", "dembow", "one-drop", "footwork", "clave",
-               "idm"]
+               "idm", "hypnotic"]
 
 
 # open hat placement per style: candidate steps and the chance each one
@@ -952,6 +953,7 @@ OPEN_HAT = {
     "halftime": ((6, 14), 0.4), "dnb": ((6, 14), 0.25),
     "minimal": ((2, 6, 10, 14), 0.15), "footwork": ((14,), 0.3),
     "clave": ((6, 14), 0.3), "idm": (tuple(range(1, 16, 2)), 0.15),
+    "hypnotic": ((2, 6, 10, 14), 0.2),
 }
 
 
@@ -1109,6 +1111,35 @@ def make_pattern(rng, role, style, steps=16):
             for s in range(0, steps, 2):
                 if rng.random() < 0.85:
                     pat[s] = 0.8 if s % 4 == 0 else rng.uniform(0.4, 0.6)
+    elif style == "hypnotic":                       # Rrose's techno
+        # The kick never moves. The snare is not a backbeat but a soft
+        # pulse at an odd count against the four, 3, 5, 6 or 7 steps,
+        # Tenney's pulses at harmonic rates: it lands somewhere else on
+        # every beat and closes on the bar. Its velocity ramps across the
+        # bar, so the figure seems to rise (or sink) forever, bar after
+        # bar, a Shepard tone's way; now and then a second count runs
+        # against the first and where they meet is the accent. The hats
+        # are continuous, 16ths or 8ths, on a ramp of their own: the
+        # stillness of a sound that never stops.
+        if role == "kick":
+            for s in (0, 4, 8, 12):
+                pat[s] = 1.0
+        elif role == "snare":
+            period = rng.choice([3, 3, 5, 6, 7])
+            rise = rng.choice([-1, 1])
+            for s in range(rng.randrange(period), steps, period):
+                t = s / (steps - 1)
+                pat[s] = 0.3 + 0.35 * (t if rise > 0 else 1 - t)
+            if rng.random() < 0.4:                  # two counts interfere
+                p2 = rng.choice([p for p in (3, 5, 7) if p != period])
+                for s in range(rng.randrange(p2), steps, p2):
+                    pat[s] = min(1.0, pat[s] + 0.3) if pat[s] > 0 else 0.25
+        else:
+            rise = rng.choice([-1, 1])
+            div = rng.choice([1, 1, 2])
+            for s in range(0, steps, div):
+                t = s / (steps - 1)
+                pat[s] = 0.3 + 0.4 * (t if rise > 0 else 1 - t)
     elif style == "idm":                            # structured chaos
         if role == "kick":
             pat[0] = 1.0
