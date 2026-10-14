@@ -116,7 +116,7 @@ from gacha_frag import Fragments
 from gacha_freeze import Freeze
 from gacha_metro import Metronome, VEL as METRO_VEL
 from gacha_fx import ALL_CHANNELS, Rack, STEM_CHANNELS, VOICES
-from gacha_midi import DRUM_NOTES, DRUM_ROLES, style_offset
+from gacha_midi import DRUM_NOTES, DRUM_ROLES, TONAL_VOICING, root_shift, style_offset
 
 assert VOICES[:len(DRUM_ROLES)] == DRUM_ROLES      # one voice per MIDI role, then the sub
 
@@ -293,21 +293,30 @@ def _device_index(name, kind, api=None):
     raise RuntimeError(f"{name}: not found (unplugged?)")
 
 
-def drum_table(events, sr, style=None, bpm=None):
+def drum_table(events, sr, style=None, bpm=None, root=None):
     """The drum hits of an event timeline ([t, src, off, dur, rate, role,
     (vel)] with t in seconds) as (frames int64 sorted, roles, velocities
     0..1, semitones), for the MIDI out; None when there is none. The
     semitones are the style voicing (gacha_midi.style_offset) of each hit
     from the drum style the hits were patterned in and the tempo, by its
-    16th step in the bar; 0 everywhere without them."""
+    16th step in the bar; 0 everywhere without them. `root`, a note name
+    (a section's) or a list of (start_s, end_s, name) (a song's sections),
+    moves the tonal voicings (gacha_midi.TONAL_VOICING) into that key."""
     rows = []
     step_s = 60.0 / bpm / 4 if style and bpm else None
+    tonal = TONAL_VOICING.get(style, ()) if step_s else ()
+    if isinstance(root, str) or root is None:
+        spans = [(-1e9, 1e9, root_shift(root))]
+    else:
+        spans = [(float(a), float(b), root_shift(r)) for a, b, r in root]
     for e in events or ():
         if len(e) < 6 or e[5] not in DRUM_ROLES:
             continue
         vel = min(1.0, max(0.0, float(e[6]) if len(e) > 6 else 1.0))
         t = float(e[0])
         semis = style_offset(style, e[5], int(round(t / step_s)), vel) if step_s else 0
+        if e[5] in tonal:
+            semis += next((k for a, b, k in spans if a <= t < b), 0)
         rows.append((int(round(t * sr)), e[5], vel, semis))
     if not rows:
         return None
@@ -996,7 +1005,8 @@ class SectionPlayer:
                       "covered": 0, "after": 0}     # the MIDI out's window, see _fill_hits
         self.fill_armed = None
 
-    def queue(self, stems, events, bpm, bars, bar_t0=None, start_bar=0, style=None):
+    def queue(self, stems, events, bpm, bars, bar_t0=None, start_bar=0, style=None,
+              root=None):
         """The next section: on the loop's next bar while one plays, else
         from the next block, or, `bar_t0` given (monotonic seconds, the
         Link session's bar), exactly then as heard: the block's `now` is
@@ -1007,20 +1017,21 @@ class SectionPlayer:
         just passed, the loop entered that far in.
         `start_bar`: the loop entered that many bars in (an outro, from
         its second half). `style`: the drum style the hits were patterned
-        in, for the MIDI out's style voicing."""
+        in, and `root` the section's note name, for the MIDI out's style
+        voicing."""
         self.pending = (stems, events, bpm, bars, bar_t0,
-                        drum_table(events, self.sr, style, bpm), int(start_bar))
+                        drum_table(events, self.sr, style, bpm, root), int(start_bar))
         self._pend_covered = 0
         self.frag.prepare(stems)             # its stacked copy, here and not on the audio thread
 
-    def replace(self, stems, events, style=None):
+    def replace(self, stems, events, style=None, root=None):
         """The playing section's stems and events anew, the loop where it
         is: a shuffle (one part rendered again, the rest the same arrays).
         Lands on the next bar line, a block late at most; the same length
         as the loop or it is dropped. A section queued meanwhile wins, it
-        replaces everything anyway; a break waits it out. `style` as in
-        queue()."""
-        self._replace = (stems, events, drum_table(events, self.sr, style, self.bpm))
+        replaces everything anyway; a break waits it out. `style` and
+        `root` as in queue()."""
+        self._replace = (stems, events, drum_table(events, self.sr, style, self.bpm, root))
         self.frag.prepare(stems)
 
     def waiting_for(self):
@@ -1424,11 +1435,12 @@ class SongPlayer:
         self.lookahead = 0
         self.hits = []
 
-    def set_events(self, events, style=None, bpm=None):
+    def set_events(self, events, style=None, bpm=None, roots=None):
         """The render's event timeline (its meta's `events`), for the MIDI
-        out; its drum style and tempo (the meta's `style` and `bpm`) for
-        the style voicing."""
-        self._ev = drum_table(events, self.sr, style, bpm)
+        out; its drum style and tempo (the meta's `style` and `bpm`) and
+        its sections' roots ([(start_s, end_s, name)]) for the style
+        voicing."""
+        self._ev = drum_table(events, self.sr, style, bpm, roots)
 
     def load(self, path, play=True):
         self._gen += 1

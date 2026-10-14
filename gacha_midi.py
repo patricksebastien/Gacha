@@ -127,6 +127,24 @@ STYLE_VOICING = {
     "one-drop": "the rim (the snare at full) a fifth up, the ghost as it is",
     "idm": "the kick and the snare on a pitch of their own per step, fixed for the song",
 }
+# the voicings that are pitches in a key rather than a drum's colour: these
+# roles are moved to the section's root as well (the sub bass's note, read
+# off the layers), so the box's track, tuned so that the map's note sounds
+# a C, plays in the groove's key; the others (ghosts, rims, hats, the clave)
+# stay where the track is tuned
+TONAL_VOICING = {"hypnotic": ("snare",), "halftime": ("kick",), "footwork": ("kick",),
+                 "idm": ("kick", "snare")}
+_PCS = {"C": 0, "C#": 1, "D": 2, "D#": 3, "E": 4, "F": 5, "F#": 6, "G": 7, "G#": 8, "A": 9,
+        "A#": 10, "B": 11}
+
+
+def root_shift(root):
+    """Semitones from C to the note name `root` ("A#"), the short way round
+    (-6..+5; B is -1, not +11); 0 for no root."""
+    pc = _PCS.get(root or "", None)
+    if pc is None:
+        return 0
+    return pc - 12 if pc > 6 else pc
 
 
 def style_offset(style, role, step, vel):

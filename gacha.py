@@ -3043,7 +3043,10 @@ class Main(QMainWindow):
             "channels or a sampler's pad: on a GM kit the shifted notes land on "
             "other drums. " + " ".join(f"{s}: {w}." for s, w in STYLE_VOICING.items())
             + " The other styles send the map as is. The drum pads are never "
-            "shifted. Off by default, remembered.")
+            "shifted. The pitched ones (hypnotic's ladder, halftime's and footwork's "
+            "kicks, idm's steps) are moved into the section's key as well, the root "
+            "the sub bass plays: tune that track so the map's note sounds a C and it "
+            "plays in the groove's key. Off by default, remembered.")
         form.addRow("notes", self._row([("channel", self.midi_out_channel),
                                         ("", self.midi_out_cycles),
                                         ("lead", self.midi_out_lead),
@@ -9250,7 +9253,8 @@ class Main(QMainWindow):
         la = self.through
         pl = la.player if la is not None and la.running else None
         if self._perf_playing is sec and pl is not None and pl.playing:
-            pl.replace(out, events, style=getattr(sec, "drum_style", None))
+            pl.replace(out, events, style=getattr(sec, "drum_style", None),
+                       root=getattr(sec, "root", None))
             self._shuffle_landing.append(part)
             self.log.appendPlainText(f"randomize {part}: {what}; on the bar")
         else:
@@ -9300,7 +9304,7 @@ class Main(QMainWindow):
         # the ending effect and the ring-out, then the stop
         start_bar = sec.bars // 2 if sec.kind == "outro" else 0
         pl.queue(stems, sec.events, sec.bpm, sec.bars, bar_t0, start_bar,
-                 style=getattr(sec, "drum_style", None))
+                 style=getattr(sec, "drum_style", None), root=getattr(sec, "root", None))
         if self._shuffle_landing:                     # the queued section replaces everything
             self._shuffle_landing = []
             self._shuffle_faces()
@@ -10785,8 +10789,10 @@ class Main(QMainWindow):
         try:
             meta = json.loads(Path(wav).with_suffix(".json").read_text())
             if self.through is not None:     # its drum hits, for the MIDI out
-                self.through.song.set_events(meta.get("events") or [],
-                                             meta.get("style"), meta.get("bpm"))
+                self.through.song.set_events(
+                    meta.get("events") or [], meta.get("style"), meta.get("bpm"),
+                    [(s["start_sec"], s["end_sec"], s.get("root"))
+                     for s in meta.get("sections") or [] if "start_sec" in s])
             self._sections = meta["sections"]
             self._sec_bounds = [int(s["start_sec"] * 1000)
                                 for s in self._sections]
