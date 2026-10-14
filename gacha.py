@@ -3544,6 +3544,7 @@ class Main(QMainWindow):
             sp.valueChanged.connect(self._midi_out_apply)
         self.midi_out_only.toggled.connect(self._midi_out_apply)
         self.midi_out_follow.toggled.connect(self._midi_out_apply)
+        self.midi_out_voicing.toggled.connect(self._midi_out_apply)
         self.midi_out_cycles.toggled.connect(self._midi_out_cycles_toggled)
         self.midi_out_clock.toggled.connect(self._midi_out_apply)
         self.midi_metro.toggled.connect(self._midi_out_apply)
