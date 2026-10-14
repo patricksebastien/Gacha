@@ -36,7 +36,7 @@ groove of 8 bars renders in about a second on a 2-take bank once the
 material is carved.
 """
 import random
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 from scipy.signal import resample_poly
@@ -45,13 +45,51 @@ import gacha_engine as E
 from gacha_engine import SR
 from gacha_fx import VOICES
 
-KINDS = ("groove", "break", "build", "sparse", "dense", "insane", "overload")   # what "random" picks from
-TURN_UP = {"dense": 1, "insane": 2, "overload": 3}   # the kinds above groove, how far
-LAYERS_OVER = {1: (1, 2), 2: (3, 4), 3: (5, 6)}      # per rung: over the knobs' max, and at least
-# the chop sources a rung adds to the feel's own: (density on any step, gain)
-CHOPS_OVER = {1: (), 2: ((0.6, 0.8), (0.4, 0.6)),
-              3: ((0.8, 0.8), (0.6, 0.7), (0.5, 0.6), (0.4, 0.5))}
-STUTTERS = {1: 1, 2: 1, 3: 3}                        # stutter rolls per bar
+KINDS = ("groove", "break", "build", "sparse", "dense", "heavy", "insane", "overload")   # what "random" picks from
+
+
+@dataclass(frozen=True)
+class Rung:
+    """A kind above groove: the feel turned up by so much. The ladder is
+    sparse, groove, then these (RUNGS), each a clear step over the last;
+    every number bends the feel and the knobs, none replaces them."""
+    ratchet: float            # at least this chance of a roll per hit
+    glitch: float             # x the stutter chance
+    rolls: int                # stutter rolls drawn per bar
+    mutation: float           # x the mutation chance
+    fill: float               # at least this chance of a fill on the last bar
+    sub: float                # x the sub's per-bar chance
+    hats: tuple               # the hat pattern's rests filled: (chance, velocity lo, hi)
+    ghosts: float             # a ghost on each of the snare's rests, chance
+    layers: tuple             # textures over the knobs' max, and at least
+    level: float              # x the texture level
+    chops: float              # x the chop density (capped at 1); the chops always in
+    sources: tuple            # more chop samples, short pieces on any step: (density, gain)
+    events: tuple             # one-shots over the feel's most: (lo, hi)
+    grid: str | None = None   # the one-shots' grid, None: the feel's
+    counts: tuple | None = None   # the roll's hits, None: the feel's
+    kick: bool = False        # the kick doubled on the offbeat 8ths
+    ohat: float = 0.0         # more hats opened, chance per closed step
+    rev: float = 0.0          # at least this chance of a backwards chop in the added sources
+    short: tuple | None = None   # the one-shots' length, None: the feel's
+
+
+RUNGS = {
+    "dense": Rung(ratchet=0.15, glitch=2.5, rolls=1, mutation=1.2, fill=0.8, sub=1.3,
+                  hats=(0.4, 0.3, 0.5), ghosts=0.2, layers=(1, 2), level=1.1, chops=1.5,
+                  sources=(), events=(1, 3)),
+    "heavy": Rung(ratchet=0.25, glitch=4.0, rolls=2, mutation=1.5, fill=1.0, sub=2.0,
+                  hats=(1.0, 0.35, 0.6), ghosts=0.35, layers=(2, 3), level=1.2, chops=2.0,
+                  sources=((0.5, 0.7),), events=(3, 5), grid="16th", ohat=0.15),
+    "insane": Rung(ratchet=0.35, glitch=6.0, rolls=2, mutation=2.0, fill=1.0, sub=3.0,
+                   hats=(1.0, 0.4, 0.7), ghosts=0.5, layers=(3, 4), level=1.3, chops=3.0,
+                   sources=((0.6, 0.8), (0.4, 0.6)), events=(5, 8), grid="16th", ohat=0.25),
+    "overload": Rung(ratchet=0.6, glitch=12.0, rolls=3, mutation=3.0, fill=1.0, sub=3.0,
+                     hats=(1.0, 0.6, 0.9), ghosts=0.9, layers=(5, 6), level=1.5, chops=3.0,
+                     sources=((0.8, 0.8), (0.6, 0.7), (0.5, 0.6), (0.4, 0.5)), events=(10, 16),
+                     grid="16th", counts=(2, 3, 4, 4), kick=True, ohat=0.35, rev=0.3,
+                     short=(0.2, 2.0)),
+}
 EXTRA_KINDS = ("intro", "outro")                      # picked by name only
 INTRO_STYLES = ("random", "ambient", "sparse", "none", "build", "drums-first",
                 "reverse-swell", "collage", "filtered")
@@ -201,16 +239,17 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     """One looping section as stems + events. `kind`: groove (full kit, one
     to three layers, maybe chops), break (one or two drum voices, more
     layers), build (voices stack up bar by bar), sparse (one voice, one
-    layer), dense (groove turned up: the full kit with the ride, a layer
-    over the knobs' max, chops for sure and thicker, more one-shots and
-    stutters, a fill), insane (everything: hats on every 16th, ghosts
-    under the snare, three layers over the max and louder, chops from
-    three samples on any step, one-shots by the handful on the 16ths, six
-    times the stutters, the sub every bar), overload (past the limit: the
-    kick doubled on the offbeat 8ths, the snare on nearly every 16th, hats
-    hard on every 16th and more of them open, three stutter rolls a bar,
-    five layers over the max and half again as loud, chops from five
-    samples, one-shots by the dozen), intro (the song intro of `intro_style`, see the module note),
+    layer), then the rungs above groove (RUNGS, each the feel turned up
+    by so much): dense (the ride, some hats and ghosts added, a layer
+    over the knobs' max, chops for sure and thicker, more one-shots,
+    rolls), heavy (hats on every 16th, two layers over, a second chop
+    sample, two stutter rolls a bar, the sub most bars), insane (ghosts
+    under half the snare's rests, three layers over and louder, chops
+    from three samples, one-shots by the handful on the 16ths, the sub
+    every bar), overload (past the limit: the kick doubled on the offbeat
+    8ths, the snare nearly everywhere, hats hard and more of them open,
+    three stutter rolls a bar, five layers over, chops from five samples,
+    one-shots by the dozen, most hits ratcheted), intro (the song intro of `intro_style`, see the module note),
     outro (a groove ending in `outro_style`, silent by the last bar).
 
     The four parts (STEMS: the drums, the layers, the chops, the events)
@@ -244,25 +283,17 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         drum_style = rng.choice(E.DRUM_STYLES)        # the shape: every part follows it
     feel_name = E.resolve_feel(feel, drum_style, rng)
     feel = E.style_feel(feel_name)
-    up = TURN_UP.get(kind, 0)                         # dense: the feel turned up; insane: all of it
-    if up == 1:
-        feel = replace(feel, ride=1.0, fill=max(feel.fill, 0.8), glitch=feel.glitch * 2.5,
-                       ratchet=max(feel.ratchet, 0.15),
-                       mutation=feel.mutation * 1.2, sub=feel.sub * 1.3,
-                       layer_level=feel.layer_level * 1.1,
-                       chop_density=min(1.0, feel.chop_density * 1.5),
-                       events=(feel.events[1] + 1, feel.events[1] + 3))
-    elif up == 2:
-        feel = replace(feel, ride=1.0, fill=1.0, glitch=feel.glitch * 6, mutation=feel.mutation * 2.0,
-                       ratchet=max(feel.ratchet, 0.35),
-                       sub=3.0, layer_level=feel.layer_level * 1.3, chop_density=1.0,
-                       events=(feel.events[1] + 5, feel.events[1] + 8), event_grid="16th")
-    elif up == 3:
-        feel = replace(feel, ride=1.0, fill=1.0, glitch=feel.glitch * 12, mutation=feel.mutation * 3.0,
-                       ratchet=max(feel.ratchet, 0.6), ratchet_counts=(2, 3, 4, 4),
-                       sub=3.0, layer_level=feel.layer_level * 1.5, chop_density=1.0,
-                       chop_len=(1, 1, 2), events=(feel.events[1] + 10, feel.events[1] + 16),
-                       event_grid="16th", event_len=(0.2, 2.0))
+    rung = RUNGS.get(kind)                            # a kind above groove: the feel turned up
+    if rung is not None:
+        feel = replace(feel, ride=1.0, fill=max(feel.fill, rung.fill),
+                       glitch=feel.glitch * rung.glitch, mutation=feel.mutation * rung.mutation,
+                       sub=feel.sub * rung.sub, ratchet=max(feel.ratchet, rung.ratchet),
+                       ratchet_counts=rung.counts or feel.ratchet_counts,
+                       layer_level=feel.layer_level * rung.level,
+                       chop_density=min(1.0, feel.chop_density * rung.chops),
+                       events=(feel.events[1] + rung.events[0], feel.events[1] + rung.events[1]),
+                       event_grid=rung.grid or feel.event_grid,
+                       event_len=rung.short or feel.event_len)
     humanize = min(1.0, k.humanize * feel.humanize)
     intro_kind = intro_style if kind == "intro" and intro_style in INTRO_STYLES else None
     if intro_kind == "random":
@@ -299,20 +330,19 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
 
     # ---- drums ----
     pats = {r: E.make_pattern(rd, r, drum_style) for r in ("kick", "snare", "hihat", "ride")}
-    if up == 2:                                       # hats that never stop, ghosts under the snare
-        pats["hihat"] = [v if v > 0 else rd.uniform(0.4, 0.7) for v in pats["hihat"]]
-        pats["snare"] = [v if v > 0 else (rd.uniform(0.2, 0.45) if rd.random() < 0.5 else 0.0)
-                         for v in pats["snare"]]
-    elif up == 3:                                     # the kick doubled, the snare nearly everywhere
-        pats["hihat"] = [v if v > 0 else rd.uniform(0.6, 0.9) for v in pats["hihat"]]
-        pats["snare"] = [v if v > 0 else (rd.uniform(0.3, 0.6) if rd.random() < 0.9 else 0.0)
-                         for v in pats["snare"]]
-        pats["kick"] = [v if v > 0 else (rd.uniform(0.6, 0.8) if st % 4 == 2 else 0.0)
-                        for st, v in enumerate(pats["kick"])]
+    if rung is not None:                              # the rung's extra hits
+        chance, lo, hi = rung.hats                    # hats on the pattern's rests
+        pats["hihat"] = [v if v > 0 else (rd.uniform(lo, hi) if rd.random() < chance else 0.0)
+                         for v in pats["hihat"]]
+        pats["snare"] = [v if v > 0 else (rd.uniform(0.2, 0.45) if rd.random() < rung.ghosts else 0.0)
+                         for v in pats["snare"]]      # ghosts under the snare
+        if rung.kick:                                 # the kick doubled on the offbeat 8ths
+            pats["kick"] = [v if v > 0 else (rd.uniform(0.6, 0.8) if st % 4 == 2 else 0.0)
+                            for st, v in enumerate(pats["kick"])]
     pats["hihat"], pats["ohat"] = E.open_hat_pattern(rd, pats["hihat"], drum_style)
-    if up == 3:                                       # more of the hats open, any step
+    if rung is not None and rung.ohat > 0:            # more of the hats open, any step
         for st in range(16):
-            if pats["hihat"][st] > 0 and pats["ohat"][st] == 0 and rd.random() < 0.35:
+            if pats["hihat"][st] > 0 and pats["ohat"][st] == 0 and rd.random() < rung.ohat:
                 pats["ohat"][st], pats["hihat"][st] = max(pats["hihat"][st], 0.8), 0.0
     active = ["kick", "snare", "hihat"]
     build_from = {}
@@ -330,7 +360,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         build_from = {"hihat": 0, "kick": max(1, bars // 3), "snare": max(2, (2 * bars) // 3)}
     if not active and "drums" in force:               # shuffled into an intro without them
         active = ["kick", "snare", "hihat"]
-    if (kind in ("groove", "outro") or up) and rd.random() < feel.ride:
+    if (kind in ("groove", "outro") or rung is not None) and rd.random() < feel.ride:
         active.append("ride")
     if "hihat" in active and kind != "sparse" and intro_kind != "sparse":
         active.append("ohat")
@@ -378,7 +408,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                     hit = E.panned(hit, rd.uniform(-pan_drums, pan_drums))
                 for rp, rv in reps:
                     _place_wrap(stems[role], hit, max(0, rp), rv * gains[role])
-        for _roll in range(STUTTERS.get(up, 1)):
+        for _roll in range(rung.rolls if rung is not None else 1):
             if "hihat" not in active or rd.random() >= k.glitch_chance * feel.glitch:
                 continue
             s = rd.randrange(16)
@@ -451,8 +481,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         n_layers = min(max(2, k.layers_min), k.layers_max)
     elif kind in ("build", "sparse"):
         n_layers = 1
-    elif up:                                          # over the top of the range, by the rung
-        over, least = LAYERS_OVER[up]
+    elif rung is not None:                            # over the top of the range, by the rung
+        over, least = rung.layers
         n_layers = max(least, E.layer_range(k, feel)[1] + over) if k.layers_max > 0 else 0
     else:
         n_layers = rl.randint(*E.layer_range(k, feel))
@@ -505,13 +535,13 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     chop_roll = rc.random()                           # drawn either way: the stream stays in step
     chops_in = (kind in ("groove", "outro") and chop_roll < k.chop_chance * feel.chop
                 or kind == "break" and chop_roll < 0.5 * feel.chop
-                or bool(up) and k.chop_chance > 0)
+                or rung is not None and k.chop_chance > 0)
     if mat.names and (chops_in or "chops" in force):
         chop_feels = [feel]
-        for dens, gain in CHOPS_OVER.get(up, ()):     # more sources, short pieces on any step
+        for dens, gain in (rung.sources if rung is not None else ()):   # more samples, short, any step
             chop_feels.append(replace(feel, chop_steps=None, chop_period=None, chop_density=dens,
                                       chop_len=(1, 1, 2), chop_gain=feel.chop_gain * gain,
-                                      chop_rev=max(feel.chop_rev, 0.3 if up == 3 else 0.0)))
+                                      chop_rev=max(feel.chop_rev, rung.rev)))
         for cf in chop_feels:
             src = rc.choice(mat.names)
             clip = mat.bank[src]
