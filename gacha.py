@@ -2601,6 +2601,8 @@ class Main(QMainWindow):
         self._keys_into_tips()                  # "(N)" off the buttons, into the tips
         self._live_defaults = self._live_state()  # as built: the values-only reset's target
         self._live_restore()                    # the knobs as they were left
+        self._show_take_status()                # with the free memory, from the start
+        self._take_timer.start(3000)
         if self.settings.value("video/window", False, type=bool):
             QTimer.singleShot(0, lambda: self.video_window.setChecked(True))
         self._live_timer = QTimer(self)         # and kept from then on, every few seconds
@@ -10088,15 +10090,21 @@ class Main(QMainWindow):
         if rec:
             self._take_timer.start(100)
         else:
-            self._take_timer.stop()
-            n = len(self.takes.takes)
-            self.take_status.setText(
-                "no takes" if not n else
-                f"{n} take{'s' if n > 1 else ''}, {sum(t.seconds for t in self.takes.takes):.0f} s, "
-                f"{self.takes.nbytes / 1e9:.1f} GB in RAM"
-                + (f"  ·  writing {self.takes.pending} to videos/" if self.takes.pending
-                   else (f"  ·  {len(self.takes.unsaved())} not on disk yet"
-                         if self.takes.unsaved() else "")))
+            self._take_timer.start(3000)             # the free memory, kept fresh
+            self._show_take_status()
+
+    def _show_take_status(self):
+        """The takes line, idle: the takes in RAM and what the machine has
+        left for more (the recording and the engine share it)."""
+        n = len(self.takes.takes)
+        free = f"{self._free_memory_gb():.1f} GB free"
+        self.take_status.setText(
+            f"no takes  ·  {free}" if not n else
+            f"{n} take{'s' if n > 1 else ''}, {sum(t.seconds for t in self.takes.takes):.0f} s, "
+            f"{self.takes.nbytes / 1e9:.1f} GB in RAM, {free}"
+            + (f"  ·  writing {self.takes.pending} to videos/" if self.takes.pending
+               else (f"  ·  {len(self.takes.unsaved())} not on disk yet"
+                     if self.takes.unsaved() else "")))
 
     def _poll_take(self):
         was = self.takes.recording
@@ -10104,8 +10112,12 @@ class Main(QMainWindow):
         if was and not self.takes.recording:           # the limit stopped it
             self._log_take(self.takes.takes[-1])
             return
+        if not self.takes.recording:                   # idle: the line every few seconds
+            self._show_take_status()
+            return
         self.take_status.setText(f"● recording {self.takes.elapsed:.1f} s / "
-                                 f"{self.takes.limit:.0f} s")
+                                 f"{self.takes.limit:.0f} s  ·  "
+                                 f"{self._free_memory_gb():.1f} GB free")
 
     def _save_takes(self):
         todo = self.takes.unsaved()
