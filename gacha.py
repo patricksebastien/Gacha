@@ -2929,9 +2929,12 @@ and a MIDI binding, and the drum hits can leave as MIDI notes for a drum machine
 <b>[</b> / <b>]</b> or an expression pedal for A/B, <b>F1</b> to <b>F4</b> for the stems,
 <b>E</b> for a one-shot, <b>A</b> for the live input through, <b>R</b> to record a take as
 new material.</li>
-<li><b>Controls</b> binds any row to a key or a MIDI message: click its MIDI cell and move
-the control (learn). <b>Erae</b> lays the pads out on an Erae 2, <b>M:C</b> drives a
-Model:Cycles over MIDI.</li>
+<li>MIDI binding, the quick way: <b>Ctrl-click</b> any knob, switch, menu or slider anywhere
+in the interface, then move or press the controller, and that control is bound (the control
+keeps its value; a second Ctrl-click cancels). <b>Alt-click</b> a control to remove its
+binding. The <b>Controls</b> tab has every row with its key and its binding: click a row's
+MIDI cell to learn there, Delete clears it. <b>Erae</b> lays the pads out on an Erae 2,
+<b>M:C</b> drives a Model:Cycles over MIDI.</li>
 <li>The manual is <b>README.md</b> next to the program; the box's MIDI surface is in
 <b>MODEL_CYCLES_MIDI.md</b>.</li>
 </ol>
