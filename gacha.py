@@ -1777,10 +1777,12 @@ class PerfMeter(QWidget):
     """The section at a glance, big enough to read from the pedals: what
     plays (kind, root, tempo) in large type, and the loop's bars as a row of
     cells, the current one lit with a sweep running through it over the
-    bar, four beat dots under each, a mark after every phrase. A held
-    repeat draws its window over the cells in yellow, the cell's own
-    playhead inside it and a chevron for the direction, while the sweep
-    underneath goes on showing the transport the loop will come back to."""
+    bar, four beat dots under each, a mark after every phrase, and the
+    sub bass's note in the bars that have one (the MIDI out's root notes
+    play the same). A held repeat draws its window over the cells in
+    yellow, the cell's own playhead inside it and a chevron for the
+    direction, while the sweep underneath goes on showing the transport
+    the loop will come back to."""
 
     ACCENT = QColor(212, 48, 30, 230)
     REPEAT = QColor(255, 214, 80, 70)
@@ -1797,18 +1799,23 @@ class PerfMeter(QWidget):
         self.bars = 8
         self.pos = None                  # bars into the loop (float), None = nothing plays
         self.repeat = None               # (start, length, backwards, heard), in bars
+        self.notes = {}                  # bar -> the sub's note name ("G"), the bars with one
         self.setMinimumHeight(132)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-    def set_state(self, title, bars=None, pos=None, repeat=None):
+    def set_state(self, title, bars=None, pos=None, repeat=None, notes=None):
         """`title` the big line; `bars` the loop's length; `pos` the
         position in bars (0 <= pos < bars), or None while nothing plays;
         `repeat` a held repeat's window as (start, length, backwards,
-        heard), start and heard in bars into the loop, length in bars."""
+        heard), start and heard in bars into the loop, length in bars;
+        `notes` the sub bass's note name per bar ({bar: "G"}), the bars
+        without one left out."""
         bars = self.bars if bars is None else max(1, int(bars))
-        if (title, bars, pos, repeat) == (self.title, self.bars, self.pos, self.repeat):
+        notes = {int(b): str(nm) for b, nm in (notes or {}).items()}
+        if (title, bars, pos, repeat, notes) == (self.title, self.bars, self.pos, self.repeat,
+                                                self.notes):
             return
-        self.title, self.bars, self.pos, self.repeat = title, bars, pos, repeat
+        self.title, self.bars, self.pos, self.repeat, self.notes = title, bars, pos, repeat, notes
         self.update()
 
     def _x(self, b, cw, gap, end=False):
@@ -1868,6 +1875,9 @@ class PerfMeter(QWidget):
         frac = 0.0 if self.pos is None else self.pos - int(self.pos)
         num = QFont(f)
         num.setPixelSize(max(12, int(ch * 0.5)))
+        note_f = QFont(f)                             # the sub's note, under the number
+        note_f.setPixelSize(max(10, int(ch * 0.2)))
+        band = max(14.0, ch * 0.22) if self.notes else 0.0
         for i in range(n):
             x = i * (cw + gap)
             r = QRectF(x, top, cw, ch)
@@ -1884,7 +1894,11 @@ class PerfMeter(QWidget):
                 p.drawRoundedRect(QRectF(x, top, max(8.0, cw * frac), ch), 8, 8)
             p.setFont(num)
             p.setPen(self.TEXT if i == cur else self.DIM)
-            p.drawText(QRectF(x, top, cw, ch - 10), Qt.AlignCenter, str(i + 1))
+            p.drawText(QRectF(x, top, cw, ch - 10 - band), Qt.AlignCenter, str(i + 1))
+            if i in self.notes:                       # the sub's note that bar
+                p.setFont(note_f)
+                p.drawText(QRectF(x, top + ch - 12 - band, cw, band), Qt.AlignCenter,
+                           self.notes[i])
             p.setPen(Qt.NoPen)
             for b in range(4):                        # the beats of the bar
                 lit = i == cur and frac * 4 >= b
@@ -5553,7 +5567,11 @@ class Main(QMainWindow):
         self.perf_meter = PerfMeter()
         self.perf_meter.setToolTip("What plays and where the loop is: the current bar lit, "
                                    "a sweep through it over the bar, a dot per beat, a mark "
-                                   "after each 4-bar phrase (where a break lands). A held "
+                                   "after each 4-bar phrase (where a break lands), and under "
+                                   "the number the sub bass's note in the bars that have one "
+                                   "(the key note, its fifth, or the bar's own pitch with the "
+                                   "Sections tab's per bar tick; the MIDI out's root notes "
+                                   "play the same). A held "
                                    "repeat draws its window in yellow over the cells, with "
                                    "its own playhead and a chevron for the direction; the "
                                    "sweep underneath is the loop running on, where letting "
@@ -9292,6 +9310,9 @@ class Main(QMainWindow):
         sec.notes = [n for n in sec.notes if not own(n)] + [n for n in new.notes if own(n)]
         for name in SHUFFLE_STEMS[part]:
             sec.stems[name] = new.stems[name]
+        if "sub" in SHUFFLE_STEMS[part]:              # the sub rendered again: its key and notes
+            sec.root, sec.mode = new.root, getattr(new, "mode", None)
+            sec.sub_notes = dict(getattr(new, "sub_notes", {}))
         self._perf_current = (sec, out, cur[2])
         self._pad_cache.clear()                       # the pads follow the section's kit
         if part in KIT_PARTS:
@@ -10071,7 +10092,7 @@ class Main(QMainWindow):
                    pl.heard_s() * pl.bpm / 60.0 / 4)
         if pl.head_state()["mode"] is not None and pl.repeat is None:
             bar_pos = (pl.heard_s() * pl.bpm / 60.0 / 4) % max(1, pl.bars)   # what sounds
-        self.perf_meter.set_state(big, pl.bars, bar_pos, win)
+        self.perf_meter.set_state(big, pl.bars, bar_pos, win, getattr(sec, "sub_notes", None))
         # picture: the frame the sounding sample was cut from, dissolved into
         # the live picture by the A/B pedal (follow), or pinned to either side
         mode = self.perf_picture.currentText()
