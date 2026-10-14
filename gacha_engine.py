@@ -868,6 +868,7 @@ SYNTH_FLAVOUR = {                     # drum style -> synth flavour (auto)
     "one-drop": "house", "boom-bap": "house",
     "halftime": "techno", "idm": "techno", "dembow": "techno", "clave": "techno",
     "hypnotic": "techno", "drone": "techno", "glitch": "techno", "dub": "house",
+    "polyrhythm": "techno",
     "dnb": "dnb", "breakbeat": "dnb", "footwork": "dnb",
 }
 
@@ -1037,7 +1038,7 @@ def humanize_time(rng, amount):
 
 DRUM_STYLES = ["four-floor", "breakbeat", "boom-bap", "halftime", "dnb",
                "minimal", "ukg", "dembow", "one-drop", "footwork", "clave",
-               "idm", "hypnotic", "drone", "glitch", "dub"]
+               "idm", "hypnotic", "drone", "glitch", "dub", "polyrhythm"]
 
 
 # open hat placement per style: candidate steps and the chance each one
@@ -1051,7 +1052,7 @@ OPEN_HAT = {
     "clave": ((6, 14), 0.3), "idm": (tuple(range(1, 16, 2)), 0.15),
     "hypnotic": ((2, 6, 10, 14), 0.2),
     "drone": ((8,), 0.3), "glitch": (tuple(range(1, 16, 2)), 0.1),
-    "dub": ((2, 6, 10, 14), 0.5),
+    "dub": ((2, 6, 10, 14), 0.5), "polyrhythm": ((2, 6, 10, 14), 0.3),
 }
 
 
@@ -1279,6 +1280,18 @@ STYLE_FEEL = {
         chop=1.2, chop_steps=(2, 6, 10, 14), chop_density=0.7, chop_pick=2, chop_len=(1, 2, 2),
         chop_rev=0.4, chop_swing=True,
         events=(2, 4), event_len=(1.0, 4.0), event_grid="half", event_rev=0.6, event_gain=1.1),
+    "polyrhythm": Feel(
+        note="counts against the four: textures in loops of 3, 5 or 6 bars (stretched "
+             "to those too), so they come round against the 8; delays at 3, 5 and 7 "
+             "16ths; the chops one slice at a count of 3, 5 or 7 across the bars; rolls "
+             "in 3s and 5s; little mutation (it would break the count), few fills",
+        swing=(0.0, 0.02), humanize=0.6, mutation=0.3, glitch=0.5, fill=0.3, ride=0.7, sub=1.2,
+        ratchet=0.1, ratchet_counts=(3, 3, 5, 5),
+        layers=(1, 2), layer_bars=(3, 3, 5, 6), stretch_bars=(3, 5, 6),
+        favour=("Delay", "Phaser", "Reverb"), pitch=(-5, 0, 0, 5, 7, 12), delay=("poly", "poly", "med"),
+        chop=1.2, chop_period=(3, 5, 7), chop_density=0.9, chop_pick=2, chop_len=(1, 2),
+        chop_rev=0.1,
+        events=(2, 4), event_len=(0.5, 2.0)),
 }
 
 DEFAULT_FEEL = Feel()
@@ -1389,6 +1402,48 @@ def open_hat_pattern(rng, hihat, style):
             opened[st] = max(closed[st], rng.uniform(0.7, 1.0))
             closed[st] = 0.0
     return closed, opened
+
+
+def euclid(k, n, rot=0):
+    """k hits spread as evenly as n steps allow (Bjorklund's, the Euclidean
+    rhythm: E(3, 8) is the tresillo, E(5, 16) five against the four),
+    turned by `rot` steps; a list of n 0/1."""
+    k = max(0, min(k, n))
+    pat = [0] * n
+    if k:
+        for i in range(k):
+            pat[(i * n) // k] = 1
+    rot %= max(1, n)
+    return pat[-rot:] + pat[:-rot] if rot else pat
+
+
+POLY_CYCLES = (5, 6, 7, 9, 10, 11)      # the short cycles a polymeter voice runs in, in 16ths
+
+
+def polymeter_tiles(rng, style):
+    """The voices that run their own short cycle across the bars, by style:
+    {role: tile}, a tile a list of velocities of POLY_CYCLES length laid
+    end to end from the section's first step (tile_bar), so its one
+    drifts against the bar and comes round after several. Only the
+    polyrhythm style has any; nothing is drawn for the others."""
+    if style != "polyrhythm":
+        return {}
+    tiles = {}
+    lens = rng.sample(POLY_CYCLES, 2)
+    for role, n in zip(("hihat", "ride"), lens):
+        k = max(2, round(n * rng.uniform(0.4, 0.6)))
+        hits = euclid(k, n, rng.randrange(n))
+        first = next((i for i, h in enumerate(hits) if h), 0)
+        tiles[role] = [(0.95 if i == first else rng.uniform(0.4, 0.65)) if h else 0.0
+                       for i, h in enumerate(hits)]
+    return tiles
+
+
+def tile_bar(tile, bar_i, steps=16):
+    """Bar `bar_i` of a polymeter voice: its tile laid end to end from
+    the section's first step, cut at the bar."""
+    n = len(tile)
+    return [tile[(bar_i * steps + s) % n] for s in range(steps)]
 
 
 def make_pattern(rng, role, style, steps=16):
@@ -1596,6 +1651,24 @@ def make_pattern(rng, role, style, steps=16):
             for s in range(1, steps, 2):
                 if pat[s] == 0 and rng.random() < 0.3:
                     pat[s] = rng.uniform(0.2, 0.4)
+    elif style == "polyrhythm":                     # counts against the four
+        if role == "kick":                          # the four, the pulse the rest is against
+            if rng.random() < 0.2:                  # now and then five against it instead
+                for s, h in enumerate(euclid(5, steps)):
+                    if h:
+                        pat[s] = 1.0 if s == 0 else rng.uniform(0.8, 0.95)
+            else:
+                for s in (0, 4, 8, 12):
+                    pat[s] = 1.0
+        elif role == "snare":                       # the cross-rhythm: 3, 5, 6 or 7 even hits
+            k = rng.choice([3, 5, 5, 6, 7])         # across the bar, resolving on the one
+            for s, h in enumerate(euclid(k, steps, rng.choice([0, 0, 1, 2]))):
+                if h:                               # on the four's beats hard, between soft
+                    pat[s] = rng.uniform(0.85, 1.0) if s % 4 == 0 else rng.uniform(0.45, 0.7)
+        else:                                       # the hats: a polymeter tile takes the
+            for s, h in enumerate(euclid(7, steps, rng.randrange(steps))):   # bars over
+                if h:
+                    pat[s] = rng.uniform(0.5, 0.8)
     elif style == "idm":                            # structured chaos
         if role == "kick":
             pat[0] = 1.0
@@ -1642,6 +1715,9 @@ def synced_delay(rng, beat, tiers=None):
     if tier == "dub":
         t = beat * rng.choice([0.75, 1.5, 3])      # dotted 8th, dotted 4th, dotted half
         fb, mix = rng.uniform(0.45, 0.6), rng.uniform(0.3, 0.45)
+    elif tier == "poly":
+        t = beat * rng.choice([0.75, 1.25, 1.75])  # 3, 5 and 7 16ths: echoes against the four
+        fb, mix = rng.uniform(0.35, 0.5), rng.uniform(0.25, 0.4)
     elif tier == "short":
         t = beat * rng.choice([0.125, 0.25])       # 1/32, 1/16: slapback
         fb, mix = rng.uniform(0.15, 0.35), rng.uniform(0.25, 0.5)
@@ -1840,6 +1916,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
 
         pats = {r: make_pattern(rng, r, drum_style)
                 for r in ("kick", "snare", "hihat", "ride")}
+        tiles = polymeter_tiles(rng, drum_style)   # the voices on a short cycle of their own
         pats["hihat"], pats["ohat"] = open_hat_pattern(rng, pats["hihat"],
                                                        drum_style)
         intro_kind = intro_style if is_intro else None
@@ -1871,9 +1948,10 @@ def compose(seed, duration, sample_files, intro_bars=None,
                       if (gains[r] > 0 and kit[r]) or (sgains[r] > 0 and synth)]
             for bi in range(length):
                 bar_start = sec_start + int(bi * bar * SR)
-                bar_pats = {r: (mutate(rng, pats[r], k.mutation_amount)
+                base = {r: (tile_bar(tiles[r], bi) if r in tiles else pats[r]) for r in active}
+                bar_pats = {r: (mutate(rng, base[r], k.mutation_amount)
                                 if rng.random() < k.mutation_chance * feel.mutation
-                                else pats[r]) for r in active}
+                                else base[r]) for r in active}
                 # drum fill on the last bar of a section
                 if bi == length - 1 and rng.random() < feel.fill and "snare" in active:
                     p = list(bar_pats["snare"])

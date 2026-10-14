@@ -7962,7 +7962,8 @@ program.</li>
         self.drum_style.addItems(["random", "four-floor", "breakbeat",
                                   "boom-bap", "halftime", "dnb", "minimal",
                                   "ukg", "dembow", "one-drop", "footwork",
-                                  "clave", "idm", "hypnotic", "drone", "glitch", "dub"])
+                                  "clave", "idm", "hypnotic", "drone", "glitch", "dub",
+                                  "polyrhythm"])
         self.drum_style.setToolTip(
             "The style of the whole song or section, not the kit alone: its pattern "
             "family, and with it how the textures loop, where the chops land, how "
@@ -7982,8 +7983,12 @@ program.</li>
             "one and little else under long stretched textures, short bursts for "
             "chops, swells), glitch (bursts anywhere, crushed, chops and one-shots of "
             "a 16th or less, rolls), dub (steppers: the kick on the beat, the rim on 3, "
-            "the skank, dub echoes, everything reversed more often than not). random "
-            "picks one per song, or per live section.")
+            "the skank, dub echoes, everything reversed more often than not), polyrhythm "
+            "(counts against the four: the kick the four, the snare 3, 5, 6 or 7 even "
+            "hits across the bar, the hats and the ride each on a short cycle of 5 to 11 "
+            "16ths drifting across the bars, textures in loops of 3, 5 or 6 bars, chops "
+            "at a count of 3, 5 or 7, delays at 3, 5 and 7 16ths, rolls in 3s and 5s). "
+            "random picks one per song, or per live section.")
         self.feel = QComboBox()
         self.feel.addItems(E.FEEL_CHOICES)
         self.feel.setToolTip(
@@ -8063,7 +8068,7 @@ program.</li>
                                     "the drum style: house for four-floor, "
                                     "ukg, minimal, one-drop, boom-bap; techno "
                                     "for halftime, idm, dembow, clave, hypnotic, drone, "
-                                    "glitch; house for dub too; dnb for "
+                                    "glitch, polyrhythm; house for dub too; dnb for "
                                     "dnb, breakbeat, footwork. Picking a "
                                     "flavour sets the synth volumes to a mix "
                                     "that suits it; auto leaves them alone")

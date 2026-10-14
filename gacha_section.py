@@ -330,6 +330,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
 
     # ---- drums ----
     pats = {r: E.make_pattern(rd, r, drum_style) for r in ("kick", "snare", "hihat", "ride")}
+    tiles = E.polymeter_tiles(rd, drum_style)         # the voices on a short cycle of their own
     if rung is not None:                              # the rung's extra hits
         chance, lo, hi = rung.hats                    # hats on the pattern's rests
         pats["hihat"] = [v if v > 0 else (rd.uniform(lo, hi) if rd.random() < chance else 0.0)
@@ -369,8 +370,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     kick_hits = []                                    # (pos, bar, step) for the sub
     for bi in range(bars):
         bar_start = int(bi * bar * SR)
-        bar_pats = {r: (E.mutate(rd, pats[r], k.mutation_amount)
-                        if rd.random() < k.mutation_chance * feel.mutation else pats[r])
+        base = {r: (E.tile_bar(tiles[r], bi) if r in tiles else pats[r]) for r in active}
+        bar_pats = {r: (E.mutate(rd, base[r], k.mutation_amount)
+                        if rd.random() < k.mutation_chance * feel.mutation else base[r])
                     for r in active}
         if bi == bars - 1 and rd.random() < feel.fill and "snare" in active:
             p = list(bar_pats["snare"])
