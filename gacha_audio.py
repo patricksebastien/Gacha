@@ -116,7 +116,7 @@ from gacha_frag import Fragments
 from gacha_freeze import Freeze
 from gacha_metro import Metronome, VEL as METRO_VEL
 from gacha_fx import ALL_CHANNELS, Rack, STEM_CHANNELS, VOICES
-from gacha_midi import DRUM_NOTES, DRUM_ROLES, TONAL_VOICING, root_shift, style_offset
+from gacha_midi import DRUM_NOTES, DRUM_ROLES, ROOT_ROLES, ROOT_VEL, root_shift, style_offset
 
 assert VOICES[:len(DRUM_ROLES)] == DRUM_ROLES      # one voice per MIDI role, then the sub
 
@@ -293,31 +293,36 @@ def _device_index(name, kind, api=None):
     raise RuntimeError(f"{name}: not found (unplugged?)")
 
 
-def drum_table(events, sr, style=None, bpm=None, root=None):
+def drum_table(events, sr, style=None, bpm=None, root=None, length_s=None):
     """The drum hits of an event timeline ([t, src, off, dur, rate, role,
     (vel)] with t in seconds) as (frames int64 sorted, roles, velocities
     0..1, semitones), for the MIDI out; None when there is none. The
     semitones are the style voicing (gacha_midi.style_offset) of each hit
     from the drum style the hits were patterned in and the tempo, by its
-    16th step in the bar; 0 everywhere without them. `root`, a note name
-    (a section's) or a list of (start_s, end_s, name) (a song's sections),
-    moves the tonal voicings (gacha_midi.TONAL_VOICING) into that key."""
+    16th step in the bar, plus the key: `root`, a note name (a section's)
+    or a list of (start_s, end_s, name) (a song's sections), moves every
+    hit into that key (gacha_midi.root_shift). With a root and `length_s`
+    (the loop's or the song's length) a "root" row sits on every bar's
+    one as well, the root note itself for the box's tone and chord tracks
+    (ROOT_ROLES). Semitones 0 everywhere without a style and a tempo."""
     rows = []
     step_s = 60.0 / bpm / 4 if style and bpm else None
-    tonal = TONAL_VOICING.get(style, ()) if step_s else ()
     if isinstance(root, str) or root is None:
         spans = [(-1e9, 1e9, root_shift(root))]
     else:
         spans = [(float(a), float(b), root_shift(r)) for a, b, r in root]
+    key = (lambda t: next((k for a, b, k in spans if a <= t < b), 0)) if step_s else (lambda t: 0)
     for e in events or ():
         if len(e) < 6 or e[5] not in DRUM_ROLES:
             continue
         vel = min(1.0, max(0.0, float(e[6]) if len(e) > 6 else 1.0))
         t = float(e[0])
         semis = style_offset(style, e[5], int(round(t / step_s)), vel) if step_s else 0
-        if e[5] in tonal:
-            semis += next((k for a, b, k in spans if a <= t < b), 0)
-        rows.append((int(round(t * sr)), e[5], vel, semis))
+        rows.append((int(round(t * sr)), e[5], vel, semis + key(t)))
+    if step_s and root and length_s:
+        bar_s = step_s * 16
+        for b in range(int(round(length_s / bar_s))):
+            rows.append((int(round(b * bar_s * sr)), "root", ROOT_VEL, key(b * bar_s)))
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])
@@ -1020,7 +1025,8 @@ class SectionPlayer:
         in, and `root` the section's note name, for the MIDI out's style
         voicing."""
         self.pending = (stems, events, bpm, bars, bar_t0,
-                        drum_table(events, self.sr, style, bpm, root), int(start_bar))
+                        drum_table(events, self.sr, style, bpm, root, bars * 240.0 / bpm),
+                        int(start_bar))
         self._pend_covered = 0
         self.frag.prepare(stems)             # its stacked copy, here and not on the audio thread
 
@@ -1031,7 +1037,8 @@ class SectionPlayer:
         as the loop or it is dropped. A section queued meanwhile wins, it
         replaces everything anyway; a break waits it out. `style` and
         `root` as in queue()."""
-        self._replace = (stems, events, drum_table(events, self.sr, style, self.bpm, root))
+        self._replace = (stems, events, drum_table(events, self.sr, style, self.bpm, root,
+                                                   self.bars * 240.0 / self.bpm))
         self.frag.prepare(stems)
 
     def waiting_for(self):
@@ -1432,6 +1439,7 @@ class SongPlayer:
         self._gen = 0
         self._want_play = False
         self._ev = None                       # drum_table of the render: the MIDI out
+        self.bpm = None                       # its tempo, for the root notes' length
         self.lookahead = 0
         self.hits = []
 
@@ -1440,7 +1448,9 @@ class SongPlayer:
         out; its drum style and tempo (the meta's `style` and `bpm`) and
         its sections' roots ([(start_s, end_s, name)]) for the style
         voicing."""
-        self._ev = drum_table(events, self.sr, style, bpm, roots)
+        self.bpm = float(bpm) if bpm else None
+        end = max((float(b) for _a, b, _r in roots or ()), default=0.0)
+        self._ev = drum_table(events, self.sr, style, bpm, roots, end or None)
 
     def load(self, path, play=True):
         self._gen += 1
@@ -2230,11 +2240,24 @@ class LiveAudio:
             voicing = self.midi_voicing
             w = float(np.sqrt(ab))                            # the section under the pedal
             frozen = self.freeze.active                       # the hits pause under the freeze
-            for hits, scale in ((self.player.hits, w), (self.song.hits, 1.0)):
+            for hits, scale, bpm in ((self.player.hits, w, self.player.bpm),
+                                     (self.song.hits, 1.0, self.song.bpm)):
                 if scale < 0.05 or frozen:
                     continue
                 for off, role, vel, semis in hits:
                     aud = aud_after if sw_off is None or off >= sw_off else aud_before
+                    if role == "root":                # the key itself, on the box's
+                        if not voicing or not chans:  # tone and chord tracks, a bar long
+                            continue
+                        for r in ROOT_ROLES:
+                            note = notes.get(r, -1)
+                            if r not in aud or note is None or note < 0:
+                                continue
+                            mo.note(chans[r], min(127, max(0, note + semis)),
+                                    round(127 * vel * scale), base + off / sr,
+                                    0.9 * 240.0 / bpm if bpm else gate)
+                            self.midi_sent += 1
+                        continue
                     note = notes.get(role, -1)
                     if role not in aud or note is None or note < 0:
                         continue

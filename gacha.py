@@ -3042,11 +3042,16 @@ class Main(QMainWindow):
             "for a receiver whose drum plays chromatically, the Model:Cycles' track "
             "channels or a sampler's pad: on a GM kit the shifted notes land on "
             "other drums. " + " ".join(f"{s}: {w}." for s, w in STYLE_VOICING.items())
-            + " The other styles send the map as is. The drum pads are never "
-            "shifted. The pitched ones (hypnotic's ladder, halftime's and footwork's "
-            "kicks, idm's steps) are moved into the section's key as well, the root "
-            "the sub bass plays: tune that track so the map's note sounds a C and it "
-            "plays in the groove's key. Off by default, remembered.")
+            + " The other styles send the map as is. And the whole kit is moved "
+            "into the section's key, the root the sub bass plays (a song's per "
+            "section): every hit's note takes the root's shift, B one down, G a "
+            "fourth down, so with each track tuned so the map's note sounds a C "
+            "the box is tuned to the samples. With the Model:Cycles tick the root "
+            "itself goes out on the one of every bar, held for most of the bar, on "
+            "the ride's and the hat stutter's tracks, T5 and T6, a Tone and a Chord "
+            "machine by default: the key under the kit, besides those tracks' own "
+            "hits in key. The drum pads are never shifted. Off by default, "
+            "remembered.")
         form.addRow("notes", self._row([("channel", self.midi_out_channel),
                                         ("", self.midi_out_cycles),
                                         ("lead", self.midi_out_lead),

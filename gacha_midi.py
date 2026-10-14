@@ -127,13 +127,16 @@ STYLE_VOICING = {
     "one-drop": "the rim (the snare at full) a fifth up, the ghost as it is",
     "idm": "the kick and the snare on a pitch of their own per step, fixed for the song",
 }
-# the voicings that are pitches in a key rather than a drum's colour: these
-# roles are moved to the section's root as well (the sub bass's note, read
-# off the layers), so the box's track, tuned so that the map's note sounds
-# a C, plays in the groove's key; the others (ghosts, rims, hats, the clave)
-# stay where the track is tuned
-TONAL_VOICING = {"hypnotic": ("snare",), "halftime": ("kick",), "footwork": ("kick",),
-                 "idm": ("kick", "snare")}
+# With the voicing on the whole kit is moved into the section's key as well:
+# every hit's note takes the root's shift (the sub bass's note, read off the
+# layers; a song's per section), so the box, each track tuned so that the
+# map's note sounds a C, is tuned to the samples. And the root itself goes
+# out once a bar on the one, held for most of the bar, on the tracks of
+# ROOT_ROLES (the box's T5 and T6, a Tone and a Chord machine by default):
+# the key under the kit, besides those tracks' own hits. Those are "root"
+# rows of the hit table, sent on the track channels only (a Model:Cycles).
+ROOT_ROLES = ("ride", "glitch")
+ROOT_VEL = 0.8
 _PCS = {"C": 0, "C#": 1, "D": 2, "D#": 3, "E": 4, "F": 5, "F#": 6, "G": 7, "G#": 8, "A": 9,
         "A#": 10, "B": 11}
 
