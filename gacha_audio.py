@@ -348,7 +348,7 @@ class SectionPlayer:
     right into the one. `fill_state()` tells the picture what is happening.
 
     A repeat (`repeat`, set from the GUI while a key or a note is held): a
-    cell of the bar, a division of it (bar, 1/2, ... 1/64), is read in place
+    cell of the bar, a division of it (4 bars, 2 bars, bar, 1/2, ... 1/64), is read in place
     of the transport, the cell playing at the press (the anchor), moved
     some cells earlier or later round the loop, forwards or backwards. The
     transport runs on underneath, so the bar, the clock and a queued
@@ -509,7 +509,7 @@ class SectionPlayer:
                 "gap": bool(f["retrig"][k] < 0), "swell": min(1.0, sw)}
 
     def set_repeat(self, div, offset=0, rev=False):
-        """Hold: repeat `div` of a bar (1.0, 0.5, ... 1/64) from the cell
+        """Hold: repeat `div` of a bar (4.0, 2.0, 1.0, 0.5, ... 1/64) from the cell
         playing now, `offset` cells earlier (< 0) or later round the loop,
         backwards with `rev`; call again to change any of them while held,
         the anchor stays. See the class note. No-op with no section."""
@@ -578,24 +578,42 @@ class SectionPlayer:
         return start, ln, rev
 
     # ---- the repeat (audio thread)
+    def _rep_len(self, div):
+        """The cell in frames: a division of the bar, or whole bars (2, 4)."""
+        bar_f = 4 * self.beat_frames
+        return max(1, int(round(bar_f * div)))
+
+    def _rep_phase(self, t, ln):
+        """Where frame(s) `t` fall in a cell of `ln` frames: within the bar
+        for a cell under a bar (so the cells re-sync on every bar, whatever
+        the rounding), over whole bars for a cell of several."""
+        bar_f = 4 * self.beat_frames
+        return t % ln if ln >= bar_f else (t % bar_f) % ln
+
+    def _rep_cell_start(self, a, ln):
+        """The first frame of the cell `a` falls in: cells tile the bar, or
+        the bars from the loop's start for a cell of several."""
+        bar_f = 4 * self.beat_frames
+        if ln >= bar_f:
+            return (a // ln) * ln
+        return (a // bar_f) * bar_f + (a % bar_f // ln) * ln
+
     def _rep_geom(self, a, rep):
         """(cell length, window start, backwards) of the repeat `rep` from
         the anchor `a`: a coarser division snaps the anchor down within its
-        bar, a finer one keeps it, so the roll tightens from the same one;
-        the offset moves the window by cells, round the loop."""
+        bar (or to the bars), a finer one keeps it, so the roll tightens
+        from the same one; the offset moves the window by cells, round the
+        loop (a window past the loop's end reads on from its start)."""
         div, off, rev = rep
-        bar_f = 4 * self.beat_frames
-        ln = max(1, min(bar_f, int(round(bar_f * div))))
-        start = ((a // bar_f) * bar_f + (a % bar_f // ln) * ln + off * ln) % self.n
+        ln = self._rep_len(div)
+        start = (self._rep_cell_start(a, ln) + off * ln) % self.n
         return ln, start, rev
 
     def _rep_cells(self, i0, rep):
         """The repeat's geometry at transport frame `i0`; the anchor, set
         at the first block, is the cell playing then."""
         if self._rep_anchor is None:
-            bar_f = 4 * self.beat_frames
-            ln = max(1, min(bar_f, int(round(bar_f * rep[0]))))
-            self._rep_anchor = (i0 // bar_f) * bar_f + (i0 % bar_f // ln) * ln
+            self._rep_anchor = self._rep_cell_start(i0, self._rep_len(rep[0]))
         return self._rep_geom(self._rep_anchor, rep)
 
     def _rep_map(self, t, rep):
@@ -606,8 +624,8 @@ class SectionPlayer:
         cell is the transport's own, within its bar, so the hits land on
         the grid."""
         ln, start, rev = self._rep_cells(int(t[0]), rep)
-        bar_f, n = 4 * self.beat_frames, self.n
-        ph = (t % bar_f) % ln
+        n = self.n
+        ph = self._rep_phase(t, ln)
         src = start + (ln - 1 - ph if rev else ph)
         f = int(0.002 * self.sr)
         g = None
@@ -859,7 +877,7 @@ class SectionPlayer:
         t = max(i0, min(a0, self._covered))
         while t < end:
             tb = t % bar_f
-            ph = tb % ln
+            ph = self._rep_phase(t, ln)
             cnt = min(end - t, ln - ph, bar_f - tb)
             off = lead + (t - a0)                     # block offset of transport frame t
             if rev:

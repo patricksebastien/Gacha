@@ -477,10 +477,10 @@ KEYMAP += [("pads", f"hit_{_v}", "", f"{VOICE_LABELS[_v]} hit: the voice's sampl
 KEYMAP += [("section", "repeat", "H", "repeat (hold): the cell of the bar playing at the "
                                      "press loops while the key or the note is down, at "
                                      "the division next to it; the loop runs on underneath"),
-           ("section", "rep_finer", "-", "repeat division one finer: bar, 1/2, 1/4, 1/8, "
-                                        "1/16, 1/32, 1/64"),
+           ("section", "rep_finer", "-", "repeat division one finer: 4 bars, 2 bars, bar, 1/2, "
+                                        "1/4, 1/8, 1/16, 1/32, 1/64"),
            ("section", "rep_coarser", "=", "repeat division one coarser"),
-           ("section", "rep_div", "", "repeat division as a knob: bar at the bottom, 1/64 "
+           ("section", "rep_div", "", "repeat division as a knob: 4 bars at the bottom, 1/64 "
                                      "at the top"),
            ("section", "rep_earlier", ",", "repeat position one cell earlier, round the loop"),
            ("section", "rep_later", ".", "repeat position one cell later"),
@@ -718,8 +718,8 @@ QUANT_GRIDS = [("off", 0.0), ("1/16", 1 / 16), ("1/8", 1 / 8), ("1/4", 1 / 4),
                ("1/2", 1 / 2), ("bar", 1.0)]
 QUANT_DEFAULT = "1/8"
 # the repeat's cell: a division of the bar
-REPEAT_DIVS = [("bar", 1.0), ("1/2", 1 / 2), ("1/4", 1 / 4), ("1/8", 1 / 8),
-               ("1/16", 1 / 16), ("1/32", 1 / 32), ("1/64", 1 / 64)]
+REPEAT_DIVS = [("4 bars", 4.0), ("2 bars", 2.0), ("bar", 1.0), ("1/2", 1 / 2), ("1/4", 1 / 4),
+               ("1/8", 1 / 8), ("1/16", 1 / 16), ("1/32", 1 / 32), ("1/64", 1 / 64)]
 REPEAT_DEFAULT = "bar"
 REPEAT_RANGE = 16                 # cells earlier or later the position knob reaches
 # the speed: what half and double time resync on, and a tape stop's length
@@ -5127,10 +5127,10 @@ class Main(QMainWindow):
         self.rep_div = QComboBox()
         self.rep_div.addItems([name for name, _f in REPEAT_DIVS])
         self.rep_div.setToolTip(
-            "The cell the repeat loops: the bar down to a 1/64 note (a pitched "
-            "buzz by then). Finer while held tightens the roll from the same "
-            "one; coarser widens it. - and = step it, a MIDI knob sweeps it. "
-            "Remembered.")
+            "The cell the repeat loops: 4 bars, 2 bars, the bar, down to a 1/64 "
+            "note (a pitched buzz by then). Finer while held tightens the roll "
+            "from the same one; coarser widens it (2 and 4 bars snap to the "
+            "loop's bars). - and = step it, a MIDI knob sweeps it. Remembered.")
         d = self.settings.value("perform/rep_div", REPEAT_DEFAULT)
         if self.rep_div.findText(str(d)) >= 0:
             self.rep_div.setCurrentText(str(d))
@@ -9541,7 +9541,7 @@ class Main(QMainWindow):
         self.rep_div.setCurrentIndex(max(0, min(self.rep_div.count() - 1, i)))
 
     def _rep_div_frac(self, x):
-        """A knob over the divisions: the bar at the bottom, 1/64 at the top."""
+        """A knob over the divisions: 4 bars at the bottom, 1/64 at the top."""
         n = self.rep_div.count()
         self.rep_div.setCurrentIndex(min(n - 1, int(max(0.0, min(1.0, x)) * n)))
 
