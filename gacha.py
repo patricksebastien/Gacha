@@ -3059,7 +3059,8 @@ class Main(QMainWindow):
         gm = QPushButton("GM")
         gm.setToolTip("The General MIDI drum notes back: kick 36, snare 38, closed hat 42, "
                       "open hat 46, ride 51, hat stutter 44 (pedal hat). For a Model:Cycles "
-                      "the M:C tab's map to root button instead.")
+                      f"every drum at {CYCLES_ROOT} instead, the box's root (the M:C tab's "
+                      "tracks tick does that on a GM map).")
         gm.clicked.connect(self._midi_out_gm)
         pairs.append(("", gm))
         form.addRow("map", self._row(pairs))
@@ -3152,17 +3153,16 @@ class Main(QMainWindow):
         outer.addWidget(hint)
         # the MIDI out's side of the box (the port itself is the Controls tab's):
         # the hits on the track channels, the voicing, the octaves per track
-        # and the Controls tab's map to the box's root
         self.midi_out_cycles = QCheckBox("hits on the tracks")
         self.midi_out_cycles.setToolTip(
             "The MIDI out's receiver is this box: each drum goes out on its own "
             "track channel instead of the Controls tab's one channel, kick 1, snare 2, "
             "closed hat 3, open hat 4, ride 5, hat stutter 6 (the box's default T1-6 IN "
             "channels; RCV NOTE must be on). A note on a track channel plays that "
-            "track chromatically, so the Controls tab's map is the pitch of each: map "
-            f"to root puts the root (C4, {CYCLES_ROOT}) everywhere, which leaves the "
-            "track's own tuning alone (a fresh tick does that by itself when the map is "
-            "still GM). Remembered.")
+            f"track chromatically, so the Controls tab's map is the pitch of each: {CYCLES_ROOT} "
+            "(C4, the box's root) leaves the track's own tuning alone, and ticking this on "
+            "a map still at the GM notes puts it there on every drum. Move a drum up or "
+            "down in the map to pitch that track. Remembered.")
         self.midi_out_voicing = QCheckBox("style voicing")
         self.midi_out_voicing.setToolTip(
             "Ticked, the drum style the section (or the song) was patterned in "
@@ -3198,12 +3198,6 @@ class Main(QMainWindow):
                 "Remembered.")
             self.midi_out_oct[role] = sp
             mc_row.append(("oct" if i == 0 else "", sp))
-        root_btn = QPushButton("map to root")
-        root_btn.setToolTip(f"Every drum of the Controls tab's map at the box's root note "
-                            f"{CYCLES_ROOT}: each track plays at its own tuning. Move one "
-                            "up or down there to pitch that track.")
-        root_btn.clicked.connect(self._midi_out_cycles_root)
-        mc_row.append(("", root_btn))
         outer.addWidget(self._row([("MIDI out", mc_row[0][1])] + mc_row[1:]))
         self.mc_status = QLabel("")
         self.mc_status.setProperty("role", "sub")
