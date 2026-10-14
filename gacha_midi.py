@@ -132,6 +132,8 @@ STYLE_VOICING = {
     "dub": "as one-drop: the rim (the snare at full) a fifth up",
     "polyrhythm": "the cross-rhythm's hits between the four's beats (the snare off the "
                   "beat) a fourth up, the ones on a beat as they are",
+    "electro": "the kick's off-the-beat hits (the 3-3-2 figure) a fourth up, as footwork",
+    "amapiano": "the kick's off-the-beat hits an octave up: the log drum",
 }
 # With the voicing on the whole kit is moved into the section's key as well:
 # every hit's note takes the root's shift (the key's tonic, read off the
@@ -197,6 +199,12 @@ def style_offset(style, role, step, vel, mode="major"):
     elif style == "polyrhythm":
         if role == "snare" and s % 4:
             return 5
+    elif style == "electro":
+        if role == "kick" and s % 4:
+            return 5
+    elif style == "amapiano":
+        if role == "kick" and s % 4:
+            return 12
     return 0
 # the box's sound over CC, Appendix A of the manual (MODEL_CYCLES_MIDI.md):
 # (key, cc, label, kind, default, what) per track, on the track's channel.

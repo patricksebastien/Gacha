@@ -7963,7 +7963,9 @@ program.</li>
                                   "boom-bap", "halftime", "dnb", "minimal",
                                   "ukg", "dembow", "one-drop", "footwork",
                                   "clave", "idm", "hypnotic", "drone", "glitch", "dub",
-                                  "polyrhythm"])
+                                  "polyrhythm", "electro", "acid", "jungle", "gabber", "jersey",
+                                  "gqom", "amapiano", "jazz", "industrial", "bruk", "ambient",
+                                  "motorik", "afrobeat", "cumbia"])
         self.drum_style.setToolTip(
             "The style of the whole song or section, not the kit alone: its pattern "
             "family, and with it how the textures loop, where the chops land, how "
@@ -7987,8 +7989,19 @@ program.</li>
             "(counts against the four: the kick the four, the snare 3, 5, 6 or 7 even "
             "hits across the bar, the hats and the ride each on a short cycle of 5 to 11 "
             "16ths drifting across the bars, textures in loops of 3, 5 or 6 bars, chops "
-            "at a count of 3, 5 or 7, delays at 3, 5 and 7 16ths, rolls in 3s and 5s). "
-            "random picks one per song, or per live section.")
+            "at a count of 3, 5 or 7, delays at 3, 5 and 7 16ths, rolls in 3s and 5s), "
+            "electro (808: the kick in 3-3-2 figures, a stab on the 8ths), acid (the sub a "
+            "16th line with slides, a pitched chop line through the ladder), jungle (the "
+            "break re-cut every bar, the reese), gabber (the kick driven, a stab on every "
+            "beat, a hoover loop), jersey (the bed-squeak kick, chops in triplets), gqom "
+            "(broken and dark, chants on the kick's rests), amapiano (the log drum as a "
+            "pitched chop line, a heavy swing), jazz (the ride leads on a triplet swing, "
+            "the kick feathered, comping), industrial (sequenced, driven, crushed), bruk "
+            "(the snare displaced a 16th), ambient (hardly a beat, long textures, swells), "
+            "motorik (the same bar forever), afrobeat (Tony Allen's kit under short guitar "
+            "loops, the horn stabs chopped), cumbia (the caja on the offbeat 8ths, the "
+            "guacharaca's chk-chk-chk, the kick on 1 and 3, the accordion's chord chopped on "
+            "the offbeats). random picks one per song, or per live section.")
         self.feel = QComboBox()
         self.feel.addItems(E.FEEL_CHOICES)
         self.feel.setToolTip(
@@ -8068,7 +8081,9 @@ program.</li>
                                     "the drum style: house for four-floor, "
                                     "ukg, minimal, one-drop, boom-bap; techno "
                                     "for halftime, idm, dembow, clave, hypnotic, drone, "
-                                    "glitch, polyrhythm; house for dub too; dnb for "
+                                    "glitch, polyrhythm, acid, gabber, gqom, industrial, "
+                                    "ambient, motorik; house for dub, electro, jersey, "
+                                    "amapiano, jazz, bruk, afrobeat, cumbia; dnb for jungle and "
                                     "dnb, breakbeat, footwork. Picking a "
                                     "flavour sets the synth volumes to a mix "
                                     "that suits it; auto leaves them alone")

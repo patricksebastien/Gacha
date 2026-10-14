@@ -604,6 +604,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     pc, mode = E.chroma_key(chroma) if chroma is not None else (root_rng.randrange(12), "major")
     root = E.NOTE_NAMES[pc]
     sub_notes = {}                                   # bar -> the note's name (the MIDI out)
+    if not kick_hits and feel.drums < 1.0:            # a style whose drums sit out (ambient):
+        kick_hits = [(int(b * bar * SR), b, 0) for b in range(bars)]   # the sub on the one
     if k.sub_level > 0 and (kick_hits or feel.sub_line):
         bar_pc = E.bar_pcs(chroma, bars, int(bar * SR), pc, mode) if k.sub_follow else None
         note_len = int((feel.sub_hold * beat + k.sub_release) * SR)   # the hold + release
