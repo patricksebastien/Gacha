@@ -1514,7 +1514,9 @@ class LiveAudio:
         self.hold_tape = False               # the pedal leaves the tape's sound whole
                                              # (the webcam on B has none to bring in)
         self.player = SectionPlayer(self.sr)
-        self.on = self.player.on             # stems in/out, for section and song alike
+        self.on = self.player.on             # stems audible, for section and song alike:
+        self.stem_in = dict(self.on)         # each stem's own switch (the M button)...
+        self.stem_solo = set()               # ...and the solos: the others out while any is
         self.song = SongPlayer(self.sr, self.on)
         # the drum voices: in or out, and soloed (then every other voice is
         # out); set through switch(), which lands them on the grid
@@ -1573,11 +1575,11 @@ class LiveAudio:
 
     # ------------------------------------------------------------ control
     def switch(self, kind, key, on):
-        """A stem ("stem", F1-F4), a drum voice ("voice", in or out) or a
-        solo ("solo") switched, from any thread: it lands on the next line
-        of the quantize grid while a section plays, at once otherwise. The
-        audio gate ramps there, and the MIDI out follows from the same
-        frame on."""
+        """A stem ("stem", F1-F4), a stem's solo ("stem_solo"), a drum voice
+        ("voice", in or out) or a voice's solo ("solo") switched, from any
+        thread: it lands on the next line of the quantize grid while a
+        section plays, at once otherwise. The audio gate ramps there, and
+        the MIDI out follows from the same frame on."""
         with self._sw_lock:
             self._sw_req.append((kind, key, bool(on)))
 
@@ -1608,12 +1610,18 @@ class LiveAudio:
             if self._sw_req:
                 self._sw_wait.extend(self._sw_req)
                 self._sw_req = []
+        self._derive_stems()
         self._aud_before = self._audible()
         if not self._sw_wait or grid_off is None:
             return None
         for kind, key, on in self._sw_wait:
             if kind == "stem":
-                self.on[key] = on
+                self.stem_in[key] = on
+            elif kind == "stem_solo":
+                if on:
+                    self.stem_solo.add(key)
+                else:
+                    self.stem_solo.discard(key)
             elif kind == "voice":
                 self.voice_on[key] = on
             elif kind == "solo":
@@ -1622,7 +1630,17 @@ class LiveAudio:
                 else:
                     self.voice_solo.discard(key)
         self._sw_wait = []
+        self._derive_stems()
         return int(grid_off)
+
+    def _derive_stems(self):
+        """The stems audible (`on`, the dict the players read, kept in
+        place) from each one's switch and the solos: in, and not soloed
+        out. Every block: the GUI writes the switches and the solos
+        straight in at a stream's start."""
+        solo = self.stem_solo
+        for stem in list(self.on):
+            self.on[stem] = bool(self.stem_in.get(stem, True)) and (not solo or stem in solo)
 
     def start(self):
         """Open the devices. On ASIO the driver drives us: the stream is

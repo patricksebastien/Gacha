@@ -345,6 +345,11 @@ KEYMAP = [
     ("section", "stem_layers", "F2", "layers stem in/out"),
     ("section", "stem_chops", "F3", "chops stem in/out"),
     ("section", "stem_events", "F4", "events stem in/out"),
+    ("section", "stemsolo_drums", "Ctrl+Shift+F1", "drums stem solo off/on: the other stems "
+                                                   "out while any is soloed"),
+    ("section", "stemsolo_layers", "Ctrl+Shift+F2", "layers stem solo off/on"),
+    ("section", "stemsolo_chops", "Ctrl+Shift+F3", "chops stem solo off/on"),
+    ("section", "stemsolo_events", "Ctrl+Shift+F4", "events stem solo off/on"),
     ("section", "randomize_drums", "F5", "randomize: the drums rendered again, the rest kept"),
     ("section", "randomize_layers", "F6", "randomize: the layers rendered again, the rest kept"),
     ("section", "randomize_chops", "F7", "randomize: the chops rendered again, the rest kept"),
@@ -2380,6 +2385,7 @@ class Main(QMainWindow):
             self.actions[f"shader_{n}"] = lambda n=n: self.select_shader_key(n)
         for stem in STEMS:
             self.actions[f"stem_{stem}"] = self.perf_stems[stem].toggle
+            self.actions[f"stemsolo_{stem}"] = self.perf_stem_solos[stem].toggle
             self.actions[f"randomize_{stem}"] = lambda stem=stem: self.perform_shuffle(stem)
         for v in VOICES:
             self.actions[f"voice_{v}"] = self.perf_voices[v].toggle
@@ -4284,6 +4290,9 @@ class Main(QMainWindow):
         if ident.startswith("solo_"):
             b = self.perf_solos.get(ident[5:])
             return None if b is None else b.isChecked()
+        if ident.startswith("stemsolo_"):
+            b = self.perf_stem_solos.get(ident[9:])
+            return None if b is None else b.isChecked()
         if ident.startswith("focus_"):
             return self.afx_focus.currentText() == ident[6:]
         if ident.startswith("mc_focus_") and ident[9:].isdigit():
@@ -5017,7 +5026,7 @@ class Main(QMainWindow):
         event_btn.setToolTip("Fire a one-shot cut from the material on the next beat")
         event_btn.clicked.connect(self.perform_event)
         form.addRow("Section", self._row([("", next_btn), ("", stop_btn), ("", event_btn)]))
-        self.perf_stems = {}
+        self.perf_stems, self.perf_stem_solos = {}, {}
         keys = {"drums": "F1", "layers": "F2", "chops": "F3", "events": "F4"}
         shuffle_keys = {"drums": "F5", "layers": "F6", "chops": "F7", "events": "F8"}
         pairs = []
@@ -5036,9 +5045,25 @@ class Main(QMainWindow):
                           "rack; lit while out.")
             cb.toggled.connect(lambda muted, st=stem: self._perf_stem(st, not muted))
             self.perf_stems[stem] = cb
+            so = QPushButton("S")
+            so.setObjectName("solo")
+            so.setCheckable(True)
+            so.setFixedWidth(24)
+            so.setToolTip(f"solo the {stem} stem (Ctrl+Shift+{keys[stem]}): every stem not "
+                          "soloed is out while any is, on the quantize grid, for the "
+                          "section and a song alike; lit while soloed")
+            so.toggled.connect(lambda on, st=stem: self._perf_stem_solo(st, on))
+            self.perf_stem_solos[stem] = so
             lab = QLabel(stem.upper())
             lab.setStyleSheet("font-weight: bold;")
-            pairs.append(("", self._pair(cb, lab)))
+            box = QHBoxLayout()                        # [M] [S] [DRUMS]
+            box.setContentsMargins(0, 0, 0, 0)
+            box.setSpacing(4)
+            for x in (cb, so, lab):
+                box.addWidget(x)
+            cell = QWidget()
+            cell.setLayout(box)
+            pairs.append(("", cell))
             sh = QPushButton(f"randomize ({shuffle_keys[stem]})")
             sh.setObjectName("small")
             sh.setToolTip(
@@ -6288,6 +6313,7 @@ class Main(QMainWindow):
             sw = {f"voice_{v}": not cb.isChecked() for v, cb in self.perf_voices.items()}
             sw.update({f"solo_{v}": b.isChecked() for v, b in self.perf_solos.items()})
             sw.update({f"stem_{st}": not cb.isChecked() for st, cb in self.perf_stems.items()})
+            sw.update({f"stemsolo_{st}": b.isChecked() for st, b in self.perf_stem_solos.items()})
             sw["quant"] = self.perf_quant.currentText()
             return sw
         if g == "lfo":
@@ -6329,6 +6355,8 @@ class Main(QMainWindow):
             self.perf_solos[ident[5:]].setChecked(bool(val))
         elif ident.startswith("stem_") and ident[5:] in self.perf_stems:
             self.perf_stems[ident[5:]].setChecked(not bool(val))   # val: in; the M: out
+        elif ident.startswith("stemsolo_") and ident[9:] in self.perf_stem_solos:
+            self.perf_stem_solos[ident[9:]].setChecked(bool(val))
         elif ident == "quant":
             if self.perf_quant.findText(str(val)) >= 0:
                 self.perf_quant.setCurrentText(str(val))
@@ -9436,6 +9464,12 @@ class Main(QMainWindow):
         if self.through is not None:
             self.through.switch("stem", stem, on)
 
+    def _perf_stem_solo(self, stem, on):
+        """A stem soloed (Ctrl+Shift+F1-F4): the others out while any is,
+        on the grid, for the section and a song alike."""
+        if self.through is not None:
+            self.through.switch("stem_solo", stem, on)
+
     def _perf_voice(self, v, on):
         """A drum voice in or out, on the grid; its MIDI notes with it."""
         if self.through is not None:
@@ -10266,7 +10300,8 @@ class Main(QMainWindow):
         self.through.ab = self.perf_ab.value() / 100.0
         self.through.hold_tape = self._webcam_b()
         for stem, cb in self.perf_stems.items():
-            self.through.on[stem] = not cb.isChecked()   # the M: lit while out
+            self.through.stem_in[stem] = not cb.isChecked()   # the M: lit while out
+        self.through.stem_solo = {st for st, b in self.perf_stem_solos.items() if b.isChecked()}
         self._push_voices(self.through)
         self._push_afx()
         self.through.inserts = self.inserts
