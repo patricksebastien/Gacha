@@ -3053,12 +3053,33 @@ class Main(QMainWindow):
             "hits in key. The drum pads are never shifted. Off by default, "
             "remembered.")
         form.addRow("notes", self._row([("channel", self.midi_out_channel),
-                                        ("", self.midi_out_cycles),
                                         ("lead", self.midi_out_lead),
                                         ("gate", self.midi_out_gate),
                                         ("", self.midi_out_only),
-                                        ("", self.midi_out_follow),
-                                        ("", self.midi_out_voicing)]))
+                                        ("", self.midi_out_follow)]))
+        # the box's own row: the tick, the voicing, the octaves per track and
+        # the map to its root
+        self.midi_out_oct = {}
+        mc_row = [("", self.midi_out_cycles), ("", self.midi_out_voicing)]
+        for i, role in enumerate(DRUM_ROLES):
+            sp = QSpinBox(minimum=-5, maximum=5, value=0, prefix=f"T{i + 1} ")
+            sp.setToolTip(
+                f"Octaves for the {DRUM_LABELS[role]}'s notes (the box's T{i + 1}) with "
+                "the voicing on, up to five either way from the map's note, live: the "
+                "drum's hits and, on the ride's and the hat stutter's tracks, the root "
+                "notes too. On the Model:Cycles that is the track's pitch: a tone or a "
+                "chord machine down there is the bass, up there the pad; how far a "
+                "track really plays is the box's own range. Nothing with the voicing "
+                "off. Remembered.")
+            self.midi_out_oct[role] = sp
+            mc_row.append(("oct" if i == 0 else "", sp))
+        mc = QPushButton("M:C")
+        mc.setToolTip(f"Every drum of the map at the Model:Cycles root note {CYCLES_ROOT}: "
+                      "each track plays at its own tuning. Move one up or down to pitch "
+                      "that track.")
+        mc.clicked.connect(self._midi_out_cycles_root)
+        mc_row.append(("", mc))
+        form.addRow("Model:Cycles", self._row(mc_row))
         self.midi_out_notes = {}
         pairs = []
         for role in DRUM_ROLES:
@@ -3073,27 +3094,7 @@ class Main(QMainWindow):
                       "open hat 46, ride 51, hat stutter 44 (pedal hat)")
         gm.clicked.connect(self._midi_out_gm)
         pairs.append(("", gm))
-        mc = QPushButton("M:C")
-        mc.setToolTip(f"Every drum at the Model:Cycles root note {CYCLES_ROOT}: each track "
-                      "plays at its own tuning. Move one up or down to pitch that track.")
-        mc.clicked.connect(self._midi_out_cycles_root)
-        pairs.append(("", mc))
         form.addRow("map", self._row(pairs))
-        self.midi_out_oct = {}
-        octs = []
-        for role in DRUM_ROLES:
-            sp = QSpinBox(minimum=-5, maximum=5, value=0)
-            sp.setToolTip(
-                f"Octaves for the {DRUM_LABELS[role]}'s notes with the voicing on, up to "
-                "five either way from the map's note, live: the drum's hits and, on "
-                "the ride's and the hat stutter's tracks, the root notes too. On the "
-                "Model:Cycles that is the track's pitch: a tone or a chord machine "
-                "down there is the bass, up there the pad; how far a track really "
-                "plays is the box's own range. Nothing with the voicing off. "
-                "Remembered.")
-            self.midi_out_oct[role] = sp
-            octs.append((DRUM_LABELS[role], sp))
-        form.addRow("oct", self._row(octs))
         self.midi_out_clock = QCheckBox("MIDI clock")
         self.midi_out_clock.setToolTip(
             "Send MIDI clock (24 ticks a beat) on the port at all times: at the "
