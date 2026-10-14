@@ -329,6 +329,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     swing = (k.swing if k.swing is not None else rng.uniform(*feel.swing)) * step_len * SR
 
     # ---- drums ----
+    if feel.kick_drive > 0 and kits["kick"][0]:       # the kick driven (gabber)
+        kits["kick"] = (E.drive_layers(kits["kick"][0], feel.kick_drive), kits["kick"][1])
     pats = {r: E.make_pattern(rd, r, drum_style) for r in ("kick", "snare", "hihat", "ride")}
     tiles = E.polymeter_tiles(rd, drum_style)         # the voices on a short cycle of their own
     if rung is not None:                              # the rung's extra hits
@@ -363,6 +365,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         active = ["kick", "snare", "hihat"]
     if (kind in ("groove", "outro") or rung is not None) and rd.random() < feel.ride:
         active.append("ride")
+    if kind not in ("intro", "build") and rd.random() >= feel.drums and "drums" not in force:
+        active = []                                   # a style with hardly a beat (ambient)
     if "hihat" in active and kind != "sparse" and intro_kind != "sparse":
         active.append("ohat")
         build_from.setdefault("ohat", build_from.get("hihat", 0))
@@ -390,8 +394,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 if vel <= 0 or (role == "hihat" and ohat_pat[s] > 0):
                     continue
                 pos = bar_start + int(s * step_len * SR)
-                if s % 2 == 1:
-                    pos += int(swing)
+                if E.swung(s, feel):
+                    pos += int(swing * E.swing_steps(feel))
                 pos += E.humanize_time(rd, humanize)
                 vel = E.humanize_vel(rd, vel, s, humanize)
                 reps = E.ratchet_hits(pos, vel, rolls[role].get(s, 1), step_len * SR)
@@ -552,26 +556,30 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
             slices = [clip[i * sl:(i + 1) * sl] for i in range(n_slices)]
             board, tail = E.random_texture_board(rc, beat, k.fx_min, k.fx_max, k.saturation, cf)
             tail = min(tail, 4 * beat)
-            chop_pat, piece_steps = E.chop_pattern(rc, cf, bars, n_slices)   # the style's steps
-            max_slice = int(step_len * SR * piece_steps)
-            pieces = {}                                   # slice index -> processed piece
-            for st, idx in chop_pat:
-                if idx not in pieces:
+            chop_pat, piece_steps, spb = E.chop_pattern(rc, cf, bars, n_slices)   # the style's steps
+            cstep = bar * SR / spb                        # the chops' own step (triplets: 12 a bar)
+            max_slice = int(cstep * piece_steps)
+            pieces = {}                                   # (slice index, pitch) -> processed piece
+            for st, idx, semis in chop_pat:
+                if (idx, semis) not in pieces:
                     piece = slices[idx][:max_slice]
                     p_off, p_rate = idx * sl, 1.0
                     if rc.random() < cf.chop_rev:
                         piece = piece[::-1]
                         p_off, p_rate = idx * sl + len(piece), -1.0
                     p_dur = len(piece)
+                    if semis:                             # the line's pitch, the sampler's way
+                        piece = E.pitch_clip(piece, semis)
+                        p_rate *= 2 ** (semis / 12)
                     piece = piece * E.envelope(len(piece), decay_curve=2.0)
                     piece = E.apply_fx(piece, board, tail=tail)
                     if pan_events > 0:
                         piece = E.panned(piece, rc.uniform(-pan_events, pan_events))
-                    pieces[idx] = (piece, p_off, p_dur, p_rate)
-                piece, p_off, p_dur, p_rate = pieces[idx]
-                cpos = int(st * step_len * SR)
-                if cf.chop_swing and st % 2 == 1:       # swung with the drums
-                    cpos += int(swing)
+                    pieces[(idx, semis)] = (piece, p_off, p_dur, p_rate)
+                piece, p_off, p_dur, p_rate = pieces[(idx, semis)]
+                cpos = int(st * cstep)
+                if cf.chop_swing and spb == 16 and E.swung(st, cf):   # swung with the drums
+                    cpos += int(swing * E.swing_steps(cf))
                 _place_wrap(stems["chops"], piece, cpos, k.chop_gain * cf.chop_gain)
                 ev(cpos, src, p_off, p_dur, p_rate, "chop")
             notes.append(f"chops <- {src}")
@@ -596,31 +604,36 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     pc, mode = E.chroma_key(chroma) if chroma is not None else (root_rng.randrange(12), "major")
     root = E.NOTE_NAMES[pc]
     sub_notes = {}                                   # bar -> the note's name (the MIDI out)
-    if k.sub_level > 0 and kick_hits:
+    if k.sub_level > 0 and (kick_hits or feel.sub_line):
         bar_pc = E.bar_pcs(chroma, bars, int(bar * SR), pc, mode) if k.sub_follow else None
-        first_kick = {}                              # bar -> (pos, step)
-        for pos, bar_i, s in kick_hits:
-            if bar_i not in first_kick or s < first_kick[bar_i][1]:
-                first_kick[bar_i] = (pos, s)
-        starts = []
-        for bar_i in sorted(first_kick):
-            if root_rng.random() < k.sub_chance * feel.sub:   # weighted occurrence
-                if bar_pc is not None:               # the bar's own pitch
-                    midi = E.sub_midi(bar_pc[bar_i])
-                else:
-                    midi = E.sub_midi(pc)
-                    if root_rng.random() < 0.2:      # some bars sit on the fifth
-                        midi = midi + 7 if midi + 7 <= E.SUB_HI else midi - 5
-                starts.append((first_kick[bar_i][0], midi))
-                sub_notes[bar_i] = E.NOTE_NAMES[(midi - E.SUB_LO) % 12]
-        hits = []
-        note_len = int((beat + k.sub_release) * SR)  # one-beat hold + release
-        for i, (pos, midi) in enumerate(starts):
-            # the next note (the first one again, a loop later) cuts this one
-            nxt = starts[i + 1][0] if i + 1 < len(starts) else starts[0][0] + n
-            length = min(note_len, nxt - pos - int(0.01 * SR))
-            if length > int(0.05 * SR):
-                hits.append((pos, midi, length))
+        note_len = int((feel.sub_hold * beat + k.sub_release) * SR)   # the hold + release
+        if feel.sub_line:                            # a 16th line on each bar's root (acid)
+            bar_midi = [E.sub_midi(bar_pc[b] if bar_pc is not None else pc) for b in range(bars)]
+            hits, sub_notes = E.sub_line_hits(root_rng, bars, int(bar * SR), int(step_len * SR),
+                                              bar_midi, feel, k.sub_chance * feel.sub)
+        else:
+            first_kick = {}                          # bar -> (pos, step)
+            for pos, bar_i, s in kick_hits:
+                if bar_i not in first_kick or s < first_kick[bar_i][1]:
+                    first_kick[bar_i] = (pos, s)
+            starts = []
+            for bar_i in sorted(first_kick):
+                if root_rng.random() < k.sub_chance * feel.sub:   # weighted occurrence
+                    if bar_pc is not None:           # the bar's own pitch
+                        midi = E.sub_midi(bar_pc[bar_i])
+                    else:
+                        midi = E.sub_midi(pc)
+                        if root_rng.random() < 0.2:  # some bars sit on the fifth
+                            midi = midi + 7 if midi + 7 <= E.SUB_HI else midi - 5
+                    starts.append((first_kick[bar_i][0], midi))
+                    sub_notes[bar_i] = E.NOTE_NAMES[(midi - E.SUB_LO) % 12]
+            hits = []
+            for i, (pos, midi) in enumerate(starts):
+                # the next note (the first one again, a loop later) cuts this one
+                nxt = starts[i + 1][0] if i + 1 < len(starts) else starts[0][0] + n
+                length = min(note_len, nxt - pos - int(0.01 * SR))
+                if length > int(0.05 * SR):
+                    hits.append((pos, midi, length))
         if hits:
             # rendered a note longer than the loop, the tail folds onto the start
             sub = E.render_sub(hits, n + note_len, k.sub_phaser, k.sub_pan, k.sub_release)
@@ -634,7 +647,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 sub *= k.sub_level * ref / E.rms(sub[active])
                 stems["sub"] += sub
                 played = " ".join(sub_notes[b] for b in sorted(sub_notes))
-                notes.append(f"sub {root} {mode}: {len(hits)} notes over {len(first_kick)} "
+                notes.append(f"sub {root} {mode}: {len(hits)} notes over {len(sub_notes)} "
                              f"bars ({played})")
 
     # ---- filtered intro: a lowpass opens bar by bar (the club door) ----

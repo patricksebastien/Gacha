@@ -612,13 +612,24 @@ def render_sub(hits, n_total, phaser_amt, pan, release):
     phaser and panned left by `pan`. Returns a stereo buffer, not yet
     level-matched."""
     osc = np.zeros(n_total, dtype="float32")
-    for pos, midi, n in hits:
+    for hit in hits:
+        pos, midi, n = hit[:3]                  # (pos, midi, length[, gain[, from_midi]])
+        gain = hit[3] if len(hit) > 3 else 1.0
+        frm = hit[4] if len(hit) > 4 else None
         n = min(n, n_total - pos)
         if n <= 0:
             continue
         f = 440.0 * 2 ** ((midi - 69) / 12)
-        t = np.arange(n) / SR
-        osc[pos:pos + n] += np.sin(2 * np.pi * f * t) * adsr(n, release=release)
+        if frm is None:
+            t = np.arange(n) / SR
+            wave = np.sin(2 * np.pi * f * t)
+        else:                                   # a slide: the pitch glides in over 60 ms
+            f0 = 440.0 * 2 ** ((frm - 69) / 12)
+            glide = min(n, int(0.06 * SR))
+            fa = np.full(n, f)
+            fa[:glide] = np.linspace(f0, f, glide)
+            wave = np.sin(np.cumsum(2 * np.pi * fa / SR))
+        osc[pos:pos + n] += wave * adsr(n, release=release) * gain
     phased = osc
     if phaser_amt > 0:
         phased = Pedalboard([Phaser(rate_hz=0.2, depth=phaser_amt,
@@ -1081,6 +1092,13 @@ class Feel:
     fill: float = 0.6                 # a snare fill on a section's last bar
     ride: float = 0.35                # a ride in a groove
     sub: float = 1.0                  # x the sub's per-bar chance, capped at 1
+    sub_hold: float = 1.0             # beats the sub holds before its release
+    sub_line: tuple | None = None     # the sub as a 16th line instead of a note a bar: its
+                                      # semitones from the root (acid), with accents and slides
+    drums: float = 1.0                # the chance the drums play at all in a groove (ambient)
+    swing_8ths: bool = False          # the swing on the offbeat 8ths (twice as far) instead of the
+                                      # odd 16ths: the jazz shuffle
+    kick_drive: float = 0.0           # drive on the kick's hits (gabber)
     ratchet: float = 0.0              # a hit's chance of being a roll inside its 16th (the hats
                                       # most, the snare, the ride and the kick less, RATCHET_ROLE)
     ratchet_counts: tuple = (2, 2, 3, 4)   # the roll's hits, 32nds to 64ths
@@ -1107,6 +1125,9 @@ class Feel:
     chop_rev: float = 0.2             # a piece played backwards
     chop_swing: bool = False          # the chops' odd 16ths swung with the drums
     chop_gain: float = 1.0            # x the chop gain
+    chop_grid: str = "16th"           # the chops' grid: 16th, or triplet (12 a bar, 8th triplets)
+    chop_rebar: float = 0.0           # the chance the chop pattern is drawn again each bar
+    chop_pitch: tuple | None = None   # the pieces pitched per step, semitones (a line)
     # the events (the one-shots)
     events: tuple = (1, 3)            # how many a section gets
     event_len: tuple = (1.0, 4.0)     # seconds of material
@@ -1331,30 +1352,110 @@ def layer_range(k, feel):
     return lo, max(lo, hi)
 
 
+CHOP_GRIDS = {"16th": 16, "triplet": 12}        # steps a bar
+
+
 def chop_pattern(rng, feel, bars, n_slices=8):
-    """Where a section's chops land and which slice each plays: a list of
-    (step, slice) over the section's bars * 16 steps, and a piece's
-    longest length in 16ths. The style says which steps may hold one
-    (Feel.chop_steps, a bar's pattern repeated every bar), or a count
-    instead (Feel.chop_period: the same slice every 3, 5, 6 or 7 16ths
-    from a random start, running across the bars, Tenney's pulse), how
-    many of the 8 slices the pattern draws from, and how long a piece is."""
+    """Where a section's chops land, which slice each plays and at what
+    pitch: a list of (step, slice, semitones) over the section's bars *
+    spb steps, a piece's longest length in steps, and spb, the steps a
+    bar (16, or 12 on the triplet grid, Feel.chop_grid). The style says
+    which steps may hold one (Feel.chop_steps, a bar's pattern repeated
+    every bar, or drawn again by Feel.chop_rebar), or a count instead
+    (Feel.chop_period: the same slice every 3, 5, 6 or 7 steps from a
+    random start, running across the bars, Tenney's pulse), how many of
+    the 8 slices the pattern draws from, how long a piece is, and the
+    pitches (Feel.chop_pitch, 0 without)."""
+    spb = CHOP_GRIDS.get(feel.chop_grid, 16)
     picks = rng.sample(range(n_slices), max(1, min(n_slices, int(feel.chop_pick))))
+    pitch = lambda: rng.choice(feel.chop_pitch) if feel.chop_pitch else 0   # noqa: E731
     out = []
     if feel.chop_period:
         period = rng.choice(feel.chop_period)
-        for st in range(rng.randrange(period), bars * 16, period):
+        for st in range(rng.randrange(period), bars * spb, period):
             if rng.random() < feel.chop_density:
-                out.append((st, rng.choice(picks)))
+                out.append((st, rng.choice(picks), pitch()))
     else:
-        steps = [s for s in (feel.chop_steps if feel.chop_steps is not None else range(16))
-                 if 0 <= s < 16]
-        pat = [(s, rng.choice(picks)) for s in steps if rng.random() < feel.chop_density]
-        if not pat and steps:                         # a sparse feel's empty draw: one chop at least
-            pat = [(rng.choice(steps), rng.choice(picks))]
+        steps = [s for s in (feel.chop_steps if feel.chop_steps is not None else range(spb))
+                 if 0 <= s < spb]
+
+        def draw():
+            pat = [(s, rng.choice(picks), pitch()) for s in steps
+                   if rng.random() < feel.chop_density]
+            if not pat and steps:                     # a sparse feel's empty draw: one chop at least
+                pat = [(rng.choice(steps), rng.choice(picks), pitch())]
+            return pat
+
+        pat = draw()
         for bi in range(bars):
-            out.extend((bi * 16 + s, idx) for s, idx in pat)
-    return out, rng.choice(feel.chop_len)
+            if bi and rng.random() < feel.chop_rebar:  # the break re-cut every bar (jungle)
+                pat = draw()
+            out.extend((bi * spb + s, idx, semis) for s, idx, semis in pat)
+    return out, rng.choice(feel.chop_len), spb
+
+
+def swung(step, feel):
+    """Whether a 16th step takes the swing: the odd 16ths, or with
+    Feel.swing_8ths the offbeat 8ths (which then move twice as far, see
+    swing_steps)."""
+    return step % 4 == 2 if feel.swing_8ths else step % 2 == 1
+
+
+def swing_steps(feel):
+    """How far a swung step moves, in multiples of the swing: twice for
+    the offbeat 8ths (a third of a step takes them to the triplet)."""
+    return 2 if feel.swing_8ths else 1
+
+
+def drive_layers(variants, amount):
+    """A voice's variants ([soft, mid, hard] each) driven: the kick of
+    gabber and hardcore, through the texture saturator."""
+    return [[saturate(layer, amount, bias=0.1, tone_hz=6000.0) for layer in layers]
+            for layers in variants]
+
+
+def pitch_clip(clip, semis):
+    """A clip pitched by `semis` the sampler's way: resampled, so up is
+    shorter and down longer; (n, 2) float32."""
+    if not semis:
+        return clip
+    rate = 2 ** (semis / 12)
+    n = max(2, int(len(clip) / rate))
+    x = np.linspace(0, len(clip) - 1, n)
+    idx = np.arange(len(clip))
+    return np.stack([np.interp(x, idx, clip[:, c]) for c in range(clip.shape[1])],
+                    axis=1).astype("float32")
+
+
+def sub_line_hits(rng, bars, bar_n, step_n, bar_midi, feel, chance):
+    """The sub as a 16th line (Feel.sub_line, the 303's way): a Euclidean
+    pattern of 7 to 11 hits a bar, drawn again now and then, each hit on
+    the bar's root plus one of the line's semitones, a third of them
+    accented, a third sliding from the note before. `bar_midi` is the
+    root per bar (None: a rest, an intro). Hits as render_sub takes them,
+    (pos, midi, length, gain, from_midi), and {bar: the root's name}."""
+    hits, notes = [], {}
+    pat = euclid(rng.randint(7, 11), 16, rng.randrange(16))
+    prev = None
+    for b in range(bars):
+        root = bar_midi[b] if b < len(bar_midi) else None
+        if root is None or rng.random() >= chance:
+            prev = None
+            continue
+        if rng.random() < 0.25:
+            pat = euclid(rng.randint(7, 11), 16, rng.randrange(16))
+        notes[b] = NOTE_NAMES[(root - SUB_LO) % 12]
+        for s in range(16):
+            if not pat[s]:
+                continue
+            midi = min(root + 19, max(root - 12, root + rng.choice(feel.sub_line)))
+            accent = rng.random() < 0.3
+            slide = prev is not None and rng.random() < 0.3
+            length = int(step_n * (1.6 if slide else 0.8))
+            hits.append((b * bar_n + s * step_n, midi, length, 1.0 if accent else 0.6,
+                         prev if slide else None))
+            prev = midi
+    return hits, notes
 
 
 RATCHET_ROLE = {"hihat": 1.0, "snare": 0.6, "ride": 0.3, "kick": 0.2}   # x Feel.ratchet per voice
@@ -1451,9 +1552,18 @@ def make_pattern(rng, role, style, steps=16):
     The style decides the rhythmic skeleton for kick/snare/hihat."""
     pat = [0.0] * steps
     if role == "ride":
-        offset = rng.choice([0, 0, 2])              # on-beat or offbeat ride
-        for s in range(offset, steps, 4):
-            pat[s] = 1.0 if s % 8 == 0 else rng.uniform(0.6, 0.9)
+        if style == "jazz":                         # ding, ding-a-ding: the and before 2 and 4
+            for s in (0, 4, 8, 12):                 # swung onto the triplet by swing_8ths
+                pat[s] = 1.0 if s % 8 == 0 else rng.uniform(0.8, 0.95)
+            for s in (2, 10):
+                pat[s] = rng.uniform(0.55, 0.75)
+        elif style == "motorik":                    # every 8th, the same forever
+            for s in range(0, steps, 2):
+                pat[s] = 0.9 if s % 4 == 0 else 0.7
+        else:
+            offset = rng.choice([0, 0, 2])          # on-beat or offbeat ride
+            for s in range(offset, steps, 4):
+                pat[s] = 1.0 if s % 8 == 0 else rng.uniform(0.6, 0.9)
         return pat
 
     if style == "four-floor":
@@ -1885,6 +1995,12 @@ def compose(seed, duration, sample_files, intro_bars=None,
         print(f"  synth kit: {flavour}  levels " + " ".join(
             f"{r}={v:g}" for r, v in sgains.items() if v > 0))
 
+    if feel.kick_drive > 0 and kit.get("kick"):       # the kick driven (gabber)
+        kit["kick"] = drive_layers(kit["kick"], feel.kick_drive)
+        if synth:
+            synth["kick"] = [saturate(l, feel.kick_drive, bias=0.1, tone_hz=6000.0)
+                             for l in synth["kick"]]
+
     # ---- song structure ------------------------------------------------
     # split bars into sections; each section gets its own patterns/layers
     sections = []
@@ -1938,6 +2054,8 @@ def compose(seed, duration, sample_files, intro_bars=None,
             # ride shows up in some sections only
             if not is_intro and rng.random() < feel.ride:
                 active.append("ride")
+            if not is_intro and rng.random() >= feel.drums:   # a style with hardly a beat (ambient)
+                active = []
             # the open hat comes with the closed one, except in sparse intros
             if "hihat" in active and intro_kind != "sparse":
                 active.append("ohat")
@@ -1971,8 +2089,8 @@ def compose(seed, duration, sample_files, intro_bars=None,
                         if role == "hihat" and ohat_pat[s] > 0:
                             continue                  # the open hat owns this step
                         pos = bar_start + int(s * step_len * SR)
-                        if s % 2 == 1:
-                            pos += int(swing)
+                        if swung(s, feel):
+                            pos += int(swing * swing_steps(feel))
                         pos += humanize_time(rng, humanize)
                         vel = humanize_vel(rng, vel, s, humanize)
                         reps = ratchet_hits(pos, vel, rolls[role].get(s, 1), step_len * SR)
@@ -2145,22 +2263,26 @@ def compose(seed, duration, sample_files, intro_bars=None,
             board, tail = random_texture_board(rng, beat, k.fx_min, k.fx_max,
                                                k.saturation, feel)
             tail = min(tail, 4 * beat)   # let echoes ring up to one bar
-            chop_pat, piece_steps = chop_pattern(rng, feel, length, n_slices)
-            max_slice = int(step_len * SR * piece_steps)
-            for st, idx in chop_pat:
+            chop_pat, piece_steps, spb = chop_pattern(rng, feel, length, n_slices)
+            cstep = bar * SR / spb                    # the chops' own step (triplets: 12 a bar)
+            max_slice = int(cstep * piece_steps)
+            for st, idx, semis in chop_pat:
                 piece = slices[idx][:max_slice]
                 p_off, p_rate = idx * sl, 1.0
                 if rng.random() < feel.chop_rev:
                     piece = piece[::-1]
                     p_off, p_rate = idx * sl + len(piece), -1.0
                 p_dur = len(piece)
+                if semis:                             # the line's pitch, the sampler's way
+                    piece = pitch_clip(piece, semis)
+                    p_rate *= 2 ** (semis / 12)
                 piece = piece * envelope(len(piece), decay_curve=2.0)
                 piece = apply_fx(piece, board, tail=tail)
                 if pan_events > 0:
                     piece = panned(piece, rng.uniform(-pan_events, pan_events))
-                cpos = sec_start + int(st * step_len * SR)
-                if feel.chop_swing and st % 2 == 1:
-                    cpos += int(swing)
+                cpos = sec_start + int(st * cstep)
+                if feel.chop_swing and spb == 16 and swung(st, feel):
+                    cpos += int(swing * swing_steps(feel))
                 put("chops", piece, cpos, k.chop_gain * feel.chop_gain)
                 ev(cpos, src, p_off, p_dur, p_rate, "chop")
             print(f"  sec{si} chops <- {src}")
@@ -2225,34 +2347,45 @@ def compose(seed, duration, sample_files, intro_bars=None,
 
     # ---- sub bass: one note per bar on its first kick ---------------------
     sub_notes = {}                               # global bar -> the note's name (the MIDI out)
-    if k.sub_level > 0 and kick_hits:
+    if k.sub_level > 0 and (kick_hits or feel.sub_line):
         sub_rng = root_rng
-        # one candidate per bar: its first kick (the start of the sequence)
-        first_kick = {}
-        for pos, si, bar_i, s in kick_hits:
-            if sections_meta[si]["kind"] == "intro":
-                continue                         # the sub enters at the drop
-            if bar_i not in first_kick or s < first_kick[bar_i][2]:
-                first_kick[bar_i] = (pos, si, s)
-        starts = []
-        for bar_i in sorted(first_kick):
-            if sub_rng.random() < k.sub_chance * feel.sub:   # weighted occurrence
-                pos, si, _ = first_kick[bar_i]
-                if k.sub_follow:                 # the bar's own pitch
-                    midi = sub_midi(bar_pc.get(bar_i, roots[si][0]))
-                else:
-                    midi = sub_midi(roots[si][0])
-                    if sub_rng.random() < 0.2:   # some bars sit on the fifth
-                        midi = midi + 7 if midi + 7 <= SUB_HI else midi - 5
-                starts.append((pos, midi))
-                sub_notes[bar_i] = NOTE_NAMES[(midi - SUB_LO) % 12]
-        hits = []
-        note_len = int((beat + k.sub_release) * SR)   # one-beat hold + release
-        for i, (pos, midi) in enumerate(starts):
-            nxt = starts[i + 1][0] if i + 1 < len(starts) else len(buf)
-            length = min(note_len, nxt - pos - int(0.01 * SR))
-            if length > int(0.05 * SR):
-                hits.append((pos, midi, length))
+        note_len = int((feel.sub_hold * beat + k.sub_release) * SR)   # the hold + release
+        if feel.sub_line:                        # a 16th line on each bar's root (acid)
+            bar_midi = [None] * n_bars           # None: the intro, the sub enters at the drop
+            for m in sections_meta:
+                if m["kind"] == "intro":
+                    continue
+                for b in range(m["start_bar"], m["start_bar"] + m["bars"]):
+                    bar_midi[b] = sub_midi(bar_pc.get(b, roots[m["i"]][0])) if k.sub_follow \
+                        else sub_midi(roots[m["i"]][0])
+            hits, sub_notes = sub_line_hits(sub_rng, n_bars, int(bar * SR), int(step_len * SR),
+                                            bar_midi, feel, k.sub_chance * feel.sub)
+        else:
+            # one candidate per bar: its first kick (the start of the sequence)
+            first_kick = {}
+            for pos, si, bar_i, s in kick_hits:
+                if sections_meta[si]["kind"] == "intro":
+                    continue                     # the sub enters at the drop
+                if bar_i not in first_kick or s < first_kick[bar_i][2]:
+                    first_kick[bar_i] = (pos, si, s)
+            starts = []
+            for bar_i in sorted(first_kick):
+                if sub_rng.random() < k.sub_chance * feel.sub:   # weighted occurrence
+                    pos, si, _ = first_kick[bar_i]
+                    if k.sub_follow:             # the bar's own pitch
+                        midi = sub_midi(bar_pc.get(bar_i, roots[si][0]))
+                    else:
+                        midi = sub_midi(roots[si][0])
+                        if sub_rng.random() < 0.2:   # some bars sit on the fifth
+                            midi = midi + 7 if midi + 7 <= SUB_HI else midi - 5
+                    starts.append((pos, midi))
+                    sub_notes[bar_i] = NOTE_NAMES[(midi - SUB_LO) % 12]
+            hits = []
+            for i, (pos, midi) in enumerate(starts):
+                nxt = starts[i + 1][0] if i + 1 < len(starts) else len(buf)
+                length = min(note_len, nxt - pos - int(0.01 * SR))
+                if length > int(0.05 * SR):
+                    hits.append((pos, midi, length))
         sub = render_sub(hits, len(buf), k.sub_phaser, k.sub_pan,
                          k.sub_release)
         active = np.abs(sub).sum(axis=1) > 1e-6
