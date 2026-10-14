@@ -5106,8 +5106,9 @@ program.</li>
                  "where the sections stop by themselves; random picks one. The Generate "
                  "tab's box without its none, with its tail, bars, wet and amount."),
                 (self.perf_drum_style, self.drum_style,
-                 "The drum style the next section is patterned in: the Sections tab's box; "
-                 "random picks one per section (the one playing shows in the meter).")):
+                 "The style of the next section, its drums and the feel of its layers, "
+                 "chops and events alike: the Sections tab's box; random picks one per "
+                 "section (the one playing shows in the meter), and a randomize keeps it.")):
             # the same names but none (a live intro or outro always has a
             # shape), so the pair is kept by name: the Generate tab on none
             # leaves this box where it was, and the live render reads this one
@@ -7944,7 +7945,10 @@ program.</li>
                                   "ukg", "dembow", "one-drop", "footwork",
                                   "clave", "idm", "hypnotic"])
         self.drum_style.setToolTip(
-            "The kit's pattern family, for the songs and the live sections alike: "
+            "The style of the whole song or section, not the kit alone: its pattern "
+            "family, and with it how the textures loop, where the chops land, how "
+            "long the one-shots are, the swing, the fills, the sub (the README's "
+            "feel table). "
             "four-floor (a kick on every beat, house), breakbeat (syncopated, the "
             "snare off the grid, lots of ghosts), boom-bap (hip hop's lazy "
             "backbeat), halftime (the snare on beat 3 only, trap hats), dnb "
@@ -9298,8 +9302,11 @@ program.</li>
             if not mat.ok:
                 self._perf_result = ("error", "no material with sound")
                 return
+            cur = self._perf_current                  # the playing section's feel, else the box's
+            style = getattr(cur[0], "drum_style", None) if cur else None
+            style = style or (kw or {}).get("drum_style")
             shot = render_oneshot(mat, random.randrange(1 << 30), 60.0 / key[2],
-                                  (kw or {}).get("pan_events", 0.5))
+                                  (kw or {}).get("pan_events", 0.5), E.style_feel(style))
             sr = self.through.sr if self.through is not None else 48000
             clip = shot["clip"] * shot["gain"]
             if sr != E.SR:

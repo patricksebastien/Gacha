@@ -22,7 +22,10 @@ the frames each sound was cut from.
     shot = render_oneshot(mat, seed)              # a single hit/chop for a footswitch
 
 Everything musical is borrowed from the engine: patterns, humanising, the
-drum carving, the random effect chains, the texture windows, and the songs'
+drum carving, the random effect chains, the texture windows, the drum
+style's feel for the parts the patterns do not reach (gacha_engine.Feel:
+how the textures loop, where the chops land, how long the one-shots are,
+the swing, the fills, the sub), and the songs'
 intros and outros as two more kinds: "intro" shaped by the Generate tab's
 intro style (ambient, sparse, build, drums-first, filtered, reverse-swell,
 collage; none is a groove) and "outro", a groove whose ending effect
@@ -203,7 +206,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     the chops (its level is set against the mix of the three).
     `force`: parts rendered even where the kind would leave them out
     (chops outside a groove, layers or drums in an intro without them),
-    so a shuffle of a part always gives one to hear. `kit_salts` ({voice:
+    so a shuffle of a part always gives one to hear. The drum style is
+    the section's shape too (`random` is drawn from the seed, not the
+    drums' stream): its Feel reaches every part, so a shuffle keeps it. `kit_salts` ({voice:
     int}, KIT_PARTS) take a drum's sound from another carving of the
     material (Material.kit_for), the pattern and every draw the same: a
     voice's sound shuffled, the groove kept."""
@@ -217,7 +222,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     rngs = {s: random.Random(f"{seed}:{s}:{salts[s]}") for s in STEMS}
     rd, rl, rc, rx = (rngs[s] for s in STEMS)        # the drums', the layers', the chops', the events'
     if drum_style == "random" or drum_style not in E.DRUM_STYLES:
-        drum_style = rd.choice(E.DRUM_STYLES)
+        drum_style = rng.choice(E.DRUM_STYLES)        # the shape: every part follows it
+    feel = E.style_feel(drum_style)
+    humanize = min(1.0, k.humanize * feel.humanize)
     intro_kind = intro_style if kind == "intro" and intro_style in INTRO_STYLES else None
     if intro_kind == "random":
         intro_kind = rng.choice(E.INTRO_STYLES)
@@ -247,7 +254,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
 
     gains = {"kick": k.gain_kick, "snare": k.gain_snare, "hihat": k.gain_hihat,
              "ohat": k.gain_ohat, "ride": k.gain_ride}
-    swing = (k.swing if k.swing is not None else rd.uniform(0.0, 0.06)) * step_len * SR
+    # the swing is the section's time, not the drums' alone (the chops take it
+    # in some styles): the shape's draw, so a shuffle of either keeps it
+    swing = (k.swing if k.swing is not None else rng.uniform(*feel.swing)) * step_len * SR
 
     # ---- drums ----
     pats = {r: E.make_pattern(rd, r, drum_style) for r in ("kick", "snare", "hihat", "ride")}
@@ -268,7 +277,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         build_from = {"hihat": 0, "kick": max(1, bars // 3), "snare": max(2, (2 * bars) // 3)}
     if not active and "drums" in force:               # shuffled into an intro without them
         active = ["kick", "snare", "hihat"]
-    if kind in ("groove", "outro") and rd.random() < 0.35:
+    if kind in ("groove", "outro") and rd.random() < feel.ride:
         active.append("ride")
     if "hihat" in active and kind != "sparse" and intro_kind != "sparse":
         active.append("ohat")
@@ -278,8 +287,9 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     for bi in range(bars):
         bar_start = int(bi * bar * SR)
         bar_pats = {r: (E.mutate(rd, pats[r], k.mutation_amount)
-                        if rd.random() < k.mutation_chance else pats[r]) for r in active}
-        if bi == bars - 1 and rd.random() < 0.6 and "snare" in active:
+                        if rd.random() < k.mutation_chance * feel.mutation else pats[r])
+                    for r in active}
+        if bi == bars - 1 and rd.random() < feel.fill and "snare" in active:
             p = list(bar_pats["snare"])
             for s in range(12, 16):
                 p[s] = rd.uniform(0.5, 1.0)
@@ -295,8 +305,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 pos = bar_start + int(s * step_len * SR)
                 if s % 2 == 1:
                     pos += int(swing)
-                pos += E.humanize_time(rd, k.humanize)
-                vel = E.humanize_vel(rd, vel, s, k.humanize)
+                pos += E.humanize_time(rd, humanize)
+                vel = E.humanize_vel(rd, vel, s, humanize)
                 if role == "kick":
                     kick_hits.append((max(0, pos), bi, s))
                 kv, ksr = kits[role]
@@ -310,7 +320,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 if role != "kick" and pan_drums > 0:
                     hit = E.panned(hit, rd.uniform(-pan_drums, pan_drums))
                 _place_wrap(stems[role], hit, max(0, pos), vel * gains[role])
-        if "hihat" in active and rd.random() < k.glitch_chance:
+        if "hihat" in active and rd.random() < k.glitch_chance * feel.glitch:
             s = rd.randrange(16)
             n_rep = rd.choice([6, 8, 12, 16])
             spacing = max(1, int(step_len * SR / rd.choice([2, 3, 4, 6])))
@@ -362,7 +372,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
             clip = clip[:cut].copy()
             c_dur = len(clip)
             clip = clip * E.envelope(len(clip), attack=0.02, decay_curve=1.5)
-            board, tail = E.random_texture_board(rx, beat, k.fx_min, k.fx_max, k.saturation)
+            board, tail = E.random_texture_board(rx, beat, k.fx_min, k.fx_max, k.saturation, feel)
             clip = E.apply_fx(clip, board, tail=min(tail, 2.0))
             spread = max(pan_events, 0.6)
             clip = E.panned(clip, rx.uniform(-spread, spread))
@@ -381,21 +391,26 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     elif kind in ("build", "sparse"):
         n_layers = 1
     else:
-        n_layers = rl.randint(k.layers_min, k.layers_max)
+        n_layers = rl.randint(*E.layer_range(k, feel))
     if "layers" in force:                             # shuffled into a section without them
         n_layers = max(1, n_layers)
     for _ in range(n_layers if mat.names else 0):
         src = rl.choice(mat.long_names or mat.names)
         clip = E.random_window(rl, mat.bank[src], n, k.random_start == "all").copy()
-        w_off, w_len = len(mat.bank[src]) - len(clip), len(clip)
+        w_off = len(mat.bank[src]) - len(clip)        # the window is a suffix of the take
         ops, rev, rate = [], False, 1.0
-        if rl.random() < k.reverse_chance:
+        if feel.layer_bars:                           # the style's loop length
+            cut = int(rl.choice(feel.layer_bars) * bar * SR)
+            if len(clip) > cut:
+                clip = clip[:cut].copy(); ops.append(f"{round(cut / (bar * SR))}bar")
+        w_len = len(clip)
+        if rl.random() < k.reverse_chance * feel.reverse:
             clip = clip[::-1].copy(); ops.append("rev"); rev = True
-        if rl.random() < k.stretch_chance and len(clip) > SR:
+        if rl.random() < k.stretch_chance * feel.stretch and len(clip) > SR:
             import librosa
             import warnings
             warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")   # librosa 1.0's own deprecations, inside phase_vocoder
-            n_target_bars = rl.choice([1, 2, 4])
+            n_target_bars = rl.choice(feel.stretch_bars)
             target = int(n_target_bars * bar * SR)
             chunk = clip[: min(len(clip), target * 2)]
             rate = len(chunk) / target
@@ -403,9 +418,11 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                            for c in range(2)], axis=1)
             clip = st.astype("float32"); ops.append(f"stretch{n_target_bars}bar")
         mat_n = len(clip)
-        board, tail = E.random_texture_board(rl, beat, k.fx_min, k.fx_max, k.saturation)
+        board, tail = E.random_texture_board(rl, beat, k.fx_min, k.fx_max, k.saturation, feel)
         clip = E.apply_fx(clip, board, tail=tail)
         loop = _loopify(E.crossfade_loop(clip, n + int(0.1 * SR)), n)
+        if rl.random() < feel.breathe:                # a filter opening and closing over the loop
+            loop = E.breathe(rl, loop); ops.append("breathe")
         n_fade = min(int(0.05 * SR), len(clip) // 4)
         step_n = (len(clip) - n_fade) or len(clip)
         lp = 0
@@ -413,7 +430,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
             ev(lp, src, w_off + w_len if rev else w_off, min(mat_n, n - lp),
                -rate if rev else rate, "texture")
             lp += step_n
-        lvl = rl.uniform(k.layer_level_min, k.layer_level_max) * (1.4 if kind == "break" else 1.0)
+        lvl = rl.uniform(k.layer_level_min, k.layer_level_max) * (1.4 if kind == "break" else 1.0) \
+            * feel.layer_level
         if pan_layers > 0:
             loop = E.panned(loop, rl.uniform(-pan_layers, pan_layers))
         stems["layers"] += loop * lvl
@@ -421,48 +439,50 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
 
     # ---- chops: slice a sample, replay on the grid (never in an intro) ----
     chop_roll = rc.random()                           # drawn either way: the stream stays in step
-    chops_in = (kind in ("groove", "outro") and chop_roll < k.chop_chance
-                or kind == "break" and chop_roll < 0.5)
+    chops_in = (kind in ("groove", "outro") and chop_roll < k.chop_chance * feel.chop
+                or kind == "break" and chop_roll < 0.5 * feel.chop)
     if mat.names and (chops_in or "chops" in force):
         src = rc.choice(mat.names)
         clip = mat.bank[src]
         n_slices = 8
         sl = max(1, len(clip) // n_slices)
         slices = [clip[i * sl:(i + 1) * sl] for i in range(n_slices)]
-        board, tail = E.random_texture_board(rc, beat, k.fx_min, k.fx_max, k.saturation)
+        board, tail = E.random_texture_board(rc, beat, k.fx_min, k.fx_max, k.saturation, feel)
         tail = min(tail, 4 * beat)
-        chop_pat = [rc.randrange(n_slices) if rc.random() < 0.4 else None for _ in range(16)]
-        max_slice = int(step_len * SR * rc.choice([1, 2, 2, 4]))
+        chop_pat, piece_steps = E.chop_pattern(rc, feel, bars, n_slices)   # the style's steps
+        max_slice = int(step_len * SR * piece_steps)
         pieces = {}                                   # slice index -> processed piece
-        for bi in range(bars):
-            bar_start = int(bi * bar * SR)
-            for s, idx in enumerate(chop_pat):
-                if idx is None:
-                    continue
-                if idx not in pieces:
-                    piece = slices[idx][:max_slice]
-                    p_off, p_rate = idx * sl, 1.0
-                    if rc.random() < 0.2:
-                        piece = piece[::-1]
-                        p_off, p_rate = idx * sl + len(piece), -1.0
-                    p_dur = len(piece)
-                    piece = piece * E.envelope(len(piece), decay_curve=2.0)
-                    piece = E.apply_fx(piece, board, tail=tail)
-                    if pan_events > 0:
-                        piece = E.panned(piece, rc.uniform(-pan_events, pan_events))
-                    pieces[idx] = (piece, p_off, p_dur, p_rate)
-                piece, p_off, p_dur, p_rate = pieces[idx]
-                cpos = bar_start + int(s * step_len * SR)
-                _place_wrap(stems["chops"], piece, cpos, k.chop_gain)
-                ev(cpos, src, p_off, p_dur, p_rate, "chop")
+        for st, idx in chop_pat:
+            if idx not in pieces:
+                piece = slices[idx][:max_slice]
+                p_off, p_rate = idx * sl, 1.0
+                if rc.random() < feel.chop_rev:
+                    piece = piece[::-1]
+                    p_off, p_rate = idx * sl + len(piece), -1.0
+                p_dur = len(piece)
+                piece = piece * E.envelope(len(piece), decay_curve=2.0)
+                piece = E.apply_fx(piece, board, tail=tail)
+                if pan_events > 0:
+                    piece = E.panned(piece, rc.uniform(-pan_events, pan_events))
+                pieces[idx] = (piece, p_off, p_dur, p_rate)
+            piece, p_off, p_dur, p_rate = pieces[idx]
+            cpos = int(st * step_len * SR)
+            if feel.chop_swing and st % 2 == 1:       # swung with the drums
+                cpos += int(swing)
+            _place_wrap(stems["chops"], piece, cpos, k.chop_gain * feel.chop_gain)
+            ev(cpos, src, p_off, p_dur, p_rate, "chop")
         notes.append(f"chops <- {src}")
 
     # ---- events: a few one-shots scattered on the beat ----
-    for _ in range(rx.randint(1, 3) if mat.names else 0):
-        shot = render_oneshot(mat, rx.randrange(1 << 30), beat, pan_events)
-        pos = int(round(rx.uniform(0.0, bars * 4 - 1)) * beat * SR)
+    grid = E.event_grid_beats(feel) * beat * SR      # the style's grid for them
+    n_events = rx.randint(*feel.events) if mat.names else 0
+    if "events" in force and mat.names:               # shuffled: one to hear whatever the style
+        n_events = max(1, n_events)
+    for _ in range(n_events):
+        shot = render_oneshot(mat, rx.randrange(1 << 30), beat, pan_events, feel)
+        pos = int(round(rx.uniform(0.0, n / grid - 1)) * grid)
         _place_wrap(stems["events"], shot["clip"], pos, shot["gain"])
-        ev(pos, shot["src"], shot["off"], shot["dur"], shot["rate"], "oneshot")
+        ev(pos, shot["src"], shot["off"] * SR, shot["dur"] * SR, shot["rate"], "oneshot")   # ev takes frames
         notes.append(f"event <- {shot['src']}")
 
     # ---- root of the section (from the layers), then the sub bass: one
@@ -481,7 +501,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 first_kick[bar_i] = (pos, s)
         starts = []
         for bar_i in sorted(first_kick):
-            if root_rng.random() < k.sub_chance:     # weighted occurrence
+            if root_rng.random() < k.sub_chance * feel.sub:   # weighted occurrence
                 if bar_pc is not None:               # the bar's own pitch
                     midi = E.sub_midi(bar_pc[bar_i])
                 else:
@@ -614,25 +634,28 @@ def render_swell(mat, seed, bpm, bars=1, gain=0.36):
     return (E.cymbal_swell(rng, hit, length) * gain).astype(np.float32)
 
 
-def render_oneshot(mat, seed, beat=0.5, pan_events=0.5):
-    """A single event from the bank: a 1 to 4 s window, maybe reversed,
-    through a random chain. {clip, gain, src, off, dur, rate}."""
+def render_oneshot(mat, seed, beat=0.5, pan_events=0.5, feel=None):
+    """A single event from the bank: a 1 to 4 s window (the style's
+    length with a `feel`, gacha_engine.Feel), maybe reversed, through a
+    random chain. {clip, gain, src, off, dur, rate}."""
     rng = random.Random(seed)
     k = mat.k
+    feel = feel or E.DEFAULT_FEEL
     src = rng.choice(mat.names)
     clip = mat.bank[src]
     L, rev = len(clip), False
-    if rng.random() < 0.4:
+    if rng.random() < feel.event_rev:
         clip = clip[::-1].copy(); rev = True
-    cut = int(min(len(clip), rng.uniform(1, 4) * SR))
+    cut = int(min(len(clip), rng.uniform(*feel.event_len) * SR))
     clip = E.random_window(rng, clip, cut, k.random_start != "off")
     o_off = L - len(clip)
     clip = clip[:cut]
     clip = clip * E.envelope(len(clip), attack=0.05, decay_curve=1.5)
-    board, tail = E.random_texture_board(rng, beat, k.fx_min, k.fx_max, k.saturation)
+    board, tail = E.random_texture_board(rng, beat, k.fx_min, k.fx_max, k.saturation, feel)
     clip = E.apply_fx(clip, board, tail=min(tail, 3.0))
     if pan_events > 0:
         clip = E.panned(clip, rng.uniform(-pan_events, pan_events))
-    return {"clip": clip.astype(np.float32), "gain": rng.uniform(0.35, 0.55), "src": src,
+    return {"clip": clip.astype(np.float32), "gain": rng.uniform(0.35, 0.55) * feel.event_gain,
+            "src": src,
             "off": (L - o_off) / SR if rev else o_off / SR, "dur": cut / SR,
             "rate": -1.0 if rev else 1.0}
