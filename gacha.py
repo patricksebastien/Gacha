@@ -2162,6 +2162,8 @@ class Main(QMainWindow):
         self._perf_want = False                     # play the next result as soon as it lands
         self._shuffle_queue = []                    # parts asked for a shuffle, in turn
         self._shuffle_landing = []                  # parts handed to the player, not yet on the bar
+        self._auto_fx_pending = None                # (style, seed) for the racks as a section lands
+        self._auto_fx_lfos = set()                  # the LFO slots auto fx filled, taken back next
         self._perf_playing = None                   # Section on the player
         self._perf_current = None                   # (Section, stems, sr): the last one played,
                                                     # what stop / Link start bring back
@@ -5331,8 +5333,13 @@ program.</li>
             "few knobs set for its feel: a reverb on the layers and a reverse delay on "
             "the chops for drone, dub echoes on the chops and the events for dub, a "
             "crusher on the chops for glitch, drive on the drums for gabber... drawn "
-            "with some chance, so two sections in one style differ; the log says what "
-            "was set. The live input's and the drum voices' racks are left alone. "
+            "with some chance, so two sections in one style differ, and set as the "
+            "section lands on its bar. Some styles move a knob instead: an LFO on the "
+            "ladder rising over 4 bars for house, on the chops' pitch stepping at random "
+            "for glitch, on the events' delay drifting for dub, into LFO slots that are "
+            "off (never one you turned on), taken back before the next section. The "
+            "log says what was set. The live input's and the drum voices' racks are "
+            "left alone. "
             "Ticked while a section plays, it sets them now; unticked, the knobs stay "
             "where they are (all off clears them). Remembered.")
         self.perf_auto_fx.setChecked(self.settings.value("perform/auto_fx", False, type=bool))
@@ -9588,8 +9595,8 @@ program.</li>
         self._perf_playing = sec
         self._perf_current = (sec, stems, self.through.sr)   # what a start brings back
         self.perf_next_btn.setText("next section")           # from here on N moves on
-        self._auto_fx_apply(getattr(sec, "feel", None) or getattr(sec, "drum_style", None),
-                            getattr(sec, "seed", None))
+        self._auto_fx_pending = (getattr(sec, "feel", None) or getattr(sec, "drum_style", None),
+                                 getattr(sec, "seed", None))   # applied as it lands on the bar
         wait = "" if bar_t0 is None or bar_t0 <= time.monotonic() \
             else f", on the Link bar in {bar_t0 - time.monotonic():.1f} s"
         self.log.appendPlainText(f"section: {sec.kind} {sec.bpm:.0f} bpm, "
@@ -9838,10 +9845,33 @@ program.</li>
             return
         rng = random.Random(seed) if seed is not None else random.Random()
         p = gacha_autofx.plan(style, rng)
+        lfos = gacha_autofx.plan_lfos(style, rng)
+        for i in self._auto_fx_lfos:                  # ours from the last section: back off
+            self.lfo_rows[i]["on"].setChecked(False)  # (the knob goes back to its centre)
+        self._auto_fx_lfos = set()
         for (ch, key), sp in self.afx.items():
             if ch in STEMS and key != "vol":
                 sp.setValue(p.get((ch, key), 0.0))
-        self.log.appendPlainText(f"auto fx ({style}): {gacha_autofx.describe(p)}")
+        free = [i for i, r in enumerate(self.lfo_rows) if not r["on"].isChecked()]
+        placed = []
+        for l, i in zip(lfos, free):                  # into slots that are off, never a player's
+            r = self.lfo_rows[i]
+            j = r["dest"].findData(l["dest"])
+            if j < 0:
+                continue
+            r["dest"].setCurrentIndex(j)
+            r["shape"].setCurrentText(l["shape"])
+            r["rate"].setCurrentText(l["rate"])
+            r["depth"].setValue(int(round(100 * l["depth"])))
+            r["phase"].setValue(0)
+            r["pol"].setCurrentIndex(1 if l["unipolar"] else 0)
+            r["mode"].setCurrentText(l["mode"])
+            r["on"].setChecked(True)
+            self._auto_fx_lfos.add(i)
+            placed.append(l)
+        if len(lfos) > len(placed):
+            self.log.appendPlainText(f"auto fx: {len(lfos) - len(placed)} LFO(s) left out, no slot off")
+        self.log.appendPlainText(f"auto fx ({style}): {gacha_autofx.describe(p, placed)}")
 
     # ---- the repeat
     def _rep_hold(self, source, on):
@@ -10234,6 +10264,10 @@ program.</li>
             if self._rep_sources:                      # still held: on the new section too
                 self._rep_apply()
             self.lfo.trigger(time.monotonic())         # trig and one-shot LFOs restart
+            if self._auto_fx_pending:                  # the racks for the section, on its bar
+                style, seed = self._auto_fx_pending
+                self._auto_fx_pending = None
+                self._auto_fx_apply(style, seed)
             self.tempo.set_bpm(pl.bpm)
             self.tempo.anchor = pl.loop_t0 if pl.loop_t0 else time.monotonic()
             self._show_live_bpm()

@@ -15,7 +15,17 @@ effects (gacha_engine.Feel.favour, the names of the texture chains'
 effects) mapped onto the rack's knobs, on the layers and the chops. The
 racks' knobs run 0..1, 1 fully wet, so the amounts stay under 0.7.
 
+Some styles move a knob rather than set it: AUTO_LFO gives each a few
+LFOs (gacha_lfo: a knob, a shape, a cycle in bars, a depth, the
+polarity), the ladder rising over 4 bars for house, the chops' pitch
+stepping at random on the 16ths for glitch, the events' delay drifting
+for dub; plan_lfos() draws them. The GUI puts them in LFO slots that are
+off, never in one the player turned on, and takes its own back before
+the next section. Every LFO is locked to the live clock's bar, and the
+racks' delays follow the beat, so what auto fx sets lands in time.
+
     plan("drone", random.Random(seed))   # {("layers", "reverb"): 0.52, ("chops", "reverse"): 0.41}
+    plan_lfos("acid", rng)               # [{"dest": "afx_chops_lowpass", "shape": "saw down", ...}]
 """
 import random
 
@@ -97,6 +107,65 @@ AUTO_FX = {
 }
 
 
+# style -> ((stem, knob, shape, cycle, depth, unipolar, chance), ...): the knob
+# moved on the live clock; depth is the LFO's (± half the knob's range at
+# 1, the whole range upward with unipolar); the pitch knob is bipolar, so a
+# depth of 0.5 either way is three semitones with the range setting at 12
+AUTO_LFO = {
+    "four-floor": (("layers", "lowpass", "saw up", "4 bars", 0.6, True, 0.6),),
+    "breakbeat": (("chops", "lowpass", "saw down", "1 bar", 0.4, True, 0.5),),
+    "boom-bap": (("layers", "lofi", "sine", "8 bars", 0.3, True, 0.5),),
+    "halftime": (("layers", "lowpass", "sine", "2 bars", 0.5, True, 0.6),),
+    "dnb": (("layers", "lowpass", "saw up", "4 bars", 0.5, True, 0.6),),
+    "minimal": (("layers", "phaser", "sine", "4 bars", 0.4, True, 0.7),),
+    "ukg": (("chops", "pitch", "random step", "1/4", 0.3, False, 0.5),),
+    "one-drop": (("events", "delay", "random smooth", "2 bars", 0.4, True, 0.6),),
+    "footwork": (("chops", "pitch", "random step", "1/4", 0.4, False, 0.6),),
+    "clave": (("layers", "chorus", "sine", "4 bars", 0.3, True, 0.5),),
+    "idm": (("events", "pitch", "random step", "1/8", 0.7, False, 0.8),
+            ("chops", "crush", "square", "1/4", 0.4, True, 0.5)),
+    "hypnotic": (("layers", "phaser", "sine", "8 bars", 0.5, True, 0.8),
+                 ("chops", "pitch", "triangle", "4 bars", 0.3, False, 0.5)),
+    "drone": (("layers", "lowpass", "sine", "8 bars", 0.5, True, 0.8),
+              ("events", "pitch", "random walk", "4 bars", 0.3, False, 0.5)),
+    "glitch": (("chops", "pitch", "random step", "1/16", 0.6, False, 0.8),
+               ("chops", "crush", "square", "1/8", 0.5, True, 0.6)),
+    "dub": (("events", "delay", "random smooth", "2 bars", 0.4, True, 0.7),
+            ("layers", "phaser", "sine", "4 bars", 0.4, True, 0.5)),
+    "polyrhythm": (("chops", "delay", "triangle", "2 bars", 0.3, True, 0.6),),
+    "electro": (("layers", "chorus", "triangle", "2 bars", 0.3, True, 0.6),),
+    "acid": (("chops", "lowpass", "saw down", "1/2", 0.6, True, 0.9),
+             ("layers", "phaser", "sine", "2 bars", 0.4, True, 0.5)),
+    "jungle": (("chops", "pitch", "random step", "1/2", 0.3, False, 0.5),),
+    "gabber": (("drums", "drive", "square", "1/4", 0.3, True, 0.4),),
+    "jersey": (("chops", "pitch", "random step", "1/8", 0.4, False, 0.6),),
+    "gqom": (("layers", "lowpass", "sine", "8 bars", 0.4, True, 0.7),),
+    "amapiano": (("chops", "delay", "sine", "4 bars", 0.3, True, 0.5),),
+    "jazz": (),
+    "industrial": (("chops", "lofi", "square", "1/2", 0.5, True, 0.6),),
+    "bruk": (("layers", "chorus", "sine", "4 bars", 0.3, True, 0.5),),
+    "ambient": (("layers", "reverb", "sine", "8 bars", 0.3, True, 0.7),
+                ("layers", "lowpass", "sine", "8 bars", 0.4, True, 0.7)),
+    "motorik": (("layers", "phaser", "sine", "8 bars", 0.5, True, 0.8),),
+    "afrobeat": (("layers", "chorus", "sine", "4 bars", 0.3, True, 0.5),),
+    "cumbia": (("layers", "chorus", "sine", "4 bars", 0.3, True, 0.5),),
+    "dembow": (),
+}
+
+
+def plan_lfos(style, rng=None):
+    """The LFOs for `style` (AUTO_LFO), each drawn with its chance: a list
+    of slot settings as the GUI's LFO rows take them, {dest, shape, rate,
+    depth, unipolar, mode}; [] for a style without any."""
+    rng = rng or random.Random()
+    out = []
+    for stem, knob, shape, rate, depth, unipolar, chance in AUTO_LFO.get(style, ()):
+        if stem in STEM_CHANNELS and knob in FX_KEYS and rng.random() < chance:
+            out.append({"dest": f"afx_{stem}_{knob}", "shape": shape, "rate": rate,
+                        "depth": depth, "unipolar": unipolar, "mode": "cycle"})
+    return out
+
+
 def plan(style, rng=None):
     """The racks for `style` (a feel's name, gacha_engine.STYLE_FEEL):
     {(stem, knob): amount} drawn from AUTO_FX, or from the feel's favoured
@@ -120,6 +189,10 @@ def plan(style, rng=None):
     return out
 
 
-def describe(p):
-    """A plan as the log says it: 'layers reverb 0.52, chops reverse 0.41'."""
-    return ", ".join(f"{stem} {knob} {v:.2f}" for (stem, knob), v in sorted(p.items())) or "nothing"
+def describe(p, lfos=()):
+    """A plan as the log says it: 'layers reverb 0.52, chops reverse 0.41;
+    LFO chops pitch random step 1/16 ±0.6'."""
+    knobs = ", ".join(f"{stem} {knob} {v:.2f}" for (stem, knob), v in sorted(p.items()))
+    moves = ", ".join(f"LFO {l['dest'][4:].replace('_', ' ')} {l['shape']} {l['rate']} "
+                      f"{'+' if l['unipolar'] else '±'}{l['depth']:g}" for l in lfos)
+    return "; ".join(x for x in (knobs, moves) if x) or "nothing"
