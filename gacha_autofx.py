@@ -36,7 +36,7 @@ racks' delays follow the beat, so what auto fx sets lands in time.
 import random
 
 import gacha_engine as E
-from gacha_fx import AUDIO_FX, STEM_CHANNELS, VOICES, VOICES
+from gacha_fx import AUDIO_FX, STEM_CHANNELS, VOICES, Gestures  # noqa: F401 (Gestures re-exported)
 
 FX_KEYS = {k for k, *_ in AUDIO_FX}
 
@@ -417,35 +417,6 @@ def plan_gestures(style, rng=None, bars=8, exclude=(), table=None, default=None,
                 for st in range(start + rng.randrange(period), end, period):
                     out.append((dest, st / 4.0, g["length"], amt, "hold"))
     return out
-
-
-class Gestures:
-    """A section's gestures on its loop clock: values(beat) gives every
-    knob with a gesture its value now, the static plan's (`base`) when no
-    gesture is on it, the largest gesture when several are."""
-
-    def __init__(self, gestures, bars, base=None):
-        self.gestures = list(gestures)
-        self.loop = bars * 4.0
-        self.base = dict(base or {})
-        self.dests = sorted({g[0] for g in self.gestures})
-
-    def values(self, beat):
-        beat = beat % self.loop if self.loop > 0 else 0.0
-        out = {d: self.base.get(d, 0.0) for d in self.dests}
-        for dest, start, length, amount, shape in self.gestures:
-            t = beat - start
-            if t < 0 or t >= length or length <= 0:
-                continue
-            f = t / length
-            v = amount * (f if shape == "in" else (1.0 - f) if shape == "out" else 1.0)
-            if abs(v) > abs(out[dest]):
-                out[dest] = round(v, 3)
-        return out
-
-    def rest(self):
-        """Every knob back to its base: the section stopped."""
-        return {d: self.base.get(d, 0.0) for d in self.dests}
 
 
 # ---------------------------------------------------------------- the drum voices

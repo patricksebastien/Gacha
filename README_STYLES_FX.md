@@ -107,7 +107,7 @@ With *auto fx* ticked, every section that lands on its bar (and a song started t
 
 * **Set**: a knob held for the section, the amount drawn from its range.
 * **LFO**: a knob moved on the live clock, put in an LFO slot that is off (never one you turned on) and taken back before the next section. ± moves it either way, + upward only.
-* **Moves**: the rack knob itself set and taken back at a place on the loop, a hold, a rise or a fall; several at once, the knob takes the largest, then falls back to its set value. A knob an LFO holds is left to the LFO.
+* **Moves**: an effect switched on at a place in the loop and off after its length (a hold, a rise or a fall), run by the audio engine block by block on the player's own position, so it lands within one audio block (about 3 ms) of its grid line; several at once, the largest wins, and the knob's own setting takes over again after. The Audio FX grid lights the cell and shows the move's amount, the setting untouched. A knob an LFO holds is left to the LFO.
 
 The rack knobs run 0 to 1, fully wet at 1; the pitch knob is -1 to 1 (down is negative). A style without a row in a table takes the default.
 

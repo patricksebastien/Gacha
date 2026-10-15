@@ -325,6 +325,8 @@ class Rack:
     def __init__(self, sr):
         self.sr = int(sr)
         self.amounts = {k: d for k, _l, d, _t in AUDIO_FX}   # set from any thread
+        self.moves = {}                                       # knob -> an auto fx move's amount now,
+                                                              # set by the audio thread per block
         self.vol = 1.0                                        # 0..1, unity at 1
         self.beat_s = 0.5                                     # delay time base
         self._now = dict(self.amounts)                        # ramp state
@@ -337,7 +339,8 @@ class Rack:
     def idle(self):
         """No effect on and none fading out: zeros in would be zeros out,
         so a silent channel can skip the rack."""
-        return not any(self._now.values()) and not any(self.amounts.values())
+        return not any(self._now.values()) and not any(self.amounts.values()) \
+            and not any(self.moves.values())
 
     # ---- plugins, built on first use ----
     def _get(self, key):
@@ -447,8 +450,12 @@ class Rack:
         nothing; an effect coming back from 0 starts from a clean state."""
         bs = x.shape[1]
         y = x
+        moves = self.moves
         for key, _l, _d, _t in AUDIO_FX:
             target = float(self.amounts.get(key, 0.0))
+            m = moves.get(key)
+            if m is not None and abs(m) > abs(target):    # an auto fx move on it, larger
+                target = float(m)
             bipolar = key in BIPOLAR
             if bipolar:
                 target = max(-1.0, min(1.0, target))
@@ -499,3 +506,54 @@ if __name__ == "__main__":                       # cost check from a terminal
         rack.process(x)
     ms = (time.perf_counter() - t) / 200 * 1000
     print(f"all eleven on: {ms:.2f} ms per {bs}-frame block ({1000 * bs / sr:.1f} ms of audio)")
+
+
+# ---------------------------------------------------------------- auto fx moves
+
+class Gestures:
+    """A section's auto fx moves on its loop clock (gacha_autofx draws
+    them): (dest, start_beat, length_beats, amount, shape), dest a knob id
+    "afx_<channel>_<knob>". values(beat) gives every knob with a move its
+    value now, the static plan's (`base`) when no move is on it, the
+    largest move when several are; active(beat) only the moves on. The
+    audio engine runs them per block (LiveAudio.set_moves), so they land
+    within a block of the grid."""
+
+    def __init__(self, gestures, bars, base=None):
+        self.gestures = list(gestures)
+        self.loop = bars * 4.0
+        self.base = dict(base or {})
+        self.dests = sorted({g[0] for g in self.gestures})
+
+    def values(self, beat):
+        beat = beat % self.loop if self.loop > 0 else 0.0
+        out = {d: self.base.get(d, 0.0) for d in self.dests}
+        for dest, start, length, amount, shape in self.gestures:
+            t = beat - start
+            if t < 0 or t >= length or length <= 0:
+                continue
+            f = t / length
+            v = amount * (f if shape == "in" else (1.0 - f) if shape == "out" else 1.0)
+            if abs(v) > abs(out[dest]):
+                out[dest] = round(v, 3)
+        return out
+
+    def rest(self):
+        """Every knob back to its base: the section stopped."""
+        return {d: self.base.get(d, 0.0) for d in self.dests}
+
+    def active(self, beat):
+        """The knobs a move is on at `beat`: {dest: amount}, the largest
+        when several are; the audio engine's per-block read, the knob's
+        own value (the rack's amount) wins where it is larger."""
+        beat = beat % self.loop if self.loop > 0 else 0.0
+        out = {}
+        for dest, start, length, amount, shape in self.gestures:
+            t = beat - start
+            if t < 0 or t >= length or length <= 0:
+                continue
+            f = t / length
+            v = amount * (f if shape == "in" else (1.0 - f) if shape == "out" else 1.0)
+            if abs(v) > abs(out.get(dest, 0.0)):
+                out[dest] = v
+        return out

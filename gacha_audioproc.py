@@ -96,7 +96,7 @@ SNAP_LA = [
     ((ATTR, "running"),), ((ATTR, "error"),), ((ATTR, "mode"),), ((ATTR, "sr"),),
     ((ATTR, "block"),), ((ATTR, "in_name"),), ((ATTR, "out_latency_ms"),),
     ((ATTR, "buffer_ms"),), ((ATTR, "ping_result"),), ((ATTR, "midi_sent"),),
-    ((ATTR, "in_peak"),), ((ATTR, "out_peak"),),
+    ((ATTR, "in_peak"),), ((ATTR, "out_peak"),), ((ATTR, "move_values"),),
     ((ATTR, "stats"), (CALL, None)),
     ((ATTR, "player"), (ATTR, "playing")), ((ATTR, "player"), (ATTR, "bpm")),
     ((ATTR, "player"), (ATTR, "bars")), ((ATTR, "player"), (ATTR, "n")),

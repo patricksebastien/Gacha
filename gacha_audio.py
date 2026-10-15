@@ -115,7 +115,7 @@ except (ImportError, OSError) as e:        # no package, or no libportaudio
 from gacha_frag import Fragments
 from gacha_freeze import Freeze
 from gacha_metro import Metronome, VEL as METRO_VEL
-from gacha_fx import ALL_CHANNELS, Rack, STEM_CHANNELS, VOICES
+from gacha_fx import ALL_CHANNELS, Gestures, Rack, STEM_CHANNELS, VOICES
 from gacha_midi import DRUM_NOTES, DRUM_ROLES, ROOT_ROLES, ROOT_VEL, root_shift, style_offset
 
 assert VOICES[:len(DRUM_ROLES)] == DRUM_ROLES      # one voice per MIDI role, then the sub
@@ -1575,6 +1575,9 @@ class LiveAudio:
         self.api = api                       # host API name, None = the best present
         self.mode = ""                       # how the devices were opened, for the status
         self.racks = {ch: Rack(self.sr) for ch in ALL_CHANNELS}   # live in, 4 stems, 7 voices
+        self.moves = None                    # auto fx moves (gacha_fx.Gestures), set_moves()
+        self.move_values = {}                # knob id -> a move's amount now, for the GUI's grid
+        self._moved = set()                  # the racks with moves on them
         self.beat_s = 0.5                    # the delays follow this
         self.gain = 1.0
         self.mute = False
@@ -1829,6 +1832,7 @@ class LiveAudio:
         old_racks = self.racks
         self.sr = sr
         self.racks = {ch: Rack(sr) for ch in ALL_CHANNELS}
+        self._moved = set()                           # the new racks carry no moves yet
         for ch, r in self.racks.items():
             r.amounts.update(old_racks[ch].amounts)
             r.vol = old_racks[ch].vol
@@ -2113,6 +2117,39 @@ class LiveAudio:
         self._ab_now = float(self.ab)
         self._tw_now = self._tape_weight(self._ab_now)
 
+    def set_moves(self, gestures=None, bars=8):
+        """The playing section's auto fx moves (gacha_fx.Gestures rows,
+        from the GUI's auto fx), run per block on the player's own loop
+        position; None or empty, no moves."""
+        self.moves = Gestures(gestures, bars) if gestures else None
+
+    def _apply_moves(self):
+        """The audio thread, every block, after the player: the moves on at
+        this block's beat of the loop onto their racks (Rack.moves), the
+        racks a move left cleared; move_values for the GUI's grid."""
+        g, pl = self.moves, self.player
+        vals = None
+        try:
+            if g is not None and pl.playing and pl.grid_i0 is not None and pl.n and pl.bars:
+                vals = g.active(pl.grid_i0 / pl.n * pl.bars * 4.0)
+        except Exception:                             # never stop the sound over a move
+            self.moves, vals = None, None
+        if not vals and not self._moved:
+            if self.move_values:
+                self.move_values = {}
+            return
+        per = {}
+        for dest, v in (vals or {}).items():
+            ch, key = dest[4:].split("_", 1)
+            if ch in self.racks:
+                per.setdefault(ch, {})[key] = v
+        for ch in self._moved - per.keys():
+            self.racks[ch].moves = {}
+        for ch, d in per.items():
+            self.racks[ch].moves = d
+        self._moved = set(per)
+        self.move_values = {f"afx_{ch}_{k}": round(v, 3) for ch, d in per.items() for k, v in d.items()}
+
     def _midi_sync(self, mo, heard, sr):
         """The MIDI clock's grid and the transport from this block: `heard`
         is when the block's first frame is heard, less the lead, the time
@@ -2229,6 +2266,7 @@ class LiveAudio:
         self.player.out_lat = out_lat                 # a Link bar is placed as heard
         t_block = time.perf_counter()
         sec = self.player.block(bs, now, ramp)
+        self._apply_moves()                           # auto fx moves for this block, before the racks
         song = self.song.block(bs)
         # the drum pads: on the quantize grid like a one-shot while a
         # section plays, at once otherwise; the sample into its voice below,

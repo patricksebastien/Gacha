@@ -1652,6 +1652,48 @@ class AppPlayer(QObject):
         return self.active.playbackState()
 
 
+class AfxSpin(QDoubleSpinBox):
+    """A rack knob of the Audio FX grid. While an auto fx move is on it
+    (the audio engine runs the moves, LiveAudio.move_values) it shows the
+    move's amount, lit, instead of its own value; the value itself never
+    changes, so the rack, the MIDI map, the scenes, the macros and the
+    LFOs keep reading the setting. Clicked into, it shows its own value
+    again for editing."""
+
+    _shown = None                     # a class default: Qt asks for the text while building
+
+    def textFromValue(self, v):
+        if self._shown is not None:
+            return self.locale().toString(float(self._shown), "f", self.decimals())
+        return super().textFromValue(v)
+
+    def show_move(self, v):
+        """The move's amount (None: none) on display; the edit's text set
+        with its signals blocked, so the box never reads it back."""
+        if self.hasFocus():
+            v = None
+        if v is not None:
+            v = round(float(v), self.decimals())
+        if v == self._shown:
+            return
+        self._shown = v
+        ed = self.lineEdit()
+        ed.blockSignals(True)
+        ed.setText(self.textFromValue(self.value()))
+        ed.blockSignals(False)
+        if v is None:
+            self.setStyleSheet("")
+        else:
+            a = 90 + int(140 * min(1.0, abs(v)))
+            self.setStyleSheet(f"background: rgba(255, 150, 110, {a});")
+
+    def focusInEvent(self, e):
+        if self._shown is not None:
+            self.show_move(None)
+        self._shown = None
+        super().focusInEvent(e)
+
+
 class LfoBar(QWidget):
     """An LFO's wave right now: a bar from the middle, right for positive,
     left for negative, lit while the slot is on."""
@@ -2164,8 +2206,8 @@ class Main(QMainWindow):
         self._shuffle_landing = []                  # parts handed to the player, not yet on the bar
         self._auto_fx_pending = None                # (style, seed) for the racks as a section lands
         self._auto_fx_lfos = {}                     # LFO slot -> the group ("stems", "drums") that filled it
-        self._auto_fx_gest = None                   # gacha_autofx.Gestures: the moves on the loop clock
-        self._auto_fx_last = {}                     # knob id -> the value the gestures wrote last
+        self._auto_fx_gest = None                   # gacha_fx.Gestures: the moves, run by the engine
+        self._auto_fx_shown = set()                 # grid cells showing a move
         self._perf_playing = None                   # Section on the player
         self._perf_current = None                   # (Section, stems, sr): the last one played,
                                                     # what stop / Link start bring back
@@ -4602,7 +4644,7 @@ All three sit next to the program.</li>
             grid.addWidget(lbl, r, 0)
             for c, ch in enumerate(channels):
                 lo = -1.0 if key in BIPOLAR else 0.0
-                sp = QDoubleSpinBox(minimum=lo, maximum=1.0, singleStep=0.05, decimals=2)
+                sp = AfxSpin(minimum=lo, maximum=1.0, singleStep=0.05, decimals=2)
                 sp.setValue(default)
                 sp.setToolTip(f"{ch}: {tip}")
                 sp.setButtonSymbols(QAbstractSpinBox.NoButtons)
@@ -9879,8 +9921,7 @@ All three sit next to the program.</li>
             keep = [m for m in g.gestures if m[0][4:].split("_", 1)[0] not in channels]
             base = {d: v for d, v in g.base.items() if d[4:].split("_", 1)[0] not in channels}
             self._auto_fx_gest = gacha_autofx.Gestures(keep, g.loop / 4, base) if keep else None
-            self._auto_fx_last = {d: v for d, v in self._auto_fx_last.items()
-                                  if d[4:].split("_", 1)[0] not in channels}
+            self._auto_fx_send()
         for (ch, key), sp in self.afx.items():
             if ch in channels and key != "vol":
                 sp.setValue(0.0)
@@ -9921,7 +9962,7 @@ All three sit next to the program.</li>
             if len(lfos) > len(placed):
                 self.log.appendPlainText(f"auto fx: {len(lfos) - len(placed)} LFO(s) left out, "
                                          "no slot off")
-            # the moves in time, on the loop clock (_auto_fx_tick); a knob an
+            # the moves in time, run by the audio engine on the loop; a knob an
             # LFO holds, ours or the player's, is the LFO's
             held = {r["dest"].currentData() for r in self.lfo_rows if r["on"].isChecked()}
             group_moves = A.plan_gestures(style, rng, bars, exclude=held, table=t_moves,
@@ -9931,8 +9972,7 @@ All three sit next to the program.</li>
             said.append(f"{name}: {A.describe(p, placed)}"
                         + (f", {len(group_moves)} moves" if group_moves else ""))
         self._auto_fx_gest = A.Gestures(moves, bars, base) if moves else None
-        self._auto_fx_last = {d: v for d, v in self._auto_fx_last.items()
-                              if self._auto_fx_gest is not None and d in self._auto_fx_gest.dests}
+        self._auto_fx_send()
         self.log.appendPlainText(f"auto fx ({style}) " + " | ".join(said))
 
     def _auto_fx_place_lfos(self, lfos, group):
@@ -9957,30 +9997,42 @@ All three sit next to the program.</li>
             placed.append(l)
         return placed
 
-    def _auto_fx_tick(self, beat):
-        """The gestures' knobs for this moment of the loop, `beat` beats in;
-        a knob is written only when it moved."""
+    def _auto_fx_send(self):
+        """The moves to the audio engine, which runs them per block on the
+        player's own loop position (LiveAudio.set_moves); none, it stops."""
+        la = self.through
+        if la is None:
+            return
         g = self._auto_fx_gest
         if g is None:
-            return
-        for dest, v in g.values(beat).items():
-            if abs(v - self._auto_fx_last.get(dest, -9.0)) > 0.004:
-                sp = self.afx.get((dest[4:].split("_", 1)[0], dest[4:].split("_", 1)[1]))
-                if sp is not None:
-                    sp.setValue(v)
-                self._auto_fx_last[dest] = v
+            la.set_moves(None)
+        else:
+            la.set_moves(list(g.gestures), g.loop / 4.0)
+
+    def _auto_fx_show(self):
+        """The moves the engine runs, on the Audio FX grid: each cell a
+        move is on shows its amount, lit (the knob's value untouched)."""
+        la = self.through
+        vals = {}
+        if la is not None and la.running and self._auto_fx_gest is not None:
+            vals = la.move_values or {}
+        cells = set()
+        for dest, v in vals.items():
+            sp = self.afx.get(tuple(dest[4:].split("_", 1)))
+            if isinstance(sp, AfxSpin):
+                sp.show_move(v)
+                cells.add(sp)
+        for sp in self._auto_fx_shown - cells:
+            sp.show_move(None)
+        self._auto_fx_shown = cells
 
     def _auto_fx_idle(self):
-        """The section stopped: the gestures' knobs back to their base."""
-        g = self._auto_fx_gest
-        if g is None:
-            return
-        for dest, v in g.rest().items():
-            sp = self.afx.get(tuple(dest[4:].split("_", 1)))
-            if sp is not None:
-                sp.setValue(v)
+        """The section stopped: the engine's moves off, the grid as set."""
         self._auto_fx_gest = None
-        self._auto_fx_last = {}
+        self._auto_fx_send()
+        for sp in self._auto_fx_shown:
+            sp.show_move(None)
+        self._auto_fx_shown = set()
 
     # ---- the repeat
     def _rep_hold(self, source, on):
@@ -10340,7 +10392,7 @@ All three sit next to the program.</li>
             if self._perf_sounding:                    # our section just stopped (on the bar,
                 self._perf_sounding = False            # or the output closed): the peers stop
                 self._link_transport(False)            # with it; idling alone sends nothing
-                self._auto_fx_idle()                   # the gestures' knobs back to base
+                self._auto_fx_idle()                   # the engine's moves off, the grid as set
                 if "ui" in self._rep_sources:          # the latched repeat ends with it
                     self._rep_hold("ui", False)
                 if "ui" in self._brake_sources:        # and the latched tape stop
@@ -10416,7 +10468,7 @@ All three sit next to the program.</li>
         pos = pl.pos_s()
         bar_pos = pos * pl.bpm / 60.0 / 4                # bars into the loop
         bar = int(bar_pos) + 1
-        self._auto_fx_tick(bar_pos * 4.0)                # the auto fx moves, on the loop
+        self._auto_fx_show()                             # the engine's auto fx moves, on the grid
         busy = self._perf_busy
         ready = "next ready" if self._perf_ready else (
             "" if not busy else f"randomizing {busy[1]}..." if busy[0] == "shuffle" else "rendering next...")
