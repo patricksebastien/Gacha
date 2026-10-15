@@ -354,6 +354,8 @@ The ending is a ring-out effect in the spirit of Marmelade's "Ending FX" stage: 
 
 ### Drum styles
 
+Every style, its feel in numbers, the kinds of the density ladder and what auto fx does per style are in tables in [README_STYLES_FX.md](README_STYLES_FX.md) (also linked from the Help tab).
+
 `four-floor`, `breakbeat`, `boom-bap`, `halftime`, `dnb`, `minimal`, `ukg`, `dembow`, `one-drop`, `footwork`, `clave`, `idm`, `hypnotic`, `drone`, `glitch`, `dub`, `polyrhythm`, `electro`, `acid`, `jungle`, `gabber`, `jersey`, `gqom`, `amapiano`, `jazz`, `industrial`, `bruk`, `ambient`, `motorik`, `afrobeat`, `cumbia`
 
 `random` picks one per song, or per live section. Tempo is deliberately independent: dnb at 90 BPM is your call. With a chromatic drum machine on the MIDI out, the *style voicing* tick (M:C tab, MIDI out row) pitches the hits by style, see there.

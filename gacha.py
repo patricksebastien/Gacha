@@ -2982,8 +2982,9 @@ binding. The <b>Controls</b> tab has every row with its key and its binding: cli
 MIDI cell to learn there, Delete clears it. <b>Erae</b> lays the pads out on an Erae 2,
 <b>M:C</b> drives a Model:Cycles over MIDI.</li>
 <li>The manual: <a {link} href="gacha:readme">README.md</a>, opens here; the box's MIDI
-surface: <a {link} href="MODEL_CYCLES_MIDI.md">MODEL_CYCLES_MIDI.md</a>. Both sit next to the
-program.</li>
+surface: <a {link} href="MODEL_CYCLES_MIDI.md">MODEL_CYCLES_MIDI.md</a>; the styles, their
+feels, the kinds and auto fx in tables: <a {link} href="README_STYLES_FX.md">README_STYLES_FX.md</a>.
+All three sit next to the program.</li>
 </ol>
 
 <p><b>Tools.</b></p>
