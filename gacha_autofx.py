@@ -15,6 +15,12 @@ effects (gacha_engine.Feel.favour, the names of the texture chains'
 effects) mapped onto the rack's knobs, on the layers and the chops. The
 racks' knobs run 0..1, 1 fully wet, so the amounts stay under 0.7.
 
+Beyond the settings, the racks move: AUTO_GESTURES (below) gives each
+style moves in time, a delay thrown on an 8th now and then, a crusher
+for a beat, a reverb tail on the loop's last bar, the ladder closing over
+the last two, several at once; plan_gestures() draws a section's and
+Gestures runs them on the loop clock from the Perform poll.
+
 Some styles move a knob rather than set it: AUTO_LFO gives each a few
 LFOs (gacha_lfo: a knob, a shape, a cycle in bars, a depth, the
 polarity), the ladder rising over 4 bars for house, the chops' pitch
@@ -196,3 +202,234 @@ def describe(p, lfos=()):
     moves = ", ".join(f"LFO {l['dest'][4:].replace('_', ' ')} {l['shape']} {l['rate']} "
                       f"{'+' if l['unipolar'] else '±'}{l['depth']:g}" for l in lfos)
     return "; ".join(x for x in (knobs, moves) if x) or "nothing"
+
+
+# ---------------------------------------------------------------- gestures
+# The racks as moves in time rather than settings: a delay thrown on an 8th
+# now and then, a crusher for a beat, a reverb tail on the loop's last bar,
+# the ladder closing over the last two, several at once. A gesture is
+# (dest, start, length, amount, shape) in beats from the loop's start:
+# "hold" keeps the amount, "in" rises to it, "out" falls from it; the knob
+# is the largest gesture on it at the moment, the static plan's value when
+# none is on. AUTO_GESTURES holds a palette per style, each line a kind of
+# move with its chance; plan_gestures() draws a section's from the palette
+# and Gestures runs them on the loop clock (the Perform poll, 50 times a
+# second, the player's position in beats). The pitch knob takes signed
+# amounts (down is negative). A knob an LFO holds is left to the LFO.
+
+def throw(stem, knob, amount, length, grid, count, chance, shape="hold"):
+    """`count` (lo, hi) moves of `length` beats at random places on a grid
+    of `grid` beats: the delay throw, the crusher burst."""
+    return {"kind": "throw", "stem": stem, "knob": knob, "amount": amount, "length": length,
+            "grid": grid, "count": count, "chance": chance, "shape": shape}
+
+
+def onbar(stem, knob, amount, length, bars, beat, chance, shape="hold"):
+    """A move of `length` beats at `beat` (0..3) of the bars `bars` says:
+    "last", "first", "even", "odd", "all", a list of 1-based bars."""
+    return {"kind": "onbar", "stem": stem, "knob": knob, "amount": amount, "length": length,
+            "bars": bars, "beat": beat, "chance": chance, "shape": shape}
+
+
+def ramp(stem, knob, amount, bars, shape, chance):
+    """A rise ("in") or a fall ("out") across the bars `bars` says: (from,
+    to) 1-based inclusive, "last", "last2", "last4", "first4"."""
+    return {"kind": "ramp", "stem": stem, "knob": knob, "amount": amount, "bars": bars,
+            "chance": chance, "shape": shape}
+
+
+def count(stem, knob, amount, periods, bars, chance, length=0.25):
+    """A 16th-long move every so many 16ths (one of `periods`) across the
+    bars `bars` says: Tenney's pulse on a knob."""
+    return {"kind": "count", "stem": stem, "knob": knob, "amount": amount, "periods": periods,
+            "bars": bars, "chance": chance, "length": length}
+
+
+DEFAULT_GESTURES = (
+    onbar("chops", "delay", (0.5, 0.7), 1.0, [4, 8], 3, 0.5),
+    onbar("events", "reverb", (0.6, 0.8), 1.0, "last", 3, 0.4),
+    ramp("layers", "lowpass", (0.5, 0.8), "last", "in", 0.3),
+)
+
+AUTO_GESTURES = {
+    "four-floor": (ramp("layers", "lowpass", (0.6, 0.8), "last4", "out", 0.6),
+                   onbar("events", "reverb", (0.6, 0.8), 1.0, "last", 3, 0.6),
+                   onbar("chops", "delay", (0.5, 0.7), 1.0, [4, 8], 3, 0.7)),
+    "breakbeat": (throw("drums", "crush", (0.5, 0.7), 2.0, 1.0, (1, 2), 0.6),
+                  onbar("drums", "delay", (0.5, 0.7), 1.0, "even", 3, 0.6),
+                  throw("events", "reverse", (0.7, 0.9), 2.0, 1.0, (1, 2), 0.5)),
+    "boom-bap": (throw("chops", "lofi", (0.5, 0.7), 2.0, 1.0, (1, 2), 0.5),
+                 onbar("drums", "delay", (0.4, 0.6), 1.0, [4, 8], 3, 0.5)),
+    "halftime": (ramp("layers", "lowpass", (0.6, 0.8), "last2", "in", 0.6),
+                 onbar("drums", "reverb", (0.5, 0.7), 1.0, "last", 3, 0.5),
+                 throw("chops", "delay", (0.5, 0.7), 1.0, 1.0, (1, 2), 0.5)),
+    "dnb": (throw("drums", "crush", (0.4, 0.6), 2.0, 1.0, (1, 2), 0.6),
+            onbar("drums", "delay", (0.5, 0.7), 1.0, "even", 3, 0.6),
+            throw("events", "reverse", (0.7, 0.9), 2.0, 1.0, (1, 2), 0.5)),
+    "minimal": (throw("chops", "delay", (0.4, 0.6), 1.0, 1.0, (1, 3), 0.7),
+                ramp("layers", "lowpass", (0.4, 0.6), "last", "in", 0.4)),
+    "ukg": (throw("chops", "delay", (0.5, 0.7), 0.5, 0.25, (3, 6), 0.7),
+            throw("chops", "pitch", (0.4, 0.7), 0.5, 0.25, (2, 4), 0.5)),
+    "dembow": (onbar("drums", "delay", (0.5, 0.7), 1.0, "even", 3, 0.6),
+               onbar("events", "reverb", (0.5, 0.7), 1.0, "last", 3, 0.4)),
+    "one-drop": (onbar("drums", "delay", (0.6, 0.8), 1.0, "even", 3, 0.8),
+                 ramp("events", "reverb", (0.6, 0.8), "last", "in", 0.6),
+                 ramp("layers", "lowpass", (0.6, 0.8), "last", "in", 0.5),
+                 throw("chops", "reverse", (0.6, 0.8), 2.0, 1.0, (1, 2), 0.4)),
+    "footwork": (throw("chops", "delay", (0.5, 0.7), 0.5, 0.25, (3, 6), 0.7),
+                 throw("chops", "pitch", (0.4, 0.7), 0.5, 0.25, (2, 4), 0.5),
+                 throw("drums", "lofi", (0.7, 0.9), 0.5, 0.5, (1, 3), 0.4)),
+    "clave": (onbar("events", "delay", (0.5, 0.7), 1.0, "even", 3, 0.5),
+              onbar("events", "reverb", (0.5, 0.7), 1.0, "last", 3, 0.4)),
+    "idm": (throw("chops", "delay", (0.6, 0.8), 0.5, 0.25, (3, 6), 0.8),
+            throw("chops", "crush", (0.6, 0.8), 1.0, 1.0, (1, 3), 0.7),
+            throw("events", "reverse", (0.7, 0.9), 2.0, 1.0, (1, 2), 0.6),
+            throw("chops", "pitch", (-0.9, -0.5), 1.0, 0.5, (1, 3), 0.5, "out"),
+            throw("drums", "lofi", (0.8, 1.0), 0.5, 0.5, (1, 3), 0.5)),
+    "hypnotic": (count("chops", "delay", (0.4, 0.6), (5, 7), "last4", 0.7),
+                 ramp("layers", "lowpass", (0.3, 0.5), "last4", "in", 0.4),
+                 onbar("events", "reverb", (0.6, 0.8), 2.0, "last", 2, 0.4)),
+    "drone": (ramp("layers", "reverb", (0.6, 0.8), "first4", "in", 0.7),
+              ramp("events", "pitch", (-0.7, -0.4), "last2", "in", 0.5),
+              onbar("chops", "reverse", (0.7, 0.9), 4.0, [3, 7], 0, 0.6),
+              ramp("layers", "lowpass", (0.4, 0.6), "last2", "in", 0.5)),
+    "glitch": (throw("chops", "delay", (0.6, 0.8), 0.5, 0.25, (4, 8), 0.9),
+               throw("chops", "crush", (0.6, 0.8), 1.0, 1.0, (2, 4), 0.8),
+               throw("events", "reverse", (0.7, 0.9), 2.0, 1.0, (1, 2), 0.6),
+               throw("drums", "lofi", (0.8, 1.0), 0.5, 0.5, (2, 4), 0.6),
+               throw("chops", "pitch", (-0.9, -0.5), 1.0, 0.5, (1, 3), 0.6, "out"),
+               throw("layers", "crush", (0.5, 0.7), 0.5, 0.25, (2, 4), 0.5)),
+    "dub": (onbar("drums", "delay", (0.7, 0.9), 1.0, "even", 3, 0.9),
+            ramp("events", "reverb", (0.7, 0.9), "last", "in", 0.7),
+            ramp("layers", "lowpass", (0.6, 0.8), "last", "in", 0.6),
+            throw("chops", "reverse", (0.6, 0.8), 2.0, 1.0, (1, 2), 0.5),
+            throw("drums", "reverb", (0.6, 0.8), 1.0, 1.0, (1, 2), 0.5)),
+    "polyrhythm": (count("chops", "delay", (0.5, 0.7), (5, 7), "last4", 0.7),
+                   count("events", "reverb", (0.5, 0.7), (3, 5), "last2", 0.4)),
+    "electro": (onbar("drums", "delay", (0.4, 0.6), 1.0, "even", 3, 0.6),
+                throw("chops", "lofi", (0.5, 0.7), 1.0, 1.0, (1, 3), 0.5),
+                throw("layers", "pitch", (0.3, 0.5), 1.0, 1.0, (1, 2), 0.4, "out")),
+    "acid": (throw("chops", "lowpass", (0.8, 1.0), 0.25, 0.25, (6, 12), 0.8),
+             onbar("chops", "drive", (0.5, 0.7), 4.0, "last", 0, 0.5),
+             onbar("chops", "delay", (0.5, 0.7), 1.0, [4, 8], 3, 0.5)),
+    "jungle": (throw("drums", "crush", (0.5, 0.7), 2.0, 1.0, (1, 2), 0.6),
+               throw("chops", "pitch", (-0.8, -0.5), 1.0, 0.5, (2, 4), 0.6, "out"),
+               onbar("drums", "delay", (0.5, 0.7), 1.0, "even", 3, 0.6),
+               throw("events", "reverse", (0.7, 0.9), 2.0, 1.0, (1, 2), 0.5)),
+    "gabber": (onbar("drums", "drive", (0.6, 0.8), 4.0, "last", 0, 0.7),
+               ramp("layers", "pitch", (0.4, 0.7), "last2", "in", 0.5),
+               throw("drums", "crush", (0.5, 0.7), 0.5, 0.5, (2, 4), 0.5)),
+    "jersey": (throw("chops", "delay", (0.5, 0.7), 0.5, 0.25, (3, 6), 0.7),
+               throw("chops", "pitch", (0.4, 0.7), 0.5, 0.25, (2, 4), 0.6),
+               onbar("events", "reverb", (0.5, 0.7), 1.0, "last", 3, 0.4)),
+    "gqom": (onbar("drums", "reverb", (0.5, 0.7), 1.0, "even", 3, 0.6),
+             ramp("layers", "lowpass", (0.7, 0.9), "last", "in", 0.6),
+             throw("chops", "reverse", (0.6, 0.8), 2.0, 1.0, (1, 2), 0.5)),
+    "amapiano": (onbar("chops", "delay", (0.5, 0.7), 1.0, [4, 8], 3, 0.7),
+                 throw("events", "reverb", (0.6, 0.8), 2.0, 1.0, (1, 2), 0.5)),
+    "jazz": (onbar("events", "reverb", (0.6, 0.8), 2.0, [4, 8], 2, 0.6),
+             throw("chops", "chorus", (0.4, 0.6), 2.0, 1.0, (1, 2), 0.4)),
+    "industrial": (throw("drums", "crush", (0.6, 0.8), 1.0, 1.0, (3, 6), 0.8),
+                   throw("chops", "drive", (0.5, 0.7), 2.0, 1.0, (1, 3), 0.6),
+                   onbar("layers", "lofi", (0.8, 1.0), 4.0, "last", 0, 0.5),
+                   throw("drums", "lofi", (0.8, 1.0), 0.5, 0.5, (2, 4), 0.5)),
+    "bruk": (throw("chops", "phaser", (0.5, 0.7), 2.0, 1.0, (1, 2), 0.5),
+             onbar("drums", "delay", (0.4, 0.6), 1.0, "even", 3, 0.5)),
+    "ambient": (ramp("layers", "reverb", (0.6, 0.8), "first4", "in", 0.8),
+                ramp("layers", "lowpass", (0.5, 0.7), "last4", "out", 0.6),
+                onbar("events", "reverse", (0.6, 0.8), 8.0, [5], 0, 0.4)),
+    "motorik": (onbar("events", "reverb", (0.5, 0.7), 2.0, "last", 2, 0.4),
+                onbar("chops", "delay", (0.4, 0.6), 1.0, [8], 3, 0.5)),
+    "afrobeat": (throw("chops", "delay", (0.4, 0.6), 1.0, 1.0, (1, 3), 0.6),
+                 onbar("events", "reverb", (0.5, 0.7), 1.0, "last", 3, 0.4)),
+    "cumbia": (throw("chops", "delay", (0.4, 0.6), 1.0, 1.0, (1, 3), 0.6),
+               onbar("events", "reverb", (0.5, 0.7), 2.0, [8], 2, 0.5)),
+}
+
+
+def _bars_of(spec, bars):
+    """The 1-based bars a spec names, inside `bars`."""
+    if isinstance(spec, (list, tuple)):
+        if len(spec) == 2 and spec[0] <= spec[1] and not isinstance(spec, list):
+            return [b for b in range(spec[0], spec[1] + 1) if 1 <= b <= bars]
+        return [b for b in spec if 1 <= b <= bars]
+    return {"last": [bars], "first": [1], "even": list(range(2, bars + 1, 2)),
+            "odd": list(range(1, bars + 1, 2)), "all": list(range(1, bars + 1)),
+            "last2": list(range(max(1, bars - 1), bars + 1)),
+            "last4": list(range(max(1, bars - 3), bars + 1)),
+            "first4": list(range(1, min(4, bars) + 1))}.get(spec, [])
+
+
+def _amount(rng, a):
+    return round(rng.uniform(*a), 2) if isinstance(a, (list, tuple)) else float(a)
+
+
+def plan_gestures(style, rng=None, bars=8, exclude=()):
+    """A section's gestures from the style's palette (AUTO_GESTURES, the
+    default palette without one, none for the default feel): a list of
+    (dest, start_beat, length_beats, amount, shape). Knobs in `exclude`
+    (ids an LFO holds) are left out."""
+    rng = rng or random.Random()
+    if style == "default":
+        return []
+    out = []
+    loop = bars * 4
+    for g in AUTO_GESTURES.get(style, DEFAULT_GESTURES):
+        dest = f"afx_{g['stem']}_{g['knob']}"
+        if g["stem"] not in STEM_CHANNELS or g["knob"] not in FX_KEYS or dest in exclude:
+            continue
+        if rng.random() >= g["chance"]:
+            continue
+        kind = g["kind"]
+        if kind == "throw":
+            n = rng.randint(*g["count"])
+            slots = int(loop / g["grid"])
+            for i in sorted(rng.sample(range(slots), min(n, slots))):
+                out.append((dest, i * g["grid"], g["length"], _amount(rng, g["amount"]), g["shape"]))
+        elif kind == "onbar":
+            for b in _bars_of(g["bars"], bars):
+                out.append((dest, (b - 1) * 4 + g["beat"], g["length"], _amount(rng, g["amount"]),
+                            g["shape"]))
+        elif kind == "ramp":
+            bs = _bars_of(g["bars"], bars)
+            if bs:
+                start, end = (bs[0] - 1) * 4, bs[-1] * 4
+                out.append((dest, start, end - start, _amount(rng, g["amount"]), g["shape"]))
+        elif kind == "count":
+            bs = _bars_of(g["bars"], bars)
+            if bs:
+                period = rng.choice(g["periods"])
+                start, end = (bs[0] - 1) * 16, bs[-1] * 16
+                amt = _amount(rng, g["amount"])
+                for st in range(start + rng.randrange(period), end, period):
+                    out.append((dest, st / 4.0, g["length"], amt, "hold"))
+    return out
+
+
+class Gestures:
+    """A section's gestures on its loop clock: values(beat) gives every
+    knob with a gesture its value now, the static plan's (`base`) when no
+    gesture is on it, the largest gesture when several are."""
+
+    def __init__(self, gestures, bars, base=None):
+        self.gestures = list(gestures)
+        self.loop = bars * 4.0
+        self.base = dict(base or {})
+        self.dests = sorted({g[0] for g in self.gestures})
+
+    def values(self, beat):
+        beat = beat % self.loop if self.loop > 0 else 0.0
+        out = {d: self.base.get(d, 0.0) for d in self.dests}
+        for dest, start, length, amount, shape in self.gestures:
+            t = beat - start
+            if t < 0 or t >= length or length <= 0:
+                continue
+            f = t / length
+            v = amount * (f if shape == "in" else (1.0 - f) if shape == "out" else 1.0)
+            if abs(v) > abs(out[dest]):
+                out[dest] = round(v, 3)
+        return out
+
+    def rest(self):
+        """Every knob back to its base: the section stopped."""
+        return {d: self.base.get(d, 0.0) for d in self.dests}

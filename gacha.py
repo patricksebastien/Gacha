@@ -2164,6 +2164,8 @@ class Main(QMainWindow):
         self._shuffle_landing = []                  # parts handed to the player, not yet on the bar
         self._auto_fx_pending = None                # (style, seed) for the racks as a section lands
         self._auto_fx_lfos = set()                  # the LFO slots auto fx filled, taken back next
+        self._auto_fx_gest = None                   # gacha_autofx.Gestures: the moves on the loop clock
+        self._auto_fx_last = {}                     # knob id -> the value the gestures wrote last
         self._perf_playing = None                   # Section on the player
         self._perf_current = None                   # (Section, stems, sr): the last one played,
                                                     # what stop / Link start bring back
@@ -5337,9 +5339,12 @@ program.</li>
             "section lands on its bar. Some styles move a knob instead: an LFO on the "
             "ladder rising over 4 bars for house, on the chops' pitch stepping at random "
             "for glitch, on the events' delay drifting for dub, into LFO slots that are "
-            "off (never one you turned on), taken back before the next section. The "
-            "log says what was set. The live input's and the drum voices' racks are "
-            "left alone. "
+            "off (never one you turned on), taken back before the next section. And "
+            "the racks move in time: a delay thrown on an 8th now and then, a crusher "
+            "for a beat, a reverb tail on the loop's last bar, the ladder closing over "
+            "the last two, several at once, each style its own moves, drawn afresh per "
+            "section. The log says what was set. The live input's and the drum voices' "
+            "racks are left alone. "
             "Ticked while a section plays, it sets them now; unticked, the knobs stay "
             "where they are (all off clears them). Remembered.")
         self.perf_auto_fx.setChecked(self.settings.value("perform/auto_fx", False, type=bool))
@@ -9871,7 +9876,41 @@ program.</li>
             placed.append(l)
         if len(lfos) > len(placed):
             self.log.appendPlainText(f"auto fx: {len(lfos) - len(placed)} LFO(s) left out, no slot off")
-        self.log.appendPlainText(f"auto fx ({style}): {gacha_autofx.describe(p, placed)}")
+        # the moves in time, on the loop clock (_auto_fx_tick); a knob an LFO
+        # holds, ours or the player's, is the LFO's
+        held = {r["dest"].currentData() for r in self.lfo_rows if r["on"].isChecked()}
+        bars = getattr(self._perf_playing, "bars", 8) or 8
+        moves = gacha_autofx.plan_gestures(style, rng, bars, exclude=held)
+        base = {f"afx_{ch}_{key}": v for (ch, key), v in p.items()}
+        self._auto_fx_gest = gacha_autofx.Gestures(moves, bars, base) if moves else None
+        self._auto_fx_last = {}
+        self.log.appendPlainText(f"auto fx ({style}): {gacha_autofx.describe(p, placed)}"
+                                 + (f"; {len(moves)} moves on the loop" if moves else ""))
+
+    def _auto_fx_tick(self, beat):
+        """The gestures' knobs for this moment of the loop, `beat` beats in;
+        a knob is written only when it moved."""
+        g = self._auto_fx_gest
+        if g is None:
+            return
+        for dest, v in g.values(beat).items():
+            if abs(v - self._auto_fx_last.get(dest, -9.0)) > 0.004:
+                sp = self.afx.get((dest[4:].split("_", 1)[0], dest[4:].split("_", 1)[1]))
+                if sp is not None:
+                    sp.setValue(v)
+                self._auto_fx_last[dest] = v
+
+    def _auto_fx_idle(self):
+        """The section stopped: the gestures' knobs back to their base."""
+        g = self._auto_fx_gest
+        if g is None:
+            return
+        for dest, v in g.rest().items():
+            sp = self.afx.get(tuple(dest[4:].split("_", 1)))
+            if sp is not None:
+                sp.setValue(v)
+        self._auto_fx_gest = None
+        self._auto_fx_last = {}
 
     # ---- the repeat
     def _rep_hold(self, source, on):
@@ -10231,6 +10270,7 @@ program.</li>
             if self._perf_sounding:                    # our section just stopped (on the bar,
                 self._perf_sounding = False            # or the output closed): the peers stop
                 self._link_transport(False)            # with it; idling alone sends nothing
+                self._auto_fx_idle()                   # the gestures' knobs back to base
                 if "ui" in self._rep_sources:          # the latched repeat ends with it
                     self._rep_hold("ui", False)
                 if "ui" in self._brake_sources:        # and the latched tape stop
@@ -10306,6 +10346,7 @@ program.</li>
         pos = pl.pos_s()
         bar_pos = pos * pl.bpm / 60.0 / 4                # bars into the loop
         bar = int(bar_pos) + 1
+        self._auto_fx_tick(bar_pos * 4.0)                # the auto fx moves, on the loop
         busy = self._perf_busy
         ready = "next ready" if self._perf_ready else (
             "" if not busy else f"randomizing {busy[1]}..." if busy[0] == "shuffle" else "rendering next...")
