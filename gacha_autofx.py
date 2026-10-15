@@ -36,7 +36,7 @@ racks' delays follow the beat, so what auto fx sets lands in time.
 import random
 
 import gacha_engine as E
-from gacha_fx import AUDIO_FX, STEM_CHANNELS
+from gacha_fx import AUDIO_FX, STEM_CHANNELS, VOICES, VOICES
 
 FX_KEYS = {k for k, *_ in AUDIO_FX}
 
@@ -159,29 +159,33 @@ AUTO_LFO = {
 }
 
 
-def plan_lfos(style, rng=None):
-    """The LFOs for `style` (AUTO_LFO), each drawn with its chance: a list
-    of slot settings as the GUI's LFO rows take them, {dest, shape, rate,
-    depth, unipolar, mode}; [] for a style without any."""
+def plan_lfos(style, rng=None, table=None, channels=STEM_CHANNELS):
+    """The LFOs for `style` (`table`: AUTO_LFO, the stems', or
+    AUTO_LFO_VOICES), each drawn with its chance: a list of slot settings
+    as the GUI's LFO rows take them, {dest, shape, rate, depth, unipolar,
+    mode}; [] for a style without any."""
     rng = rng or random.Random()
+    table = AUTO_LFO if table is None else table
     out = []
-    for stem, knob, shape, rate, depth, unipolar, chance in AUTO_LFO.get(style, ()):
-        if stem in STEM_CHANNELS and knob in FX_KEYS and rng.random() < chance:
-            out.append({"dest": f"afx_{stem}_{knob}", "shape": shape, "rate": rate,
+    for ch, knob, shape, rate, depth, unipolar, chance in table.get(style, ()):
+        if ch in channels and knob in FX_KEYS and rng.random() < chance:
+            out.append({"dest": f"afx_{ch}_{knob}", "shape": shape, "rate": rate,
                         "depth": depth, "unipolar": unipolar, "mode": "cycle"})
     return out
 
 
-def plan(style, rng=None):
+def plan(style, rng=None, table=None, channels=STEM_CHANNELS):
     """The racks for `style` (a feel's name, gacha_engine.STYLE_FEEL):
-    {(stem, knob): amount} drawn from AUTO_FX, or from the feel's favoured
-    chain effects for a style without a row (the first on the layers, the
-    second on the chops, 0.2 to 0.35); {} for the default feel and for
+    {(channel, knob): amount} drawn from `table` (AUTO_FX, the stems', or
+    AUTO_FX_VOICES, the drum voices'), or for the stems of a style without
+    a row from the feel's favoured chain effects (the first on the layers,
+    the second on the chops, 0.2 to 0.35); {} for the default feel and for
     nothing to say."""
     rng = rng or random.Random()
+    table = AUTO_FX if table is None else table
     out = {}
-    rows = AUTO_FX.get(style)
-    if rows is None:
+    rows = table.get(style)
+    if rows is None and table is AUTO_FX:
         feel = E.STYLE_FEEL.get(style)
         if feel is None:
             return out
@@ -189,9 +193,9 @@ def plan(style, rng=None):
         knobs = [k for k in knobs if k]
         rows = tuple((stem, knob, (0.2, 0.35), 0.8)
                      for stem, knob in zip(("layers", "chops"), knobs[:2]))
-    for stem, knob, (lo, hi), chance in rows:
-        if stem in STEM_CHANNELS and knob in FX_KEYS and rng.random() < chance:
-            out[(stem, knob)] = round(rng.uniform(lo, hi), 2)
+    for ch, knob, (lo, hi), chance in rows or ():
+        if ch in channels and knob in FX_KEYS and rng.random() < chance:
+            out[(ch, knob)] = round(rng.uniform(lo, hi), 2)
     return out
 
 
@@ -278,14 +282,16 @@ AUTO_GESTURES = {
                  throw("chops", "reverse", (0.6, 0.8), 2.0, 1.0, (1, 2), 0.4)),
     "footwork": (throw("chops", "delay", (0.5, 0.7), 0.5, 0.25, (3, 6), 0.7),
                  throw("chops", "pitch", (0.4, 0.7), 0.5, 0.25, (2, 4), 0.5),
-                 throw("drums", "lofi", (0.7, 0.9), 0.5, 0.5, (1, 3), 0.4)),
+                 throw("drums", "lofi", (0.7, 0.9), 0.5, 0.5, (1, 3), 0.4),
+                 throw("chops", "lofi", (0.9, 1.0), 0.25, 0.25, (2, 4), 0.5)),
     "clave": (onbar("events", "delay", (0.5, 0.7), 1.0, "even", 3, 0.5),
               onbar("events", "reverb", (0.5, 0.7), 1.0, "last", 3, 0.4)),
     "idm": (throw("chops", "delay", (0.6, 0.8), 0.5, 0.25, (3, 6), 0.8),
             throw("chops", "crush", (0.6, 0.8), 1.0, 1.0, (1, 3), 0.7),
             throw("events", "reverse", (0.7, 0.9), 2.0, 1.0, (1, 2), 0.6),
             throw("chops", "pitch", (-0.9, -0.5), 1.0, 0.5, (1, 3), 0.5, "out"),
-            throw("drums", "lofi", (0.8, 1.0), 0.5, 0.5, (1, 3), 0.5)),
+            throw("drums", "lofi", (0.8, 1.0), 0.5, 0.5, (1, 3), 0.5),
+            throw("chops", "lofi", (0.9, 1.0), 0.25, 0.25, (3, 6), 0.7)),
     "hypnotic": (count("chops", "delay", (0.4, 0.6), (5, 7), "last4", 0.7),
                  ramp("layers", "lowpass", (0.3, 0.5), "last4", "in", 0.4),
                  onbar("events", "reverb", (0.6, 0.8), 2.0, "last", 2, 0.4)),
@@ -298,7 +304,9 @@ AUTO_GESTURES = {
                throw("events", "reverse", (0.7, 0.9), 2.0, 1.0, (1, 2), 0.6),
                throw("drums", "lofi", (0.8, 1.0), 0.5, 0.5, (2, 4), 0.6),
                throw("chops", "pitch", (-0.9, -0.5), 1.0, 0.5, (1, 3), 0.6, "out"),
-               throw("layers", "crush", (0.5, 0.7), 0.5, 0.25, (2, 4), 0.5)),
+               throw("layers", "crush", (0.5, 0.7), 0.5, 0.25, (2, 4), 0.5),
+               throw("chops", "lofi", (0.9, 1.0), 0.25, 0.25, (4, 8), 0.8),
+               throw("events", "crush", (0.9, 1.0), 0.25, 0.25, (2, 4), 0.6)),
     "dub": (onbar("drums", "delay", (0.7, 0.9), 1.0, "even", 3, 0.9),
             ramp("events", "reverb", (0.7, 0.9), "last", "in", 0.7),
             ramp("layers", "lowpass", (0.6, 0.8), "last", "in", 0.6),
@@ -332,7 +340,8 @@ AUTO_GESTURES = {
     "industrial": (throw("drums", "crush", (0.6, 0.8), 1.0, 1.0, (3, 6), 0.8),
                    throw("chops", "drive", (0.5, 0.7), 2.0, 1.0, (1, 3), 0.6),
                    onbar("layers", "lofi", (0.8, 1.0), 4.0, "last", 0, 0.5),
-                   throw("drums", "lofi", (0.8, 1.0), 0.5, 0.5, (2, 4), 0.5)),
+                   throw("drums", "lofi", (0.8, 1.0), 0.5, 0.5, (2, 4), 0.5),
+                   throw("chops", "crush", (0.9, 1.0), 0.25, 0.25, (3, 6), 0.6)),
     "bruk": (throw("chops", "phaser", (0.5, 0.7), 2.0, 1.0, (1, 2), 0.5),
              onbar("drums", "delay", (0.4, 0.6), 1.0, "even", 3, 0.5)),
     "ambient": (ramp("layers", "reverb", (0.6, 0.8), "first4", "in", 0.8),
@@ -364,19 +373,23 @@ def _amount(rng, a):
     return round(rng.uniform(*a), 2) if isinstance(a, (list, tuple)) else float(a)
 
 
-def plan_gestures(style, rng=None, bars=8, exclude=()):
-    """A section's gestures from the style's palette (AUTO_GESTURES, the
-    default palette without one, none for the default feel): a list of
+def plan_gestures(style, rng=None, bars=8, exclude=(), table=None, default=None,
+                  channels=STEM_CHANNELS):
+    """A section's gestures from the style's palette (`table`:
+    AUTO_GESTURES, the stems', or AUTO_GESTURES_VOICES; `default` the
+    palette of a style without one; none for the default feel): a list of
     (dest, start_beat, length_beats, amount, shape). Knobs in `exclude`
     (ids an LFO holds) are left out."""
     rng = rng or random.Random()
     if style == "default":
         return []
+    table = AUTO_GESTURES if table is None else table
+    default = DEFAULT_GESTURES if default is None else default
     out = []
     loop = bars * 4
-    for g in AUTO_GESTURES.get(style, DEFAULT_GESTURES):
+    for g in table.get(style, default):
         dest = f"afx_{g['stem']}_{g['knob']}"
-        if g["stem"] not in STEM_CHANNELS or g["knob"] not in FX_KEYS or dest in exclude:
+        if g["stem"] not in channels or g["knob"] not in FX_KEYS or dest in exclude:
             continue
         if rng.random() >= g["chance"]:
             continue
@@ -433,3 +446,170 @@ class Gestures:
     def rest(self):
         """Every knob back to its base: the section stopped."""
         return {d: self.base.get(d, 0.0) for d in self.dests}
+
+
+# ---------------------------------------------------------------- the drum voices
+# The same three tables for the voices' racks (gacha_fx.VOICES: kick,
+# snare, hihat, ohat, ride, glitch (the hat stutter), sub), behind the
+# Perform tab's second tick, "auto fx drums": a reverb on the snare, the
+# snare thrown into the echo on the fourth beat of the even bars (the dub
+# classic), the codec on the snare for a 16th for glitch, drive on the
+# kick for gabber, the hats' highpass rising over the last four bars for
+# house. The voices' racks sit before the drums bus rack, so a stem move
+# on the drums channel and a voice move stack.
+
+AUTO_FX_VOICES = {
+    "four-floor": (("snare", "reverb", (0.2, 0.35), 0.8), ("ohat", "delay", (0.15, 0.3), 0.6)),
+    "breakbeat": (("snare", "drive", (0.15, 0.3), 0.7), ("hihat", "lofi", (0.15, 0.3), 0.5)),
+    "boom-bap": (("kick", "drive", (0.15, 0.3), 0.7), ("snare", "lofi", (0.2, 0.4), 0.7),
+                 ("hihat", "lowpass", (0.1, 0.25), 0.5)),
+    "halftime": (("snare", "reverb", (0.3, 0.5), 0.8), ("hihat", "delay", (0.1, 0.25), 0.5),
+                 ("sub", "drive", (0.1, 0.25), 0.5)),
+    "dnb": (("snare", "drive", (0.15, 0.3), 0.7), ("kick", "drive", (0.1, 0.2), 0.5),
+            ("hihat", "lofi", (0.15, 0.3), 0.5)),
+    "minimal": (("hihat", "delay", (0.2, 0.35), 0.7), ("snare", "phaser", (0.15, 0.3), 0.5)),
+    "ukg": (("snare", "reverb", (0.2, 0.35), 0.7), ("hihat", "chorus", (0.15, 0.3), 0.6)),
+    "dembow": (("snare", "reverb", (0.2, 0.35), 0.8), ("snare", "delay", (0.1, 0.25), 0.5)),
+    "one-drop": (("snare", "delay", (0.3, 0.5), 0.9), ("snare", "reverb", (0.2, 0.35), 0.7),
+                 ("hihat", "delay", (0.15, 0.3), 0.5)),
+    "footwork": (("snare", "delay", (0.15, 0.3), 0.6), ("glitch", "crush", (0.2, 0.4), 0.6)),
+    "clave": (("snare", "reverb", (0.2, 0.35), 0.8), ("ride", "delay", (0.15, 0.3), 0.5)),
+    "idm": (("snare", "crush", (0.2, 0.4), 0.7), ("glitch", "lofi", (0.3, 0.5), 0.7),
+            ("kick", "crush", (0.1, 0.2), 0.4)),
+    "hypnotic": (("snare", "delay", (0.3, 0.45), 0.8), ("hihat", "phaser", (0.2, 0.4), 0.7),
+                 ("ride", "delay", (0.2, 0.35), 0.5)),
+    "drone": (("kick", "reverb", (0.3, 0.5), 0.8), ("snare", "reverb", (0.4, 0.6), 0.7),
+              ("hihat", "delay", (0.2, 0.4), 0.5)),
+    "glitch": (("snare", "lofi", (0.2, 0.4), 0.7), ("glitch", "crush", (0.3, 0.5), 0.8),
+               ("hihat", "reverse", (0.15, 0.3), 0.5), ("kick", "crush", (0.1, 0.25), 0.5)),
+    "dub": (("snare", "delay", (0.35, 0.55), 0.95), ("snare", "reverb", (0.2, 0.35), 0.8),
+            ("hihat", "delay", (0.15, 0.3), 0.6), ("kick", "reverb", (0.05, 0.15), 0.4)),
+    "polyrhythm": (("snare", "delay", (0.25, 0.4), 0.8), ("hihat", "phaser", (0.15, 0.3), 0.5)),
+    "electro": (("snare", "reverb", (0.2, 0.35), 0.7), ("ride", "delay", (0.15, 0.3), 0.6),
+                ("kick", "drive", (0.1, 0.2), 0.4)),
+    "acid": (("kick", "drive", (0.15, 0.3), 0.7), ("snare", "delay", (0.15, 0.3), 0.5),
+             ("hihat", "highpass", (0.2, 0.35), 0.5)),
+    "jungle": (("snare", "drive", (0.15, 0.3), 0.7), ("snare", "reverse", (0.1, 0.25), 0.4),
+               ("hihat", "lofi", (0.15, 0.3), 0.5)),
+    "gabber": (("kick", "drive", (0.3, 0.5), 0.9), ("kick", "crush", (0.1, 0.25), 0.5),
+               ("snare", "reverb", (0.2, 0.35), 0.6)),
+    "jersey": (("snare", "reverb", (0.2, 0.35), 0.7), ("kick", "drive", (0.1, 0.2), 0.5)),
+    "gqom": (("kick", "reverb", (0.1, 0.25), 0.6), ("ride", "reverb", (0.3, 0.5), 0.7),
+             ("hihat", "lowpass", (0.2, 0.35), 0.5)),
+    "amapiano": (("snare", "reverb", (0.25, 0.4), 0.8), ("hihat", "delay", (0.15, 0.3), 0.6)),
+    "jazz": (("ride", "reverb", (0.25, 0.4), 0.9), ("snare", "reverb", (0.2, 0.35), 0.8),
+             ("kick", "lowpass", (0.1, 0.25), 0.5)),
+    "industrial": (("kick", "drive", (0.3, 0.5), 0.9), ("snare", "crush", (0.3, 0.5), 0.8),
+                   ("hihat", "lofi", (0.2, 0.4), 0.7), ("ride", "drive", (0.2, 0.4), 0.5)),
+    "bruk": (("snare", "reverb", (0.2, 0.35), 0.7), ("hihat", "phaser", (0.15, 0.3), 0.5)),
+    "ambient": (("kick", "reverb", (0.4, 0.6), 0.9), ("kick", "lowpass", (0.2, 0.4), 0.6)),
+    "motorik": (("snare", "delay", (0.2, 0.35), 0.7), ("hihat", "phaser", (0.2, 0.35), 0.6)),
+    "afrobeat": (("snare", "reverb", (0.15, 0.3), 0.7), ("hihat", "chorus", (0.1, 0.25), 0.5)),
+    "cumbia": (("snare", "reverb", (0.2, 0.35), 0.8), ("ride", "delay", (0.15, 0.3), 0.5)),
+}
+
+AUTO_LFO_VOICES = {
+    "four-floor": (("hihat", "highpass", "saw up", "4 bars", 0.5, True, 0.5),),
+    "hypnotic": (("hihat", "phaser", "sine", "8 bars", 0.5, True, 0.7),),
+    "drone": (("kick", "lowpass", "sine", "8 bars", 0.4, True, 0.6),),
+    "glitch": (("glitch", "pitch", "random step", "1/16", 0.6, False, 0.7),
+               ("snare", "crush", "square", "1/8", 0.5, True, 0.5)),
+    "idm": (("snare", "pitch", "random step", "1/8", 0.5, False, 0.6),),
+    "acid": (("hihat", "highpass", "saw down", "1/2", 0.4, True, 0.5),),
+    "minimal": (("hihat", "phaser", "sine", "4 bars", 0.4, True, 0.6),),
+    "motorik": (("hihat", "phaser", "sine", "8 bars", 0.5, True, 0.7),),
+    "ambient": (("kick", "lowpass", "sine", "8 bars", 0.4, True, 0.6),),
+    "footwork": (("glitch", "pitch", "random step", "1/4", 0.5, False, 0.5),),
+    "jersey": (("snare", "pitch", "random step", "1/8", 0.4, False, 0.5),),
+    "industrial": (("snare", "lofi", "square", "1/2", 0.5, True, 0.5),),
+}
+
+DEFAULT_GESTURES_VOICES = (
+    onbar("snare", "delay", (0.5, 0.7), 1.0, [4, 8], 3, 0.5),
+    onbar("snare", "reverb", (0.6, 0.8), 1.0, "last", 3, 0.4),
+)
+
+AUTO_GESTURES_VOICES = {
+    "four-floor": (ramp("hihat", "highpass", (0.5, 0.7), "last4", "in", 0.5),
+                   onbar("snare", "reverb", (0.6, 0.8), 1.0, "last", 3, 0.6),
+                   onbar("snare", "delay", (0.5, 0.7), 1.0, [4, 8], 3, 0.6)),
+    "breakbeat": (throw("snare", "reverse", (0.7, 0.9), 1.0, 0.5, (1, 3), 0.6),
+                  throw("hihat", "crush", (0.5, 0.7), 1.0, 1.0, (1, 2), 0.5),
+                  onbar("snare", "delay", (0.5, 0.7), 1.0, "even", 3, 0.6)),
+    "boom-bap": (onbar("snare", "delay", (0.4, 0.6), 1.0, [4, 8], 3, 0.6),
+                 throw("hihat", "lofi", (0.6, 0.8), 2.0, 1.0, (1, 2), 0.4)),
+    "halftime": (onbar("snare", "reverb", (0.7, 0.9), 1.0, "last", 2, 0.6),
+                 throw("hihat", "delay", (0.5, 0.7), 0.5, 0.25, (2, 4), 0.5),
+                 throw("sub", "drive", (0.4, 0.6), 2.0, 1.0, (1, 2), 0.3)),
+    "dnb": (throw("snare", "reverse", (0.7, 0.9), 1.0, 0.5, (1, 3), 0.6),
+            onbar("snare", "delay", (0.5, 0.7), 1.0, "even", 3, 0.6),
+            throw("hihat", "crush", (0.5, 0.7), 1.0, 1.0, (1, 2), 0.4)),
+    "minimal": (throw("hihat", "delay", (0.4, 0.6), 1.0, 1.0, (1, 3), 0.6),
+                onbar("snare", "reverb", (0.5, 0.7), 1.0, "last", 3, 0.3)),
+    "ukg": (throw("snare", "delay", (0.5, 0.7), 0.5, 0.25, (2, 4), 0.6),
+            throw("hihat", "pitch", (0.4, 0.7), 0.5, 0.25, (2, 4), 0.4)),
+    "dembow": (onbar("snare", "delay", (0.5, 0.7), 1.0, "even", 3, 0.6),),
+    "one-drop": (onbar("snare", "delay", (0.7, 0.9), 1.0, "even", 3, 0.9),
+                 throw("hihat", "reverse", (0.5, 0.7), 2.0, 1.0, (1, 2), 0.4),
+                 ramp("kick", "lowpass", (0.5, 0.7), "last", "in", 0.4)),
+    "footwork": (throw("snare", "delay", (0.5, 0.7), 0.5, 0.25, (3, 6), 0.6),
+                 throw("glitch", "crush", (0.6, 0.8), 0.5, 0.25, (2, 4), 0.5)),
+    "clave": (onbar("snare", "delay", (0.5, 0.7), 1.0, "even", 3, 0.5),
+              onbar("ride", "reverb", (0.5, 0.7), 1.0, "last", 3, 0.4)),
+    "idm": (throw("snare", "lofi", (0.9, 1.0), 0.25, 0.25, (4, 8), 0.8),
+            throw("kick", "crush", (0.6, 0.8), 0.5, 0.5, (2, 4), 0.6),
+            throw("hihat", "reverse", (0.6, 0.8), 1.0, 0.5, (1, 3), 0.5),
+            throw("snare", "pitch", (-0.9, -0.5), 0.5, 0.25, (2, 4), 0.5, "out")),
+    "hypnotic": (count("snare", "delay", (0.5, 0.7), (5, 7), "last4", 0.6),
+                 ramp("hihat", "highpass", (0.3, 0.5), "last4", "in", 0.4)),
+    "drone": (ramp("kick", "reverb", (0.6, 0.8), "first4", "in", 0.6),
+              onbar("snare", "reverse", (0.7, 0.9), 4.0, [3, 7], 0, 0.5)),
+    "glitch": (throw("snare", "lofi", (0.9, 1.0), 0.25, 0.25, (4, 8), 0.9),
+               throw("kick", "crush", (0.6, 0.8), 0.5, 0.5, (2, 4), 0.7),
+               throw("hihat", "reverse", (0.6, 0.8), 1.0, 0.5, (1, 3), 0.6),
+               throw("glitch", "pitch", (-0.9, -0.5), 0.5, 0.25, (2, 4), 0.6, "out"),
+               throw("ohat", "crush", (0.7, 0.9), 0.25, 0.25, (2, 4), 0.5),
+               throw("sub", "lofi", (0.8, 1.0), 0.25, 0.25, (1, 3), 0.4)),
+    "dub": (onbar("snare", "delay", (0.8, 1.0), 1.0, "even", 3, 0.95),
+            onbar("snare", "reverb", (0.6, 0.8), 1.0, "last", 3, 0.6),
+            throw("hihat", "reverse", (0.5, 0.7), 2.0, 1.0, (1, 2), 0.4),
+            ramp("kick", "lowpass", (0.5, 0.7), "last", "in", 0.4)),
+    "polyrhythm": (count("snare", "delay", (0.5, 0.7), (5, 7), "last4", 0.6),
+                   count("hihat", "reverb", (0.4, 0.6), (3, 5), "last2", 0.4)),
+    "electro": (onbar("snare", "delay", (0.5, 0.7), 1.0, "even", 3, 0.6),
+                throw("ride", "lofi", (0.6, 0.8), 1.0, 1.0, (1, 2), 0.4)),
+    "acid": (throw("hihat", "highpass", (0.7, 0.9), 0.25, 0.25, (4, 8), 0.6),
+             onbar("kick", "drive", (0.5, 0.7), 4.0, "last", 0, 0.5),
+             onbar("snare", "delay", (0.5, 0.7), 1.0, [4, 8], 3, 0.5)),
+    "jungle": (throw("snare", "reverse", (0.7, 0.9), 1.0, 0.5, (2, 4), 0.7),
+               throw("snare", "pitch", (-0.8, -0.5), 0.5, 0.25, (2, 4), 0.6, "out"),
+               onbar("snare", "delay", (0.5, 0.7), 1.0, "even", 3, 0.6),
+               throw("hihat", "crush", (0.5, 0.7), 1.0, 1.0, (1, 2), 0.4)),
+    "gabber": (onbar("kick", "drive", (0.7, 0.9), 4.0, "last", 0, 0.7),
+               throw("kick", "crush", (0.5, 0.7), 0.5, 0.5, (2, 4), 0.5),
+               onbar("snare", "reverb", (0.7, 0.9), 1.0, "last", 3, 0.5)),
+    "jersey": (throw("snare", "delay", (0.5, 0.7), 0.5, 0.25, (2, 4), 0.6),
+               throw("kick", "pitch", (0.4, 0.7), 0.5, 0.25, (2, 4), 0.5),
+               onbar("snare", "reverb", (0.6, 0.8), 1.0, "last", 3, 0.4)),
+    "gqom": (onbar("ride", "reverb", (0.6, 0.8), 1.0, "even", 3, 0.6),
+             ramp("kick", "lowpass", (0.6, 0.8), "last", "in", 0.5),
+             throw("hihat", "reverse", (0.6, 0.8), 2.0, 1.0, (1, 2), 0.4)),
+    "amapiano": (onbar("snare", "delay", (0.5, 0.7), 1.0, [4, 8], 3, 0.6),
+                 throw("hihat", "reverb", (0.5, 0.7), 2.0, 1.0, (1, 2), 0.4)),
+    "jazz": (onbar("ride", "reverb", (0.6, 0.8), 2.0, [4, 8], 2, 0.5),
+             throw("snare", "reverb", (0.6, 0.8), 1.0, 1.0, (1, 2), 0.4)),
+    "industrial": (throw("kick", "crush", (0.6, 0.8), 1.0, 1.0, (3, 6), 0.8),
+                   throw("snare", "lofi", (0.9, 1.0), 0.25, 0.25, (3, 6), 0.7),
+                   throw("hihat", "drive", (0.5, 0.7), 2.0, 1.0, (1, 3), 0.5),
+                   onbar("ride", "lofi", (0.8, 1.0), 4.0, "last", 0, 0.4)),
+    "bruk": (throw("snare", "phaser", (0.5, 0.7), 2.0, 1.0, (1, 2), 0.5),
+             onbar("snare", "delay", (0.4, 0.6), 1.0, "even", 3, 0.5)),
+    "ambient": (ramp("kick", "reverb", (0.6, 0.8), "first4", "in", 0.7),
+                ramp("kick", "lowpass", (0.5, 0.7), "last4", "out", 0.5)),
+    "motorik": (onbar("snare", "delay", (0.5, 0.7), 1.0, [8], 3, 0.5),
+                onbar("hihat", "reverb", (0.5, 0.7), 2.0, "last", 2, 0.4)),
+    "afrobeat": (throw("snare", "delay", (0.4, 0.6), 1.0, 1.0, (1, 3), 0.6),
+                 onbar("ride", "reverb", (0.5, 0.7), 1.0, "last", 3, 0.4)),
+    "cumbia": (throw("snare", "delay", (0.4, 0.6), 1.0, 1.0, (1, 3), 0.6),
+               onbar("ride", "reverb", (0.5, 0.7), 2.0, [8], 2, 0.5)),
+}
