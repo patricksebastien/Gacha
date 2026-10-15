@@ -75,6 +75,7 @@ from gacha_midi import (CYCLES_CHANNELS, CYCLES_FX_PARAMS, CYCLES_LISTS, CYCLES_
 from gacha_freeze import FREEZE
 from gacha_frag import (FRAG_DIRS, FRAG_DIVS, FRAG_PLAYS, FRAG_RATES, FRAG_UNITS, FRAGMENTS,
                         MAX_VOICES)
+import gacha_autofx
 from gacha_fx import (ALL_CHANNELS, AUDIO_FX, BIPOLAR, CHANNELS, FX_SET, FX_SETTINGS,
                       VOICE_LABELS, VOICES)
 from gacha_erae import (ERAE_AVAILABLE, PORT as ERAE_PORT, EraeSurface, PAGES as ERAE_PAGES,
@@ -5323,7 +5324,21 @@ program.</li>
             "the drop. Remembered; takes effect from the next break.")
         self.perf_gap.setChecked(self.settings.value("perform/gap", False, type=bool))
         self.perf_gap.toggled.connect(self._perf_gap_changed)
-        form.addRow("Break", self._row([("", glitch_btn), ("", break_btn), ("", self.perf_gap)]))
+        self.perf_auto_fx = QCheckBox("auto fx")
+        self.perf_auto_fx.setToolTip(
+            "Every section that starts (and a song started through the racks) has the "
+            "four stems' racks (Audio FX tab: drums, layers, chops, events) reset and a "
+            "few knobs set for its feel: a reverb on the layers and a reverse delay on "
+            "the chops for drone, dub echoes on the chops and the events for dub, a "
+            "crusher on the chops for glitch, drive on the drums for gabber... drawn "
+            "with some chance, so two sections in one style differ; the log says what "
+            "was set. The live input's and the drum voices' racks are left alone. "
+            "Ticked while a section plays, it sets them now; unticked, the knobs stay "
+            "where they are (all off clears them). Remembered.")
+        self.perf_auto_fx.setChecked(self.settings.value("perform/auto_fx", False, type=bool))
+        self.perf_auto_fx.toggled.connect(self._auto_fx_changed)
+        form.addRow("Break", self._row([("", glitch_btn), ("", break_btn), ("", self.perf_gap),
+                                        ("", self.perf_auto_fx)]))
         form.addRow("Stems", stems_row)
         drums_at = form.rowCount()                     # the Drums row goes right under
         # the repeat: held from a key, a note or this latching button
@@ -7714,6 +7729,7 @@ program.</li>
         self.keep_takes.setChecked(sv("takes/keep", True, type=bool))
         self.level_takes.setChecked(sv("takes/level", True, type=bool))
         self.perf_gap.setChecked(sv("perform/gap", False, type=bool))
+        self.perf_auto_fx.setChecked(sv("perform/auto_fx", False, type=bool))
         combo(self.rep_div, "perform/rep_div", REPEAT_DEFAULT)
         combo(self.speed_sync, "perform/speed_sync", SPEED_SYNC_DEFAULT)
         combo(self.pitch_mode, "perform/pitch", PITCH_MODES[0])
@@ -9572,6 +9588,8 @@ program.</li>
         self._perf_playing = sec
         self._perf_current = (sec, stems, self.through.sr)   # what a start brings back
         self.perf_next_btn.setText("next section")           # from here on N moves on
+        self._auto_fx_apply(getattr(sec, "feel", None) or getattr(sec, "drum_style", None),
+                            getattr(sec, "seed", None))
         wait = "" if bar_t0 is None or bar_t0 <= time.monotonic() \
             else f", on the Link bar in {bar_t0 - time.monotonic():.1f} s"
         self.log.appendPlainText(f"section: {sec.kind} {sec.bpm:.0f} bpm, "
@@ -9801,6 +9819,29 @@ program.</li>
         self.settings.setValue("perform/gap", bool(on))
         if self.through is not None:
             self.through.player.gap = bool(on)
+
+    def _auto_fx_changed(self, on):
+        self.settings.setValue("perform/auto_fx", bool(on))
+        sec = self._perf_playing
+        if on and sec is not None:                    # the section playing gets its racks now
+            self._auto_fx_apply(getattr(sec, "feel", None) or getattr(sec, "drum_style", None),
+                                getattr(sec, "seed", None))
+
+    def _auto_fx_apply(self, style, seed=None):
+        """Auto fx: the four stems' racks reset, then the style's plan
+        (gacha_autofx.plan) onto their knobs in the Audio FX grid, so the
+        racks take it and the grid shows it. The live input's and the
+        voices' racks are left alone."""
+        if not getattr(self, "perf_auto_fx", None) or not self.perf_auto_fx.isChecked():
+            return
+        if not style or not hasattr(self, "afx"):
+            return
+        rng = random.Random(seed) if seed is not None else random.Random()
+        p = gacha_autofx.plan(style, rng)
+        for (ch, key), sp in self.afx.items():
+            if ch in STEMS and key != "vol":
+                sp.setValue(p.get((ch, key), 0.0))
+        self.log.appendPlainText(f"auto fx ({style}): {gacha_autofx.describe(p)}")
 
     # ---- the repeat
     def _rep_hold(self, source, on):
@@ -11059,6 +11100,8 @@ program.</li>
                     [(s["start_sec"], s["end_sec"], s.get("root"), s.get("mode"))
                      for s in meta.get("sections") or [] if "start_sec" in s],
                     {int(b): str(name) for b, name in meta.get("sub_notes") or []})
+            if self.through is not None and self.through.running:   # through the racks
+                self._auto_fx_apply(meta.get("feel") or meta.get("style"), meta.get("seed"))
             self._sections = meta["sections"]
             self._sec_bounds = [int(s["start_sec"] * 1000)
                                 for s in self._sections]
