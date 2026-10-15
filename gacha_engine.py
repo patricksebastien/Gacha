@@ -612,13 +612,24 @@ def render_sub(hits, n_total, phaser_amt, pan, release):
     phaser and panned left by `pan`. Returns a stereo buffer, not yet
     level-matched."""
     osc = np.zeros(n_total, dtype="float32")
-    for pos, midi, n in hits:
+    for hit in hits:
+        pos, midi, n = hit[:3]                  # (pos, midi, length[, gain[, from_midi]])
+        gain = hit[3] if len(hit) > 3 else 1.0
+        frm = hit[4] if len(hit) > 4 else None
         n = min(n, n_total - pos)
         if n <= 0:
             continue
         f = 440.0 * 2 ** ((midi - 69) / 12)
-        t = np.arange(n) / SR
-        osc[pos:pos + n] += np.sin(2 * np.pi * f * t) * adsr(n, release=release)
+        if frm is None:
+            t = np.arange(n) / SR
+            wave = np.sin(2 * np.pi * f * t)
+        else:                                   # a slide: the pitch glides in over 60 ms
+            f0 = 440.0 * 2 ** ((frm - 69) / 12)
+            glide = min(n, int(0.06 * SR))
+            fa = np.full(n, f)
+            fa[:glide] = np.linspace(f0, f, glide)
+            wave = np.sin(np.cumsum(2 * np.pi * fa / SR))
+        osc[pos:pos + n] += wave * adsr(n, release=release) * gain
     phased = osc
     if phaser_amt > 0:
         phased = Pedalboard([Phaser(rate_hz=0.2, depth=phaser_amt,
@@ -867,7 +878,11 @@ SYNTH_FLAVOUR = {                     # drum style -> synth flavour (auto)
     "four-floor": "house", "ukg": "house", "minimal": "house",
     "one-drop": "house", "boom-bap": "house",
     "halftime": "techno", "idm": "techno", "dembow": "techno", "clave": "techno",
-    "hypnotic": "techno",
+    "hypnotic": "techno", "drone": "techno", "glitch": "techno", "dub": "house",
+    "polyrhythm": "techno", "electro": "house", "acid": "techno", "jungle": "dnb",
+    "gabber": "techno", "jersey": "house", "gqom": "techno", "amapiano": "house",
+    "jazz": "house", "industrial": "techno", "bruk": "house", "ambient": "techno",
+    "motorik": "techno", "afrobeat": "house", "cumbia": "house",
     "dnb": "dnb", "breakbeat": "dnb", "footwork": "dnb",
 }
 
@@ -1037,7 +1052,9 @@ def humanize_time(rng, amount):
 
 DRUM_STYLES = ["four-floor", "breakbeat", "boom-bap", "halftime", "dnb",
                "minimal", "ukg", "dembow", "one-drop", "footwork", "clave",
-               "idm", "hypnotic"]
+               "idm", "hypnotic", "drone", "glitch", "dub", "polyrhythm",
+               "electro", "acid", "jungle", "gabber", "jersey", "gqom", "amapiano",
+               "jazz", "industrial", "bruk", "ambient", "motorik", "afrobeat", "cumbia"]
 
 
 # open hat placement per style: candidate steps and the chance each one
@@ -1050,6 +1067,13 @@ OPEN_HAT = {
     "minimal": ((2, 6, 10, 14), 0.15), "footwork": ((14,), 0.3),
     "clave": ((6, 14), 0.3), "idm": (tuple(range(1, 16, 2)), 0.15),
     "hypnotic": ((2, 6, 10, 14), 0.2),
+    "drone": ((8,), 0.3), "glitch": (tuple(range(1, 16, 2)), 0.1),
+    "dub": ((2, 6, 10, 14), 0.5), "polyrhythm": ((2, 6, 10, 14), 0.3),
+    "electro": ((2, 6, 10, 14), 0.5), "acid": ((2, 6, 10, 14), 0.6), "jungle": ((6, 14), 0.25),
+    "gabber": ((2, 6, 10, 14), 0.3), "jersey": ((2, 6, 10, 14), 0.3), "gqom": ((8,), 0.3),
+    "amapiano": ((2, 6, 10, 14), 0.3), "jazz": ((4, 12), 0.2), "industrial": ((2, 6, 10, 14), 0.2),
+    "bruk": ((2, 6, 10, 14), 0.4), "ambient": ((8,), 0.2), "motorik": ((2, 6, 10, 14), 0.1),
+    "afrobeat": ((2, 6, 10, 14), 0.4), "cumbia": ((8,), 0.2),
 }
 
 
@@ -1078,6 +1102,13 @@ class Feel:
     fill: float = 0.6                 # a snare fill on a section's last bar
     ride: float = 0.35                # a ride in a groove
     sub: float = 1.0                  # x the sub's per-bar chance, capped at 1
+    sub_hold: float = 1.0             # beats the sub holds before its release
+    sub_line: tuple | None = None     # the sub as a 16th line instead of a note a bar: its
+                                      # semitones from the root (acid), with accents and slides
+    drums: float = 1.0                # the chance the drums play at all in a groove (ambient)
+    swing_8ths: bool = False          # the swing on the offbeat 8ths (twice as far) instead of the
+                                      # odd 16ths: the jazz shuffle
+    kick_drive: float = 0.0           # drive on the kick's hits (gabber)
     ratchet: float = 0.0              # a hit's chance of being a roll inside its 16th (the hats
                                       # most, the snare, the ride and the kick less, RATCHET_ROLE)
     ratchet_counts: tuple = (2, 2, 3, 4)   # the roll's hits, 32nds to 64ths
@@ -1104,6 +1135,9 @@ class Feel:
     chop_rev: float = 0.2             # a piece played backwards
     chop_swing: bool = False          # the chops' odd 16ths swung with the drums
     chop_gain: float = 1.0            # x the chop gain
+    chop_grid: str = "16th"           # the chops' grid: 16th, or triplet (12 a bar, 8th triplets)
+    chop_rebar: float = 0.0           # the chance the chop pattern is drawn again each bar
+    chop_pitch: tuple | None = None   # the pieces pitched per step, semitones (a line)
     # the events (the one-shots)
     events: tuple = (1, 3)            # how many a section gets
     event_len: tuple = (1.0, 4.0)     # seconds of material
@@ -1238,6 +1272,203 @@ STYLE_FEEL = {
         chop=0.7, chop_period=(3, 5, 6, 7), chop_density=1.0, chop_pick=1, chop_len=(2, 4, 4),
         chop_rev=0.0, chop_gain=0.8,
         events=(0, 1), event_len=(3.0, 6.0), event_grid="bar", event_rev=0.7, event_gain=0.9),
+    "drone": Feel(
+        note="long sounds and short bursts: two or three textures stretched to 4 or 8 "
+             "bars and mostly reversed, a third louder, breathing, an octave down or up "
+             "through reverb, phaser, chorus and the ladder, never a crusher; the chops "
+             "a few one-16th bursts from two slices; one or two swells of 4 to 8 s on a "
+             "bar; no swing, few hits, the sub nearly every bar",
+        swing=(0.0, 0.0), humanize=0.5, mutation=0.3, glitch=0.2, fill=0.0, ride=0.3, sub=1.5,
+        layers=(2, 3), reverse=0.8, stretch=2.0, stretch_bars=(4, 8, 8), layer_level=1.3,
+        breathe=0.6, favour=("Reverb", "Phaser", "Chorus", "Ladder"), avoid=("Bitcrush", "GSM"),
+        pitch=(-12, -12, 0, 12, 19), delay=("long", "dub"),
+        chop=1.2, chop_density=0.12, chop_pick=2, chop_len=(1,), chop_rev=0.3,
+        events=(1, 2), event_len=(4.0, 8.0), event_grid="bar", event_rev=0.6, event_gain=1.2),
+    "glitch": Feel(
+        note="very short bursts: short loops reversed and stretched through crushers, "
+             "the codec and the pitch shift, slapback delays; chops of one 16th from "
+             "any slice, half backwards; three to six one-shots of 50 to 400 ms on the "
+             "16ths; machine timing, twice the mutation, three times the stutters, rolls "
+             "of 3 and 4",
+        swing=(0.0, 0.02), humanize=0.3, mutation=2.0, glitch=3.0, fill=0.5, ride=0.2,
+        ratchet=0.3, ratchet_counts=(3, 4, 4),
+        layers=(1, 2), layer_bars=(1, 1, 2), reverse=1.5, stretch=1.2, stretch_bars=(1, 2),
+        favour=("Bitcrush", "GSM", "PitchShift", "Saturator"),
+        pitch=(-12, -7, -5, -2, 0, 2, 5, 7, 12), delay=("short",),
+        chop=1.5, chop_density=0.5, chop_len=(1,), chop_rev=0.5,
+        events=(3, 6), event_len=(0.05, 0.4), event_grid="16th", event_rev=0.5, event_gain=1.1),
+    "dub": Feel(
+        note="delay and reverse: two or three textures in long loops, reversed more "
+             "often than not, through dub echoes, the chamber, the phaser and the "
+             "ladder, never a crusher; the chops a skank on the offbeat 8ths, swung, "
+             "nearly half backwards; echoing one-shots on beats 1 and 3, mostly "
+             "backwards; a swing, loose, the bass nearly every bar",
+        swing=(0.05, 0.12), humanize=1.2, mutation=0.5, glitch=0.3, fill=0.3, ride=0.3, sub=1.6,
+        layers=(2, 3), layer_bars=(2, 4, 4), reverse=1.6, stretch=0.8, stretch_bars=(2, 4),
+        layer_level=1.1, breathe=0.3,
+        favour=("Delay", "Reverb", "Phaser", "Ladder"), avoid=("Bitcrush", "GSM"),
+        pitch=(-12, -5, 0, 0, 7), delay=("dub", "dub", "dub", "long"),
+        chop=1.2, chop_steps=(2, 6, 10, 14), chop_density=0.7, chop_pick=2, chop_len=(1, 2, 2),
+        chop_rev=0.4, chop_swing=True,
+        events=(2, 4), event_len=(1.0, 4.0), event_grid="half", event_rev=0.6, event_gain=1.1),
+    "polyrhythm": Feel(
+        note="counts against the four: textures in loops of 3, 5 or 6 bars (stretched "
+             "to those too), so they come round against the 8; delays at 3, 5 and 7 "
+             "16ths; the chops one slice at a count of 3, 5 or 7 across the bars; rolls "
+             "in 3s and 5s; little mutation (it would break the count), few fills",
+        swing=(0.0, 0.02), humanize=0.6, mutation=0.3, glitch=0.5, fill=0.3, ride=0.7, sub=1.2,
+        ratchet=0.1, ratchet_counts=(3, 3, 5, 5),
+        layers=(1, 2), layer_bars=(3, 3, 5, 6), stretch_bars=(3, 5, 6),
+        favour=("Delay", "Phaser", "Reverb"), pitch=(-5, 0, 0, 5, 7, 12), delay=("poly", "poly", "med"),
+        chop=1.2, chop_period=(3, 5, 7), chop_density=0.9, chop_pick=2, chop_len=(1, 2),
+        chop_rev=0.1,
+        events=(2, 4), event_len=(0.5, 2.0)),
+    "electro": Feel(
+        note="808 electro: a machine, textures in 2 or 4 bar loops an octave down through "
+             "chorus, phaser and the codec, a stab on the 8ths from 2 slices, a quarter "
+             "backwards, short one-shots on the beat, the sub most bars",
+        swing=(0.0, 0.02), humanize=0.5, mutation=0.6, sub=1.3,
+        layers=(1, 2), layer_bars=(2, 4), favour=("Chorus", "Phaser", "GSM"),
+        pitch=(-12, -12, 0, 5, 7), delay=("short", "med"),
+        chop_steps=(0, 2, 4, 6, 8, 10, 12, 14), chop_density=0.45, chop_pick=2, chop_len=(1, 2),
+        chop_rev=0.25, event_len=(0.3, 1.5)),
+    "acid": Feel(
+        note="the 303: the sub a 16th line with accents and slides on each bar's root, one "
+             "short loop through the ladder breathing fast, a one-slice pitched chop line "
+             "through the ladder too, hardly an event, a machine",
+        swing=(0.0, 0.03), humanize=0.4, mutation=0.5, glitch=0.6, fill=0.3, ride=0.1, sub=2.5,
+        sub_line=(0, 0, 0, 12, 7, 3, -12), sub_hold=0.5,
+        layers=(1, 1), layer_bars=(1, 2), breathe=0.6, favour=("Ladder", "Phaser", "Delay"),
+        pitch=(-12, 0, 0, 12), delay=("short", "med"),
+        chop_density=0.5, chop_pick=1, chop_len=(1,), chop_pitch=(0, 0, 12, 7, 3), chop_rev=0.0,
+        events=(0, 1), event_len=(0.2, 1.0), event_grid="16th"),
+    "jungle": Feel(
+        note="the break re-cut: the chops a second break sliced to 8 and re-ordered most "
+             "bars, short, a third backwards; textures stretched to a bar, the reese an "
+             "octave down through drive and the ladder; rolls in 3s, fills on most last "
+             "bars, the sub on most bars and long",
+        swing=(0.0, 0.04), humanize=0.7, mutation=1.3, glitch=1.5, fill=0.8, ride=0.1, sub=1.5,
+        sub_hold=2.0, ratchet=0.15, ratchet_counts=(3, 3, 4),
+        layers=(1, 2), layer_bars=(1, 2), stretch=1.5, stretch_bars=(1, 1, 2),
+        favour=("Saturator", "Ladder", "PitchShift"), pitch=(-12, -12, -7, 0, 12),
+        delay=("short", "med"),
+        chop=1.5, chop_density=0.6, chop_len=(1, 1, 2), chop_rev=0.3, chop_rebar=0.7,
+        event_len=(0.3, 2.0), event_rev=0.5),
+    "gabber": Feel(
+        note="hardcore: the kick driven hard, one loop of a bar through drive and the "
+             "pitch shift up (the hoover), a stab on every beat from one slice, short loud "
+             "one-shots on the beat, a fill every last bar, no swing, the sub on most bars",
+        swing=(0.0, 0.0), humanize=0.3, mutation=0.6, glitch=1.2, fill=1.0, ride=0.2, sub=1.5,
+        kick_drive=0.85,
+        layers=(1, 1), layer_bars=(1, 1, 2), favour=("Saturator", "PitchShift", "Bitcrush"),
+        pitch=(0, 7, 12, 12), delay=("short",),
+        chop=1.3, chop_steps=(0, 4, 8, 12), chop_density=0.9, chop_pick=1, chop_len=(2, 2, 4),
+        chop_rev=0.0, events=(2, 4), event_len=(0.2, 1.0), event_gain=1.2),
+    "jersey": Feel(
+        note="jersey club: the chops on the triplet grid (12 a bar), one slice, half the "
+             "steps, the vocal stutter; short loops pitched up through the pitch shift and "
+             "chorus; short one-shots on the 16ths; a light swing, the sub most bars",
+        swing=(0.02, 0.06), humanize=0.6, mutation=0.8, fill=0.6, ride=0.1, sub=1.3,
+        layers=(1, 2), layer_bars=(1, 1, 2), favour=("PitchShift", "Chorus", "Reverb"),
+        pitch=(0, 5, 7, 12, 12), delay=("short", "med"),
+        chop=1.5, chop_grid="triplet", chop_density=0.5, chop_pick=1, chop_len=(1, 1, 2),
+        chop_rev=0.1, events=(2, 4), event_len=(0.2, 1.0), event_grid="16th", event_rev=0.3),
+    "gqom": Feel(
+        note="dark and sparse: loops of 2 or 4 bars an octave down through the ladder, "
+             "reverb and delay, never a chorus; chant-like chops of 2 to 4 16ths from one "
+             "slice on the kick's rests; a swell or two on a bar; loose, the sub nearly "
+             "every bar and held two beats",
+        swing=(0.0, 0.03), humanize=0.8, mutation=0.5, glitch=0.4, fill=0.3, ride=0.6, sub=1.6,
+        sub_hold=2.0,
+        layers=(1, 2), layer_bars=(2, 2, 4), favour=("Ladder", "Reverb", "Delay"), avoid=("Chorus",),
+        pitch=(-12, -12, -5, 0), delay=("med", "long"),
+        chop=1.2, chop_steps=(2, 3, 5, 7, 9, 11, 13, 15), chop_density=0.35, chop_pick=1,
+        chop_len=(2, 2, 4), chop_rev=0.1,
+        events=(1, 2), event_len=(2.0, 5.0), event_grid="bar", event_rev=0.4),
+    "amapiano": Feel(
+        note="the log drum: a pitched one-slice chop line on the offbeat 8ths and 16ths, "
+             "swung hard; two or three soft textures in 4 or 8 bar loops through chorus "
+             "and reverb; a long one-shot or two on a bar; a heavy swing, the sub most bars",
+        swing=(0.12, 0.2), mutation=0.5, glitch=0.4, fill=0.3, ride=0.3, sub=1.4,
+        layers=(2, 3), layer_bars=(4, 8, 8), layer_level=0.85,
+        favour=("Chorus", "Reverb", "Delay"), pitch=(0, 5, 7, 12), delay=("med", "long"),
+        chop=1.5, chop_steps=(2, 3, 6, 7, 10, 11, 14, 15), chop_density=0.5, chop_pick=1,
+        chop_len=(2, 2, 4), chop_pitch=(0, 0, 5, 7, 12, -5), chop_rev=0.0, chop_swing=True,
+        chop_gain=1.1, events=(1, 2), event_len=(1.0, 3.0), event_grid="bar"),
+    "jazz": Feel(
+        note="the ride leads: a triplet swing on the offbeat 8ths the chops take too, the "
+             "kick feathered, the snare comping at random; two or three long loops a fifth "
+             "up through reverb and chorus, never a crusher; sparse chops on the swung "
+             "8ths from 4 slices; a long one-shot or two on beats 1 and 3; no fills, loose",
+        swing=(0.3, 0.36), swing_8ths=True, humanize=1.3, mutation=1.2, glitch=0.1, fill=0.0,
+        ride=1.0, sub_hold=2.0,
+        layers=(2, 3), layer_bars=(4, 8), favour=("Reverb", "Chorus"), avoid=("Bitcrush", "GSM"),
+        pitch=(0, 5, 7, 12), delay=("med",),
+        chop=0.8, chop_steps=(0, 2, 4, 6, 8, 10, 12, 14), chop_density=0.3, chop_pick=4,
+        chop_len=(2, 2, 4), chop_rev=0.1, chop_swing=True,
+        events=(1, 2), event_len=(1.0, 4.0), event_grid="half", event_rev=0.5),
+    "industrial": Feel(
+        note="EBM: a machine, the kick driven a little, one slice hammered on every 8th and "
+             "a third of them backwards, loops of a bar through drive, the crusher and the "
+             "codec and never a reverb, short bursts on the 16ths, stutters, the sub most bars",
+        swing=(0.0, 0.0), humanize=0.2, mutation=0.8, glitch=1.8, fill=0.6, ride=0.5, sub=1.5,
+        ratchet=0.1, kick_drive=0.4,
+        layers=(1, 2), layer_bars=(1, 1, 2), favour=("Saturator", "Bitcrush", "GSM"),
+        avoid=("Reverb",), pitch=(-12, -5, 0, 0, 7), delay=("short",),
+        chop=1.3, chop_steps=(0, 2, 4, 6, 8, 10, 12, 14), chop_density=0.8, chop_pick=1,
+        chop_len=(1, 1, 2), chop_rev=0.35,
+        events=(2, 4), event_len=(0.1, 0.8), event_grid="16th", event_gain=1.1),
+    "bruk": Feel(
+        note="broken beat: the snare displaced a 16th, loose, a swing the chops take on the "
+             "displaced steps from 3 slices, loops of 2 or 4 bars through chorus, phaser "
+             "and reverb",
+        swing=(0.04, 0.1), humanize=1.4, glitch=0.6, fill=0.5, ride=0.3, sub=1.2,
+        layers=(1, 2), layer_bars=(2, 4), favour=("Chorus", "Phaser", "Reverb"),
+        pitch=(-5, 0, 5, 7), delay=("med",),
+        chop_steps=(3, 5, 11, 13), chop_density=0.6, chop_pick=3, chop_len=(1, 2), chop_swing=True),
+    "ambient": Feel(
+        note="no beat, or hardly: the drums in one groove in three (a kick on the one of "
+             "some bars), three or four textures stretched to 8 bars, reversed more often, "
+             "breathing, up the octaves through reverb, phaser and chorus, never drive or a "
+             "crusher; no chops; long swells on a bar, louder; the sub held a whole bar",
+        swing=(0.0, 0.0), humanize=0.5, mutation=0.0, glitch=0.0, fill=0.0, ride=0.0, sub=1.6,
+        sub_hold=4.0, drums=0.3,
+        layers=(3, 4), reverse=1.3, stretch=2.5, stretch_bars=(8, 8), layer_level=1.2, breathe=0.5,
+        favour=("Reverb", "Phaser", "Chorus"), avoid=("Bitcrush", "GSM", "Saturator"),
+        pitch=(-12, 0, 12, 19, 24), delay=("long", "dub"),
+        chop=0.0, events=(2, 4), event_len=(4.0, 8.0), event_grid="bar", event_rev=0.7,
+        event_gain=1.2),
+    "motorik": Feel(
+        note="krautrock: the same bar forever, the kick on every 8th, the ride through the "
+             "whole section, never a fill or a mutation; one loop of a bar through delay "
+             "and the phaser; one slice on every 8th; at most one long event; the sub "
+             "every bar",
+        swing=(0.0, 0.0), humanize=0.3, mutation=0.0, glitch=0.0, fill=0.0, ride=1.0, sub=1.6,
+        layers=(1, 1), layer_bars=(1, 1), reverse=0.3, stretch=0.3,
+        favour=("Delay", "Phaser"), pitch=(0, 0, 12), delay=("med", "short"),
+        chop_steps=(0, 2, 4, 6, 8, 10, 12, 14), chop_density=1.0, chop_pick=1, chop_len=(1, 1, 2),
+        chop_rev=0.0, events=(0, 1), event_len=(2.0, 4.0), event_grid="bar"),
+    "afrobeat": Feel(
+        note="Tony Allen's kit under short guitar loops: the kick on the one and the and of "
+             "3, the rim light with ghosts, the hats busy with the offbeats accented, the "
+             "horn stabs chopped on the offbeat 16ths from 2 slices and swung, loops of 1 "
+             "or 2 bars through chorus, delay and reverb, loose",
+        swing=(0.04, 0.1), humanize=1.3, mutation=0.8, glitch=0.3, fill=0.4, ride=0.6, sub=1.2,
+        layers=(1, 2), layer_bars=(1, 2, 2), favour=("Chorus", "Delay", "Reverb"),
+        pitch=(0, 0, 5, 7), delay=("short", "med"),
+        chop=1.2, chop_steps=(3, 6, 11, 14), chop_density=0.6, chop_pick=2, chop_len=(1, 2),
+        chop_rev=0.1, chop_swing=True, event_len=(0.5, 2.0)),
+    "cumbia": Feel(
+        note="the guacharaca and the caja under the accordion: the chops the accordion's "
+             "chord on the offbeat 8ths from 2 slices, swung a little; short loops of 1 or "
+             "2 bars through chorus, reverb and delay, a fifth or an octave up; a cowbell "
+             "from the ride; the bass on most bars, held a beat and a half; loose, light swing",
+        swing=(0.02, 0.08), humanize=1.2, mutation=0.5, glitch=0.2, fill=0.4, ride=0.4, sub=1.4,
+        sub_hold=1.5,
+        layers=(1, 2), layer_bars=(1, 2, 2), favour=("Chorus", "Reverb", "Delay"),
+        pitch=(0, 0, 5, 7, 12), delay=("short", "med"),
+        chop=1.3, chop_steps=(2, 6, 10, 14), chop_density=0.8, chop_pick=2, chop_len=(1, 2),
+        chop_rev=0.05, chop_swing=True, event_len=(0.5, 2.0)),
 }
 
 DEFAULT_FEEL = Feel()
@@ -1277,28 +1508,110 @@ def layer_range(k, feel):
     return lo, max(lo, hi)
 
 
+CHOP_GRIDS = {"16th": 16, "triplet": 12}        # steps a bar
+
+
 def chop_pattern(rng, feel, bars, n_slices=8):
-    """Where a section's chops land and which slice each plays: a list of
-    (step, slice) over the section's bars * 16 steps, and a piece's
-    longest length in 16ths. The style says which steps may hold one
-    (Feel.chop_steps, a bar's pattern repeated every bar), or a count
-    instead (Feel.chop_period: the same slice every 3, 5, 6 or 7 16ths
-    from a random start, running across the bars, Tenney's pulse), how
-    many of the 8 slices the pattern draws from, and how long a piece is."""
+    """Where a section's chops land, which slice each plays and at what
+    pitch: a list of (step, slice, semitones) over the section's bars *
+    spb steps, a piece's longest length in steps, and spb, the steps a
+    bar (16, or 12 on the triplet grid, Feel.chop_grid). The style says
+    which steps may hold one (Feel.chop_steps, a bar's pattern repeated
+    every bar, or drawn again by Feel.chop_rebar), or a count instead
+    (Feel.chop_period: the same slice every 3, 5, 6 or 7 steps from a
+    random start, running across the bars, Tenney's pulse), how many of
+    the 8 slices the pattern draws from, how long a piece is, and the
+    pitches (Feel.chop_pitch, 0 without)."""
+    spb = CHOP_GRIDS.get(feel.chop_grid, 16)
     picks = rng.sample(range(n_slices), max(1, min(n_slices, int(feel.chop_pick))))
+    pitch = lambda: rng.choice(feel.chop_pitch) if feel.chop_pitch else 0   # noqa: E731
     out = []
     if feel.chop_period:
         period = rng.choice(feel.chop_period)
-        for st in range(rng.randrange(period), bars * 16, period):
+        for st in range(rng.randrange(period), bars * spb, period):
             if rng.random() < feel.chop_density:
-                out.append((st, rng.choice(picks)))
+                out.append((st, rng.choice(picks), pitch()))
     else:
-        steps = feel.chop_steps if feel.chop_steps is not None else range(16)
-        pat = [(s, rng.choice(picks)) for s in steps
-               if 0 <= s < 16 and rng.random() < feel.chop_density]
+        steps = [s for s in (feel.chop_steps if feel.chop_steps is not None else range(spb))
+                 if 0 <= s < spb]
+
+        def draw():
+            pat = [(s, rng.choice(picks), pitch()) for s in steps
+                   if rng.random() < feel.chop_density]
+            if not pat and steps:                     # a sparse feel's empty draw: one chop at least
+                pat = [(rng.choice(steps), rng.choice(picks), pitch())]
+            return pat
+
+        pat = draw()
         for bi in range(bars):
-            out.extend((bi * 16 + s, idx) for s, idx in pat)
-    return out, rng.choice(feel.chop_len)
+            if bi and rng.random() < feel.chop_rebar:  # the break re-cut every bar (jungle)
+                pat = draw()
+            out.extend((bi * spb + s, idx, semis) for s, idx, semis in pat)
+    return out, rng.choice(feel.chop_len), spb
+
+
+def swung(step, feel):
+    """Whether a 16th step takes the swing: the odd 16ths, or with
+    Feel.swing_8ths the offbeat 8ths (which then move twice as far, see
+    swing_steps)."""
+    return step % 4 == 2 if feel.swing_8ths else step % 2 == 1
+
+
+def swing_steps(feel):
+    """How far a swung step moves, in multiples of the swing: twice for
+    the offbeat 8ths (a third of a step takes them to the triplet)."""
+    return 2 if feel.swing_8ths else 1
+
+
+def drive_layers(variants, amount):
+    """A voice's variants ([soft, mid, hard] each) driven: the kick of
+    gabber and hardcore, through the texture saturator."""
+    return [[saturate(layer, amount, bias=0.1, tone_hz=6000.0) for layer in layers]
+            for layers in variants]
+
+
+def pitch_clip(clip, semis):
+    """A clip pitched by `semis` the sampler's way: resampled, so up is
+    shorter and down longer; (n, 2) float32."""
+    if not semis:
+        return clip
+    rate = 2 ** (semis / 12)
+    n = max(2, int(len(clip) / rate))
+    x = np.linspace(0, len(clip) - 1, n)
+    idx = np.arange(len(clip))
+    return np.stack([np.interp(x, idx, clip[:, c]) for c in range(clip.shape[1])],
+                    axis=1).astype("float32")
+
+
+def sub_line_hits(rng, bars, bar_n, step_n, bar_midi, feel, chance):
+    """The sub as a 16th line (Feel.sub_line, the 303's way): a Euclidean
+    pattern of 7 to 11 hits a bar, drawn again now and then, each hit on
+    the bar's root plus one of the line's semitones, a third of them
+    accented, a third sliding from the note before. `bar_midi` is the
+    root per bar (None: a rest, an intro). Hits as render_sub takes them,
+    (pos, midi, length, gain, from_midi), and {bar: the root's name}."""
+    hits, notes = [], {}
+    pat = euclid(rng.randint(7, 11), 16, rng.randrange(16))
+    prev = None
+    for b in range(bars):
+        root = bar_midi[b] if b < len(bar_midi) else None
+        if root is None or rng.random() >= chance:
+            prev = None
+            continue
+        if rng.random() < 0.25:
+            pat = euclid(rng.randint(7, 11), 16, rng.randrange(16))
+        notes[b] = NOTE_NAMES[(root - SUB_LO) % 12]
+        for s in range(16):
+            if not pat[s]:
+                continue
+            midi = min(root + 19, max(root - 12, root + rng.choice(feel.sub_line)))
+            accent = rng.random() < 0.3
+            slide = prev is not None and rng.random() < 0.3
+            length = int(step_n * (1.6 if slide else 0.8))
+            hits.append((b * bar_n + s * step_n, midi, length, 1.0 if accent else 0.6,
+                         prev if slide else None))
+            prev = midi
+    return hits, notes
 
 
 RATCHET_ROLE = {"hihat": 1.0, "snare": 0.6, "ride": 0.3, "kick": 0.2}   # x Feel.ratchet per voice
@@ -1348,14 +1661,65 @@ def open_hat_pattern(rng, hihat, style):
     return closed, opened
 
 
+def euclid(k, n, rot=0):
+    """k hits spread as evenly as n steps allow (Bjorklund's, the Euclidean
+    rhythm: E(3, 8) is the tresillo, E(5, 16) five against the four),
+    turned by `rot` steps; a list of n 0/1."""
+    k = max(0, min(k, n))
+    pat = [0] * n
+    if k:
+        for i in range(k):
+            pat[(i * n) // k] = 1
+    rot %= max(1, n)
+    return pat[-rot:] + pat[:-rot] if rot else pat
+
+
+POLY_CYCLES = (5, 6, 7, 9, 10, 11)      # the short cycles a polymeter voice runs in, in 16ths
+
+
+def polymeter_tiles(rng, style):
+    """The voices that run their own short cycle across the bars, by style:
+    {role: tile}, a tile a list of velocities of POLY_CYCLES length laid
+    end to end from the section's first step (tile_bar), so its one
+    drifts against the bar and comes round after several. Only the
+    polyrhythm style has any; nothing is drawn for the others."""
+    if style != "polyrhythm":
+        return {}
+    tiles = {}
+    lens = rng.sample(POLY_CYCLES, 2)
+    for role, n in zip(("hihat", "ride"), lens):
+        k = max(2, round(n * rng.uniform(0.4, 0.6)))
+        hits = euclid(k, n, rng.randrange(n))
+        first = next((i for i, h in enumerate(hits) if h), 0)
+        tiles[role] = [(0.95 if i == first else rng.uniform(0.4, 0.65)) if h else 0.0
+                       for i, h in enumerate(hits)]
+    return tiles
+
+
+def tile_bar(tile, bar_i, steps=16):
+    """Bar `bar_i` of a polymeter voice: its tile laid end to end from
+    the section's first step, cut at the bar."""
+    n = len(tile)
+    return [tile[(bar_i * steps + s) % n] for s in range(steps)]
+
+
 def make_pattern(rng, role, style, steps=16):
     """A one-bar step pattern: list of velocities (0 = rest), 16th-note grid.
     The style decides the rhythmic skeleton for kick/snare/hihat."""
     pat = [0.0] * steps
     if role == "ride":
-        offset = rng.choice([0, 0, 2])              # on-beat or offbeat ride
-        for s in range(offset, steps, 4):
-            pat[s] = 1.0 if s % 8 == 0 else rng.uniform(0.6, 0.9)
+        if style == "jazz":                         # ding, ding-a-ding: the and before 2 and 4
+            for s in (0, 4, 8, 12):                 # swung onto the triplet by swing_8ths
+                pat[s] = 1.0 if s % 8 == 0 else rng.uniform(0.8, 0.95)
+            for s in (2, 10):
+                pat[s] = rng.uniform(0.55, 0.75)
+        elif style == "motorik":                    # every 8th, the same forever
+            for s in range(0, steps, 2):
+                pat[s] = 0.9 if s % 4 == 0 else 0.7
+        else:
+            offset = rng.choice([0, 0, 2])          # on-beat or offbeat ride
+            for s in range(offset, steps, 4):
+                pat[s] = 1.0 if s % 8 == 0 else rng.uniform(0.6, 0.9)
         return pat
 
     if style == "four-floor":
@@ -1515,6 +1879,235 @@ def make_pattern(rng, role, style, steps=16):
             for s in range(0, steps, div):
                 t = s / (steps - 1)
                 pat[s] = 0.3 + 0.4 * (t if rise > 0 else 1 - t)
+    elif style == "drone":                          # a kick on the one, little else
+        if role == "kick":
+            pat[0] = 1.0
+            if rng.random() < 0.3:
+                pat[8] = rng.uniform(0.5, 0.7)
+        elif role == "snare":
+            if rng.random() < 0.3:                  # a lone hit, late in the bar
+                pat[rng.choice([10, 12, 14])] = rng.uniform(0.3, 0.5)
+        else:                                       # a tick now and then
+            for s in range(0, steps, 4):
+                if rng.random() < 0.25:
+                    pat[s] = rng.uniform(0.2, 0.4)
+    elif style == "glitch":                         # bursts anywhere
+        if role == "kick":
+            pat[0] = 1.0
+            for s in rng.sample(range(1, steps), rng.randint(2, 5)):
+                pat[s] = rng.uniform(0.5, 1.0)
+        elif role == "snare":
+            for s in rng.sample(range(steps), rng.randint(2, 4)):
+                pat[s] = rng.uniform(0.3, 1.0)
+        else:
+            for s in range(steps):
+                if rng.random() < 0.5:
+                    pat[s] = rng.uniform(0.2, 1.0)
+    elif style == "dub":                            # steppers: the kick on the beat, the rim on 3
+        if role == "kick":
+            for s in (0, 4, 8, 12):
+                pat[s] = 1.0 if s in (0, 8) else rng.uniform(0.7, 0.9)
+        elif role == "snare":
+            pat[8] = 0.9
+            if rng.random() < 0.3:
+                pat[14] = rng.uniform(0.2, 0.4)     # a ghost before the one
+        else:                                       # the offbeat 8ths, light 16ths between
+            for s in (2, 6, 10, 14):
+                pat[s] = rng.uniform(0.6, 0.85)
+            for s in range(1, steps, 2):
+                if pat[s] == 0 and rng.random() < 0.3:
+                    pat[s] = rng.uniform(0.2, 0.4)
+    elif style == "polyrhythm":                     # counts against the four
+        if role == "kick":                          # the four, the pulse the rest is against
+            if rng.random() < 0.2:                  # now and then five against it instead
+                for s, h in enumerate(euclid(5, steps)):
+                    if h:
+                        pat[s] = 1.0 if s == 0 else rng.uniform(0.8, 0.95)
+            else:
+                for s in (0, 4, 8, 12):
+                    pat[s] = 1.0
+        elif role == "snare":                       # the cross-rhythm: 3, 5, 6 or 7 even hits
+            k = rng.choice([3, 5, 5, 6, 7])         # across the bar, resolving on the one
+            for s, h in enumerate(euclid(k, steps, rng.choice([0, 0, 1, 2]))):
+                if h:                               # on the four's beats hard, between soft
+                    pat[s] = rng.uniform(0.85, 1.0) if s % 4 == 0 else rng.uniform(0.45, 0.7)
+        else:                                       # the hats: a polymeter tile takes the
+            for s, h in enumerate(euclid(7, steps, rng.randrange(steps))):   # bars over
+                if h:
+                    pat[s] = rng.uniform(0.5, 0.8)
+    elif style == "electro":                        # 808: the kick in 3-3-2 figures
+        if role == "kick":
+            pat[0] = 1.0
+            if rng.random() < 0.6:
+                pat[6], pat[10] = 0.9, rng.uniform(0.75, 0.9)   # the and of 2, the and of 3
+            else:
+                pat[3], pat[6] = 0.9, 0.8                      # the tresillo
+                pat[8] = rng.uniform(0.8, 0.95)
+        elif role == "snare":
+            pat[4], pat[12] = 1.0, 1.0                  # the clap
+        else:                                       # 16ths, the offbeats open
+            for s in range(steps):
+                pat[s] = rng.uniform(0.4, 0.6) if s % 2 else rng.uniform(0.5, 0.7)
+    elif style == "acid":                           # the four under the line
+        if role == "kick":
+            for s in (0, 4, 8, 12):
+                pat[s] = 1.0
+        elif role == "snare":
+            if rng.random() < 0.6:
+                pat[4], pat[12] = 0.8, 0.8
+        else:
+            for s in (2, 6, 10, 14):
+                pat[s] = rng.uniform(0.7, 0.9)
+            for s in range(1, steps, 2):
+                if rng.random() < 0.3:
+                    pat[s] = rng.uniform(0.2, 0.4)
+    elif style == "jungle":                         # the break: kicks displaced, ghosts everywhere
+        if role == "kick":
+            pat[0], pat[10] = 1.0, rng.uniform(0.85, 1.0)
+            if rng.random() < 0.4:
+                pat[3] = rng.uniform(0.6, 0.8)
+            if rng.random() < 0.3:
+                pat[13] = rng.uniform(0.5, 0.7)
+        elif role == "snare":
+            pat[4], pat[12] = 1.0, 1.0
+            for s in (2, 7, 9, 11, 15):
+                if rng.random() < 0.35:
+                    pat[s] = rng.uniform(0.3, 0.5)
+        else:
+            for s in range(steps):
+                if rng.random() < 0.5:
+                    pat[s] = rng.uniform(0.4, 0.8)
+    elif style == "gabber":                         # the kick on every beat, and between in the drop
+        if role == "kick":
+            for s in (0, 4, 8, 12):
+                pat[s] = 1.0
+            if rng.random() < 0.5:
+                for s in (2, 6, 10, 14):
+                    pat[s] = 0.9
+        elif role == "snare":
+            if rng.random() < 0.3:                  # a roll into the next bar
+                for s in range(12, 16):
+                    pat[s] = rng.uniform(0.6, 0.9)
+        else:
+            for s in range(steps):
+                pat[s] = rng.uniform(0.5, 0.8)
+    elif style == "jersey":                         # the bed squeak: x..x..x.x..x..x.
+        if role == "kick":
+            for s in (0, 3, 6, 8, 11):
+                pat[s] = 1.0 if s in (0, 8) else rng.uniform(0.8, 0.95)
+            if rng.random() < 0.5:
+                pat[14] = 0.7
+        elif role == "snare":
+            pat[4], pat[12] = 1.0, 1.0                  # the clap
+        else:
+            for s in range(0, steps, 2):
+                pat[s] = rng.uniform(0.5, 0.7)
+    elif style == "gqom":                           # broken, with silences
+        if role == "kick":
+            pat[0] = 1.0
+            for s in (6, 8, 11):
+                if rng.random() < 0.6:
+                    pat[s] = rng.uniform(0.7, 0.95)
+        elif role == "snare":
+            pass                                    # none: the toms are the ride
+        else:
+            for s in (0, 8):
+                if rng.random() < 0.3:
+                    pat[s] = rng.uniform(0.3, 0.5)
+    elif style == "amapiano":                       # shakers, a sparse kick, the log drum is the chops
+        if role == "kick":
+            if rng.random() < 0.6:
+                pat[0] = 1.0
+            pat[6], pat[10] = rng.uniform(0.7, 0.9), rng.uniform(0.6, 0.85)
+        elif role == "snare":
+            if rng.random() < 0.5:
+                pat[12] = rng.uniform(0.3, 0.5)     # a rim
+        else:                                       # the shaker, the offbeats accented
+            for s in range(steps):
+                pat[s] = rng.uniform(0.5, 0.7) if s % 2 else rng.uniform(0.3, 0.45)
+    elif style == "jazz":                           # the ride leads (its own branch above)
+        if role == "kick":                          # feathered: felt, not heard
+            for s in (0, 4, 8, 12):
+                pat[s] = rng.uniform(0.25, 0.4)
+        elif role == "snare":                       # comping: a few hits anywhere, never loud
+            for s in rng.sample(range(steps), rng.randint(2, 4)):
+                pat[s] = rng.uniform(0.3, 0.7)
+        else:                                       # the hat foot on 2 and 4
+            pat[4], pat[12] = 0.5, 0.5
+    elif style == "industrial":                     # sequenced, every beat and 16th pairs
+        if role == "kick":
+            for s in (0, 4, 8, 12):
+                pat[s] = 1.0
+            for s in (1, 9):
+                if rng.random() < 0.4:
+                    pat[s] = 0.8
+        elif role == "snare":
+            pat[4], pat[12] = 1.0, 1.0
+            if rng.random() < 0.5:
+                pat[14] = 0.7
+        else:
+            for s in range(steps):
+                pat[s] = rng.uniform(0.6, 0.9)
+    elif style == "bruk":                           # the snare displaced a 16th
+        if role == "kick":
+            pat[0] = 1.0
+            for s in (7, 10):
+                if rng.random() < 0.7:
+                    pat[s] = rng.uniform(0.7, 0.9)
+        elif role == "snare":
+            pat[rng.choice([3, 5])] = 1.0
+            pat[rng.choice([11, 13])] = 1.0
+        else:
+            for s in range(steps):
+                pat[s] = rng.uniform(0.6, 0.85) if s % 4 == 2 else rng.uniform(0.3, 0.5)
+    elif style == "ambient":                        # a kick on the one of some bars
+        if role == "kick":
+            if rng.random() < 0.5:
+                pat[0] = rng.uniform(0.6, 0.8)
+        # no snare, no hats
+    elif style == "motorik":                        # the same bar forever
+        if role == "kick":
+            for s in range(0, steps, 2):
+                pat[s] = 1.0 if s % 4 == 0 else 0.85
+        elif role == "snare":
+            pat[4], pat[12] = 0.9, 0.9
+        else:
+            for s in range(0, steps, 2):
+                pat[s] = 0.6
+    elif style == "afrobeat":                       # Tony Allen: the one and the and of 3
+        if role == "kick":
+            pat[0], pat[10] = 1.0, rng.uniform(0.8, 0.95)
+            if rng.random() < 0.4:
+                pat[6] = rng.uniform(0.6, 0.8)
+            if rng.random() < 0.25:
+                pat[14] = rng.uniform(0.5, 0.7)
+        elif role == "snare":                       # the rim, light, ghosts around
+            pat[4], pat[12] = 0.6, 0.6
+            for s in (2, 7, 9, 15):
+                if rng.random() < 0.3:
+                    pat[s] = rng.uniform(0.25, 0.4)
+        else:                                       # busy, the offbeats accented
+            for s in range(steps):
+                pat[s] = rng.uniform(0.7, 0.9) if s in (2, 6, 10, 14) else rng.uniform(0.35, 0.6)
+    elif style == "cumbia":                         # the caja on the offbeats, the guacharaca
+        if role == "kick":                          # the one and the three, now and then all four
+            pat[0], pat[8] = 1.0, rng.uniform(0.85, 1.0)
+            if rng.random() < 0.3:
+                pat[4], pat[12] = 0.6, 0.6
+        elif role == "snare":                       # the caja: every offbeat 8th
+            for s in (2, 6, 10, 14):
+                pat[s] = rng.uniform(0.6, 0.8)
+            if rng.random() < 0.3:
+                pat[11] = rng.uniform(0.3, 0.45)    # a ghost into the four
+        else:                                       # the guacharaca: chk . chk-chk, every beat
+            for s in range(steps):
+                r = s % 4
+                if r == 0:
+                    pat[s] = rng.uniform(0.6, 0.75)
+                elif r == 2:
+                    pat[s] = rng.uniform(0.4, 0.55)
+                elif r == 3:
+                    pat[s] = rng.uniform(0.5, 0.65)
     elif style == "idm":                            # structured chaos
         if role == "kick":
             pat[0] = 1.0
@@ -1561,6 +2154,9 @@ def synced_delay(rng, beat, tiers=None):
     if tier == "dub":
         t = beat * rng.choice([0.75, 1.5, 3])      # dotted 8th, dotted 4th, dotted half
         fb, mix = rng.uniform(0.45, 0.6), rng.uniform(0.3, 0.45)
+    elif tier == "poly":
+        t = beat * rng.choice([0.75, 1.25, 1.75])  # 3, 5 and 7 16ths: echoes against the four
+        fb, mix = rng.uniform(0.35, 0.5), rng.uniform(0.25, 0.4)
     elif tier == "short":
         t = beat * rng.choice([0.125, 0.25])       # 1/32, 1/16: slapback
         fb, mix = rng.uniform(0.15, 0.35), rng.uniform(0.25, 0.5)
@@ -1728,6 +2324,12 @@ def compose(seed, duration, sample_files, intro_bars=None,
         print(f"  synth kit: {flavour}  levels " + " ".join(
             f"{r}={v:g}" for r, v in sgains.items() if v > 0))
 
+    if feel.kick_drive > 0 and kit.get("kick"):       # the kick driven (gabber)
+        kit["kick"] = drive_layers(kit["kick"], feel.kick_drive)
+        if synth:
+            synth["kick"] = [saturate(l, feel.kick_drive, bias=0.1, tone_hz=6000.0)
+                             for l in synth["kick"]]
+
     # ---- song structure ------------------------------------------------
     # split bars into sections; each section gets its own patterns/layers
     sections = []
@@ -1759,6 +2361,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
 
         pats = {r: make_pattern(rng, r, drum_style)
                 for r in ("kick", "snare", "hihat", "ride")}
+        tiles = polymeter_tiles(rng, drum_style)   # the voices on a short cycle of their own
         pats["hihat"], pats["ohat"] = open_hat_pattern(rng, pats["hihat"],
                                                        drum_style)
         intro_kind = intro_style if is_intro else None
@@ -1780,6 +2383,8 @@ def compose(seed, duration, sample_files, intro_bars=None,
             # ride shows up in some sections only
             if not is_intro and rng.random() < feel.ride:
                 active.append("ride")
+            if not is_intro and rng.random() >= feel.drums:   # a style with hardly a beat (ambient)
+                active = []
             # the open hat comes with the closed one, except in sparse intros
             if "hihat" in active and intro_kind != "sparse":
                 active.append("ohat")
@@ -1790,9 +2395,10 @@ def compose(seed, duration, sample_files, intro_bars=None,
                       if (gains[r] > 0 and kit[r]) or (sgains[r] > 0 and synth)]
             for bi in range(length):
                 bar_start = sec_start + int(bi * bar * SR)
-                bar_pats = {r: (mutate(rng, pats[r], k.mutation_amount)
+                base = {r: (tile_bar(tiles[r], bi) if r in tiles else pats[r]) for r in active}
+                bar_pats = {r: (mutate(rng, base[r], k.mutation_amount)
                                 if rng.random() < k.mutation_chance * feel.mutation
-                                else pats[r]) for r in active}
+                                else base[r]) for r in active}
                 # drum fill on the last bar of a section
                 if bi == length - 1 and rng.random() < feel.fill and "snare" in active:
                     p = list(bar_pats["snare"])
@@ -1812,8 +2418,8 @@ def compose(seed, duration, sample_files, intro_bars=None,
                         if role == "hihat" and ohat_pat[s] > 0:
                             continue                  # the open hat owns this step
                         pos = bar_start + int(s * step_len * SR)
-                        if s % 2 == 1:
-                            pos += int(swing)
+                        if swung(s, feel):
+                            pos += int(swing * swing_steps(feel))
                         pos += humanize_time(rng, humanize)
                         vel = humanize_vel(rng, vel, s, humanize)
                         reps = ratchet_hits(pos, vel, rolls[role].get(s, 1), step_len * SR)
@@ -1986,22 +2592,26 @@ def compose(seed, duration, sample_files, intro_bars=None,
             board, tail = random_texture_board(rng, beat, k.fx_min, k.fx_max,
                                                k.saturation, feel)
             tail = min(tail, 4 * beat)   # let echoes ring up to one bar
-            chop_pat, piece_steps = chop_pattern(rng, feel, length, n_slices)
-            max_slice = int(step_len * SR * piece_steps)
-            for st, idx in chop_pat:
+            chop_pat, piece_steps, spb = chop_pattern(rng, feel, length, n_slices)
+            cstep = bar * SR / spb                    # the chops' own step (triplets: 12 a bar)
+            max_slice = int(cstep * piece_steps)
+            for st, idx, semis in chop_pat:
                 piece = slices[idx][:max_slice]
                 p_off, p_rate = idx * sl, 1.0
                 if rng.random() < feel.chop_rev:
                     piece = piece[::-1]
                     p_off, p_rate = idx * sl + len(piece), -1.0
                 p_dur = len(piece)
+                if semis:                             # the line's pitch, the sampler's way
+                    piece = pitch_clip(piece, semis)
+                    p_rate *= 2 ** (semis / 12)
                 piece = piece * envelope(len(piece), decay_curve=2.0)
                 piece = apply_fx(piece, board, tail=tail)
                 if pan_events > 0:
                     piece = panned(piece, rng.uniform(-pan_events, pan_events))
-                cpos = sec_start + int(st * step_len * SR)
-                if feel.chop_swing and st % 2 == 1:
-                    cpos += int(swing)
+                cpos = sec_start + int(st * cstep)
+                if feel.chop_swing and spb == 16 and swung(st, feel):
+                    cpos += int(swing * swing_steps(feel))
                 put("chops", piece, cpos, k.chop_gain * feel.chop_gain)
                 ev(cpos, src, p_off, p_dur, p_rate, "chop")
             print(f"  sec{si} chops <- {src}")
@@ -2066,34 +2676,51 @@ def compose(seed, duration, sample_files, intro_bars=None,
 
     # ---- sub bass: one note per bar on its first kick ---------------------
     sub_notes = {}                               # global bar -> the note's name (the MIDI out)
-    if k.sub_level > 0 and kick_hits:
+    if feel.drums < 1.0 and not any(sections_meta[si]["kind"] != "intro"
+                                    for _p, si, _b, _s in kick_hits):
+        # a style whose drums sit out (ambient): the sub on the one of every bar past the intro
+        kick_hits += [(int(b * bar * SR), m["i"], b, 0)
+                      for m in sections_meta if m["kind"] != "intro"
+                      for b in range(m["start_bar"], m["start_bar"] + m["bars"])]
+    if k.sub_level > 0 and (kick_hits or feel.sub_line):
         sub_rng = root_rng
-        # one candidate per bar: its first kick (the start of the sequence)
-        first_kick = {}
-        for pos, si, bar_i, s in kick_hits:
-            if sections_meta[si]["kind"] == "intro":
-                continue                         # the sub enters at the drop
-            if bar_i not in first_kick or s < first_kick[bar_i][2]:
-                first_kick[bar_i] = (pos, si, s)
-        starts = []
-        for bar_i in sorted(first_kick):
-            if sub_rng.random() < k.sub_chance * feel.sub:   # weighted occurrence
-                pos, si, _ = first_kick[bar_i]
-                if k.sub_follow:                 # the bar's own pitch
-                    midi = sub_midi(bar_pc.get(bar_i, roots[si][0]))
-                else:
-                    midi = sub_midi(roots[si][0])
-                    if sub_rng.random() < 0.2:   # some bars sit on the fifth
-                        midi = midi + 7 if midi + 7 <= SUB_HI else midi - 5
-                starts.append((pos, midi))
-                sub_notes[bar_i] = NOTE_NAMES[(midi - SUB_LO) % 12]
-        hits = []
-        note_len = int((beat + k.sub_release) * SR)   # one-beat hold + release
-        for i, (pos, midi) in enumerate(starts):
-            nxt = starts[i + 1][0] if i + 1 < len(starts) else len(buf)
-            length = min(note_len, nxt - pos - int(0.01 * SR))
-            if length > int(0.05 * SR):
-                hits.append((pos, midi, length))
+        note_len = int((feel.sub_hold * beat + k.sub_release) * SR)   # the hold + release
+        if feel.sub_line:                        # a 16th line on each bar's root (acid)
+            bar_midi = [None] * n_bars           # None: the intro, the sub enters at the drop
+            for m in sections_meta:
+                if m["kind"] == "intro":
+                    continue
+                for b in range(m["start_bar"], m["start_bar"] + m["bars"]):
+                    bar_midi[b] = sub_midi(bar_pc.get(b, roots[m["i"]][0])) if k.sub_follow \
+                        else sub_midi(roots[m["i"]][0])
+            hits, sub_notes = sub_line_hits(sub_rng, n_bars, int(bar * SR), int(step_len * SR),
+                                            bar_midi, feel, k.sub_chance * feel.sub)
+        else:
+            # one candidate per bar: its first kick (the start of the sequence)
+            first_kick = {}
+            for pos, si, bar_i, s in kick_hits:
+                if sections_meta[si]["kind"] == "intro":
+                    continue                     # the sub enters at the drop
+                if bar_i not in first_kick or s < first_kick[bar_i][2]:
+                    first_kick[bar_i] = (pos, si, s)
+            starts = []
+            for bar_i in sorted(first_kick):
+                if sub_rng.random() < k.sub_chance * feel.sub:   # weighted occurrence
+                    pos, si, _ = first_kick[bar_i]
+                    if k.sub_follow:             # the bar's own pitch
+                        midi = sub_midi(bar_pc.get(bar_i, roots[si][0]))
+                    else:
+                        midi = sub_midi(roots[si][0])
+                        if sub_rng.random() < 0.2:   # some bars sit on the fifth
+                            midi = midi + 7 if midi + 7 <= SUB_HI else midi - 5
+                    starts.append((pos, midi))
+                    sub_notes[bar_i] = NOTE_NAMES[(midi - SUB_LO) % 12]
+            hits = []
+            for i, (pos, midi) in enumerate(starts):
+                nxt = starts[i + 1][0] if i + 1 < len(starts) else len(buf)
+                length = min(note_len, nxt - pos - int(0.01 * SR))
+                if length > int(0.05 * SR):
+                    hits.append((pos, midi, length))
         sub = render_sub(hits, len(buf), k.sub_phaser, k.sub_pan,
                          k.sub_release)
         active = np.abs(sub).sum(axis=1) > 1e-6
@@ -2101,7 +2728,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
             sub *= k.sub_level * rms(buf) / rms(sub[active])
             buf += sub
             stems["drums"] += sub
-        print(f"  sub: {len(hits)} notes over {len(first_kick)} bars")
+        print(f"  sub: {len(hits)} notes over {len(sub_notes)} bars")
 
     # ---- transitions into drops: repeater, gap, reverse cymbal ---------
     # a "drop" is the start of any non-break section; after an intro or a
