@@ -2163,7 +2163,7 @@ class Main(QMainWindow):
         self._shuffle_queue = []                    # parts asked for a shuffle, in turn
         self._shuffle_landing = []                  # parts handed to the player, not yet on the bar
         self._auto_fx_pending = None                # (style, seed) for the racks as a section lands
-        self._auto_fx_lfos = set()                  # the LFO slots auto fx filled, taken back next
+        self._auto_fx_lfos = {}                     # LFO slot -> the group ("stems", "drums") that filled it
         self._auto_fx_gest = None                   # gacha_autofx.Gestures: the moves on the loop clock
         self._auto_fx_last = {}                     # knob id -> the value the gestures wrote last
         self._perf_playing = None                   # Section on the player
@@ -5346,10 +5346,11 @@ All three sit next to the program.</li>
             "the last two, several at once, each style its own moves, drawn afresh per "
             "section. The log says what was set. The live input's and the drum voices' "
             "racks are left alone. "
-            "Ticked while a section plays, it sets them now; unticked, its moves stop and "
-            "the knobs stay at the plan's setting (all off clears them). Remembered.")
+            "Ticked while a section plays, it sets them now; unticked, everything it set "
+            "is cleared at once: the stems' effect knobs to 0, its LFOs off, its moves "
+            "stopped. Remembered.")
         self.perf_auto_fx.setChecked(self.settings.value("perform/auto_fx", False, type=bool))
-        self.perf_auto_fx.toggled.connect(self._auto_fx_changed)
+        self.perf_auto_fx.toggled.connect(lambda on: self._auto_fx_changed("stems", on))
         self.perf_auto_fx_drums = QCheckBox("auto fx drums")
         self.perf_auto_fx_drums.setToolTip(
             "The same for the drum voices' racks (kick, snare, hats, ride, the stutter, "
@@ -5358,10 +5359,11 @@ All three sit next to the program.</li>
             "on the fourth beat of the even bars for dub, the codec on the snare for a "
             "16th here and there for glitch, drive on the kick for gabber, the hats' "
             "highpass rising over the last four bars for house. Their racks sit before "
-            "the drums bus, so a stem move and a voice move stack. Remembered.")
+            "the drums bus, so a stem move and a voice move stack. Unticked, the voices' "
+            "effect knobs go to 0, its LFOs off, its moves stopped. Remembered.")
         self.perf_auto_fx_drums.setChecked(
             self.settings.value("perform/auto_fx_drums", False, type=bool))
-        self.perf_auto_fx_drums.toggled.connect(self._auto_fx_changed)
+        self.perf_auto_fx_drums.toggled.connect(lambda on: self._auto_fx_changed("drums", on))
         form.addRow("Break", self._row([("", glitch_btn), ("", break_btn), ("", self.perf_gap),
                                         ("", self.perf_auto_fx), ("", self.perf_auto_fx_drums)]))
         form.addRow("Stems", stems_row)
@@ -9846,49 +9848,76 @@ All three sit next to the program.</li>
         if self.through is not None:
             self.through.player.gap = bool(on)
 
-    def _auto_fx_changed(self, on):
+    AUTO_FX_GROUPS = {"stems": STEMS, "drums": VOICES}   # a tick's racks
+
+    def _auto_fx_changed(self, group, on):
+        """A tick: on, the section playing gets that group's racks now; off,
+        everything that group set is cleared at once (its LFO slots off,
+        its moves stopped, its racks' effect knobs to 0), the other tick's
+        work left as it is."""
         self.settings.setValue("perform/auto_fx", self.perf_auto_fx.isChecked())
         self.settings.setValue("perform/auto_fx_drums", self.perf_auto_fx_drums.isChecked())
+        if not on:
+            self._auto_fx_clear(group)
+            self.log.appendPlainText(f"auto fx {group}: off, its racks and LFOs cleared")
+            return
         sec = self._perf_playing
-        if not on:                                    # unticked: its moves stop now, the knobs
-            self._auto_fx_idle()                      # back to the plan's setting
-            if not (self.perf_auto_fx.isChecked() or self.perf_auto_fx_drums.isChecked()):
-                for i in self._auto_fx_lfos:          # and nothing ticked: our LFOs off too
-                    self.lfo_rows[i]["on"].setChecked(False)
-                self._auto_fx_lfos = set()
-                return
-        if sec is not None:                           # the section playing gets its racks now
+        if sec is not None:
             self._auto_fx_apply(getattr(sec, "feel", None) or getattr(sec, "drum_style", None),
-                                getattr(sec, "seed", None))
+                                getattr(sec, "seed", None), only=group)
 
-    def _auto_fx_apply(self, style, seed=None):
+    def _auto_fx_clear(self, group):
+        """Everything auto fx set for `group`: its LFO slots switched off
+        (the knob back to its centre), its moves dropped, then its racks'
+        effect knobs to 0 (the volumes stay)."""
+        channels = self.AUTO_FX_GROUPS[group]
+        for i in [i for i, g in self._auto_fx_lfos.items() if g == group]:
+            self.lfo_rows[i]["on"].setChecked(False)
+            del self._auto_fx_lfos[i]
+        g = self._auto_fx_gest
+        if g is not None:
+            keep = [m for m in g.gestures if m[0][4:].split("_", 1)[0] not in channels]
+            base = {d: v for d, v in g.base.items() if d[4:].split("_", 1)[0] not in channels}
+            self._auto_fx_gest = gacha_autofx.Gestures(keep, g.loop / 4, base) if keep else None
+            self._auto_fx_last = {d: v for d, v in self._auto_fx_last.items()
+                                  if d[4:].split("_", 1)[0] not in channels}
+        for (ch, key), sp in self.afx.items():
+            if ch in channels and key != "vol":
+                sp.setValue(0.0)
+
+    def _auto_fx_apply(self, style, seed=None, only=None):
         """Auto fx: the racks of the ticked groups (the four stems, the
-        drum voices) reset, then the style's plan (gacha_autofx.plan) onto
-        their knobs in the Audio FX grids, so the racks take it and the
-        grids show it, its LFOs into free slots, its moves onto the loop
-        clock. The live input's rack is left alone."""
+        drum voices; `only` one of them) cleared, then the style's plan
+        (gacha_autofx.plan) onto their knobs in the Audio FX grids, so the
+        racks take it and the grids show it, its LFOs into free slots, its
+        moves onto the loop clock. The live input's rack is left alone,
+        and a group not redrawn keeps what it has."""
         A = gacha_autofx
         groups = []
-        if getattr(self, "perf_auto_fx", None) and self.perf_auto_fx.isChecked():
+        if getattr(self, "perf_auto_fx", None) and self.perf_auto_fx.isChecked() \
+                and only in (None, "stems"):
             groups.append(("stems", STEMS, A.AUTO_FX, A.AUTO_LFO, A.AUTO_GESTURES, A.DEFAULT_GESTURES))
-        if getattr(self, "perf_auto_fx_drums", None) and self.perf_auto_fx_drums.isChecked():
+        if getattr(self, "perf_auto_fx_drums", None) and self.perf_auto_fx_drums.isChecked() \
+                and only in (None, "drums"):
             groups.append(("drums", VOICES, A.AUTO_FX_VOICES, A.AUTO_LFO_VOICES,
                            A.AUTO_GESTURES_VOICES, A.DEFAULT_GESTURES_VOICES))
         if not groups or not style or not hasattr(self, "afx"):
             return
         rng = random.Random(seed) if seed is not None else random.Random()
-        for i in self._auto_fx_lfos:                  # ours from the last section: back off
-            self.lfo_rows[i]["on"].setChecked(False)  # (the knob goes back to its centre)
-        self._auto_fx_lfos = set()
+        for name, *_ in groups:                       # last section's work for these groups: gone
+            self._auto_fx_clear(name)
         bars = getattr(self._perf_playing, "bars", 8) or 8
-        base, moves, said = {}, [], []
+        old = self._auto_fx_gest                      # the other group's moves, kept
+        base = dict(old.base) if old is not None else {}
+        moves = list(old.gestures) if old is not None else []
+        said = []
         for name, channels, t_fx, t_lfo, t_moves, t_default in groups:
             p = A.plan(style, rng, t_fx, channels)
             for (ch, key), sp in self.afx.items():
                 if ch in channels and key != "vol":
                     sp.setValue(p.get((ch, key), 0.0))
             lfos = A.plan_lfos(style, rng, t_lfo, channels)
-            placed = self._auto_fx_place_lfos(lfos)
+            placed = self._auto_fx_place_lfos(lfos, name)
             if len(lfos) > len(placed):
                 self.log.appendPlainText(f"auto fx: {len(lfos) - len(placed)} LFO(s) left out, "
                                          "no slot off")
@@ -9902,10 +9931,11 @@ All three sit next to the program.</li>
             said.append(f"{name}: {A.describe(p, placed)}"
                         + (f", {len(group_moves)} moves" if group_moves else ""))
         self._auto_fx_gest = A.Gestures(moves, bars, base) if moves else None
-        self._auto_fx_last = {}
+        self._auto_fx_last = {d: v for d, v in self._auto_fx_last.items()
+                              if self._auto_fx_gest is not None and d in self._auto_fx_gest.dests}
         self.log.appendPlainText(f"auto fx ({style}) " + " | ".join(said))
 
-    def _auto_fx_place_lfos(self, lfos):
+    def _auto_fx_place_lfos(self, lfos, group):
         """The plan's LFOs into slots that are off, never a player's; the
         rows set and switched on, the engine taking them; what was placed."""
         free = [i for i, r in enumerate(self.lfo_rows) if not r["on"].isChecked()]
@@ -9923,7 +9953,7 @@ All three sit next to the program.</li>
             r["pol"].setCurrentIndex(1 if l["unipolar"] else 0)
             r["mode"].setCurrentText(l["mode"])
             r["on"].setChecked(True)
-            self._auto_fx_lfos.add(i)
+            self._auto_fx_lfos[i] = group
             placed.append(l)
         return placed
 
