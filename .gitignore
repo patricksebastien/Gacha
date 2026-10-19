@@ -18,6 +18,7 @@ __pycache__/
 venv/
 
 takes/
+recordings/
 
 README_perfo.md
 # VST3 plugins (installed per machine, not distributed) — keep the empty folder

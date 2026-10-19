@@ -91,6 +91,11 @@ RUNGS = {
                      short=(0.2, 2.0)),
 }
 EXTRA_KINDS = ("intro", "outro")                      # picked by name only
+# the drums' own kind (the Perform tab's drums box): the drums can sit on
+# another rung than the layers, chops and events; "same as kind" is the
+# section's kind for all of them, as before
+DRUM_SAME = "same as kind"
+DRUM_KINDS = (DRUM_SAME, "random") + KINDS
 INTRO_STYLES = ("random", "ambient", "sparse", "none", "build", "drums-first",
                 "reverse-swell", "collage", "filtered")
 OUTRO_TAIL_MAX_BARS = 4        # the ring-out never takes more than half the loop
@@ -185,13 +190,14 @@ class Material:
 class Section:
     def __init__(self, kind, bpm, bars, seed, stems, events, notes, root=None,
                  drum_style=None, style=None, salts=None, force=(), kit_salts=None,
-                 mode=None, sub_notes=None, feel=None):
+                 mode=None, sub_notes=None, feel=None, drum_kind=None):
         self.kind, self.bpm, self.bars, self.seed = kind, bpm, bars, seed
         self.salts = dict(salts or {})  # {stem: int}: each part's stream of chance (a shuffle)
         self.kit_salts = dict(kit_salts or {})   # {voice: int}: the drum carved again (its sound)
         self.force = set(force)         # the parts rendered whatever the kind (shuffled once)
         self.drum_style = drum_style    # the style the drums were patterned in
         self.feel = feel                # the style whose feel the other parts follow
+        self.drum_kind = drum_kind      # the drums' own kind when not the section's, else None
         self.style = style              # an intro's or an outro's style, else None
         self.stems = stems              # {stem: (n, 2) float32 @ SR}, all n equal (SECTION_STEMS)
         self.events = events            # [[t, src, off, dur, rate, role]] t in s
@@ -235,7 +241,7 @@ def _loopify(x, n, fade_s=0.05):
 def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                    pan_layers=0.6, pan_events=0.5, drum_style="random",
                    intro_style="ambient", outro_style="random", salts=None, force=(),
-                   kit_salts=None, feel=E.FEEL_SAME):
+                   kit_salts=None, feel=E.FEEL_SAME, drum_kind=DRUM_SAME):
     """One looping section as stems + events. `kind`: groove (full kit, one
     to three layers, maybe chops), break (one or two drum voices, more
     layers), build (voices stack up bar by bar), sparse (one voice, one
@@ -269,7 +275,11 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     parts in another style's feel: its own by default, or random. `kit_salts` ({voice:
     int}, KIT_PARTS) take a drum's sound from another carving of the
     material (Material.kit_for), the pattern and every draw the same: a
-    voice's sound shuffled, the groove kept."""
+    voice's sound shuffled, the groove kept. `drum_kind` (DRUM_KINDS)
+    plays the drums and the sub on a kind of their own (sparse drums
+    under insane layers, say): DRUM_SAME is `kind`, random one of KINDS
+    from the seed (so a shuffle draws it again the same); the layers,
+    chops and events keep `kind`. An intro keeps its own drums."""
     k = mat.k
     salts = {s: int((salts or {}).get(s, 0)) for s in STEMS}
     kit_salts = {v: int((kit_salts or {}).get(v, 0)) for v in KIT_PARTS}
@@ -283,18 +293,28 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         drum_style = rng.choice(E.DRUM_STYLES)        # the shape: every part follows it
     feel_name = E.resolve_feel(feel, drum_style, rng)
     feel = E.style_feel(feel_name)
+    # the drums' kind: its own stream, so the shape's draws stay as they were
+    if kind == "intro" or drum_kind in (None, DRUM_SAME) or drum_kind == kind:
+        dkind = kind
+    elif drum_kind == "random":
+        dkind = random.Random(f"{seed}:drum_kind").choice(KINDS)
+    else:
+        dkind = drum_kind if drum_kind in KINDS else kind
     rung = RUNGS.get(kind)                            # a kind above groove: the feel turned up
-    if rung is not None:
-        feel = replace(feel, ride=1.0, fill=max(feel.fill, rung.fill),
-                       glitch=feel.glitch * rung.glitch, mutation=feel.mutation * rung.mutation,
-                       sub=feel.sub * rung.sub, ratchet=max(feel.ratchet, rung.ratchet),
-                       ratchet_counts=rung.counts or feel.ratchet_counts,
-                       layer_level=feel.layer_level * rung.level,
+    drung = RUNGS.get(dkind)                          # the drums' own rung (the same by default)
+    dfeel = feel                                      # the drums and the sub play this one
+    if drung is not None:
+        dfeel = replace(feel, ride=1.0, fill=max(feel.fill, drung.fill),
+                        glitch=feel.glitch * drung.glitch, mutation=feel.mutation * drung.mutation,
+                        sub=feel.sub * drung.sub, ratchet=max(feel.ratchet, drung.ratchet),
+                        ratchet_counts=drung.counts or feel.ratchet_counts)
+    if rung is not None:                              # the layers, chops and events
+        feel = replace(feel, layer_level=feel.layer_level * rung.level,
                        chop_density=min(1.0, feel.chop_density * rung.chops),
                        events=(feel.events[1] + rung.events[0], feel.events[1] + rung.events[1]),
                        event_grid=rung.grid or feel.event_grid,
                        event_len=rung.short or feel.event_len)
-    humanize = min(1.0, k.humanize * feel.humanize)
+    humanize = min(1.0, k.humanize * dfeel.humanize)
     intro_kind = intro_style if kind == "intro" and intro_style in INTRO_STYLES else None
     if intro_kind == "random":
         intro_kind = rng.choice(E.INTRO_STYLES)
@@ -329,23 +349,23 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     swing = (k.swing if k.swing is not None else rng.uniform(*feel.swing)) * step_len * SR
 
     # ---- drums ----
-    if feel.kick_drive > 0 and kits["kick"][0]:       # the kick driven (gabber)
-        kits["kick"] = (E.drive_layers(kits["kick"][0], feel.kick_drive), kits["kick"][1])
+    if dfeel.kick_drive > 0 and kits["kick"][0]:      # the kick driven (gabber)
+        kits["kick"] = (E.drive_layers(kits["kick"][0], dfeel.kick_drive), kits["kick"][1])
     pats = {r: E.make_pattern(rd, r, drum_style) for r in ("kick", "snare", "hihat", "ride")}
     tiles = E.polymeter_tiles(rd, drum_style)         # the voices on a short cycle of their own
-    if rung is not None:                              # the rung's extra hits
-        chance, lo, hi = rung.hats                    # hats on the pattern's rests
+    if drung is not None:                             # the drums' rung: extra hits
+        chance, lo, hi = drung.hats                   # hats on the pattern's rests
         pats["hihat"] = [v if v > 0 else (rd.uniform(lo, hi) if rd.random() < chance else 0.0)
                          for v in pats["hihat"]]
-        pats["snare"] = [v if v > 0 else (rd.uniform(0.2, 0.45) if rd.random() < rung.ghosts else 0.0)
+        pats["snare"] = [v if v > 0 else (rd.uniform(0.2, 0.45) if rd.random() < drung.ghosts else 0.0)
                          for v in pats["snare"]]      # ghosts under the snare
-        if rung.kick:                                 # the kick doubled on the offbeat 8ths
+        if drung.kick:                                # the kick doubled on the offbeat 8ths
             pats["kick"] = [v if v > 0 else (rd.uniform(0.6, 0.8) if st % 4 == 2 else 0.0)
                             for st, v in enumerate(pats["kick"])]
     pats["hihat"], pats["ohat"] = E.open_hat_pattern(rd, pats["hihat"], drum_style)
-    if rung is not None and rung.ohat > 0:            # more of the hats open, any step
+    if drung is not None and drung.ohat > 0:          # more of the hats open, any step
         for st in range(16):
-            if pats["hihat"][st] > 0 and pats["ohat"][st] == 0 and rd.random() < rung.ohat:
+            if pats["hihat"][st] > 0 and pats["ohat"][st] == 0 and rd.random() < drung.ohat:
                 pats["ohat"][st], pats["hihat"][st] = max(pats["hihat"][st], 0.8), 0.0
     active = ["kick", "snare", "hihat"]
     build_from = {}
@@ -355,19 +375,19 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         or intro_kind in ("reverse-swell", "collage")
     if drop_drums:
         active = []
-    elif kind == "break":
+    elif dkind == "break":
         active = rd.sample(active, rd.randint(1, 2))
-    elif kind == "sparse" or intro_kind == "sparse":
+    elif dkind == "sparse" or intro_kind == "sparse":
         active = [rd.choice(["hihat", "kick"])]
-    elif kind == "build" or intro_kind == "build":
+    elif dkind == "build" or intro_kind == "build":
         build_from = {"hihat": 0, "kick": max(1, bars // 3), "snare": max(2, (2 * bars) // 3)}
     if not active and "drums" in force:               # shuffled into an intro without them
         active = ["kick", "snare", "hihat"]
-    if (kind in ("groove", "outro") or rung is not None) and rd.random() < feel.ride:
+    if (dkind in ("groove", "outro") or drung is not None) and rd.random() < dfeel.ride:
         active.append("ride")
-    if kind not in ("intro", "build") and rd.random() >= feel.drums and "drums" not in force:
+    if dkind not in ("intro", "build") and rd.random() >= dfeel.drums and "drums" not in force:
         active = []                                   # a style with hardly a beat (ambient)
-    if "hihat" in active and kind != "sparse" and intro_kind != "sparse":
+    if "hihat" in active and dkind != "sparse" and intro_kind != "sparse":
         active.append("ohat")
         build_from.setdefault("ohat", build_from.get("hihat", 0))
     active = [r for r in active if gains[r] > 0 and kits[r][0]]
@@ -376,16 +396,16 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
         bar_start = int(bi * bar * SR)
         base = {r: (E.tile_bar(tiles[r], bi) if r in tiles else pats[r]) for r in active}
         bar_pats = {r: (E.mutate(rd, base[r], k.mutation_amount)
-                        if rd.random() < k.mutation_chance * feel.mutation else base[r])
+                        if rd.random() < k.mutation_chance * dfeel.mutation else base[r])
                     for r in active}
-        if bi == bars - 1 and rd.random() < feel.fill and "snare" in active:
+        if bi == bars - 1 and rd.random() < dfeel.fill and "snare" in active:
             p = list(bar_pats["snare"])
             for s in range(12, 16):
                 p[s] = rd.uniform(0.5, 1.0)
             bar_pats["snare"] = p
         ohat_pat = bar_pats.get("ohat", [0.0] * 16)
         closed_pat = bar_pats.get("hihat", [0.0] * 16)
-        rolls = {r: E.ratchet_steps(rd, bar_pats[r], r, feel.ratchet, feel.ratchet_counts)
+        rolls = {r: E.ratchet_steps(rd, bar_pats[r], r, dfeel.ratchet, dfeel.ratchet_counts)
                  for r in active}                     # the steps that ratchet this bar
         for role in active:
             if bi < build_from.get(role, 0):
@@ -394,8 +414,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 if vel <= 0 or (role == "hihat" and ohat_pat[s] > 0):
                     continue
                 pos = bar_start + int(s * step_len * SR)
-                if E.swung(s, feel):
-                    pos += int(swing * E.swing_steps(feel))
+                if E.swung(s, dfeel):
+                    pos += int(swing * E.swing_steps(dfeel))
                 pos += E.humanize_time(rd, humanize)
                 vel = E.humanize_vel(rd, vel, s, humanize)
                 reps = E.ratchet_hits(pos, vel, rolls[role].get(s, 1), step_len * SR)
@@ -414,8 +434,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                     hit = E.panned(hit, rd.uniform(-pan_drums, pan_drums))
                 for rp, rv in reps:
                     _place_wrap(stems[role], hit, max(0, rp), rv * gains[role])
-        for _roll in range(rung.rolls if rung is not None else 1):
-            if "hihat" not in active or rd.random() >= k.glitch_chance * feel.glitch:
+        for _roll in range(drung.rolls if drung is not None else 1):
+            if "hihat" not in active or rd.random() >= k.glitch_chance * dfeel.glitch:
                 continue
             s = rd.randrange(16)
             n_rep = rd.choice([6, 8, 12, 16])
@@ -433,7 +453,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                 _place_wrap(stems["glitch"], h, gpos, g)
                 ev(gpos, gsrc[0], gsrc[1], spacing, 1.0, "glitch", gv)
     notes.append(f"drums {drum_style}: {', '.join(active) or 'none'}"
-                 + (f", the {feel_name} feel" if feel_name != drum_style else ""))
+                 + (f", the {feel_name} feel" if feel_name != drum_style else "")
+                 + (f", {dkind}" if dkind != kind else ""))
 
     # ---- special intro content, as in the songs ----
     if intro_kind == "reverse-swell" and mat.names:
@@ -604,15 +625,15 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     pc, mode = E.chroma_key(chroma) if chroma is not None else (root_rng.randrange(12), "major")
     root = E.NOTE_NAMES[pc]
     sub_notes = {}                                   # bar -> the note's name (the MIDI out)
-    if not kick_hits and feel.drums < 1.0:            # a style whose drums sit out (ambient):
+    if not kick_hits and dfeel.drums < 1.0:           # a style whose drums sit out (ambient):
         kick_hits = [(int(b * bar * SR), b, 0) for b in range(bars)]   # the sub on the one
-    if k.sub_level > 0 and (kick_hits or feel.sub_line):
+    if k.sub_level > 0 and (kick_hits or dfeel.sub_line):
         bar_pc = E.bar_pcs(chroma, bars, int(bar * SR), pc, mode) if k.sub_follow else None
-        note_len = int((feel.sub_hold * beat + k.sub_release) * SR)   # the hold + release
-        if feel.sub_line:                            # a 16th line on each bar's root (acid)
+        note_len = int((dfeel.sub_hold * beat + k.sub_release) * SR)   # the hold + release
+        if dfeel.sub_line:                           # a 16th line on each bar's root (acid)
             bar_midi = [E.sub_midi(bar_pc[b] if bar_pc is not None else pc) for b in range(bars)]
             hits, sub_notes = E.sub_line_hits(root_rng, bars, int(bar * SR), int(step_len * SR),
-                                              bar_midi, feel, k.sub_chance * feel.sub)
+                                              bar_midi, dfeel, k.sub_chance * dfeel.sub)
         else:
             first_kick = {}                          # bar -> (pos, step)
             for pos, bar_i, s in kick_hits:
@@ -620,7 +641,7 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
                     first_kick[bar_i] = (pos, s)
             starts = []
             for bar_i in sorted(first_kick):
-                if root_rng.random() < k.sub_chance * feel.sub:   # weighted occurrence
+                if root_rng.random() < k.sub_chance * dfeel.sub:   # weighted occurrence
                     if bar_pc is not None:           # the bar's own pitch
                         midi = E.sub_midi(bar_pc[bar_i])
                     else:
@@ -703,7 +724,8 @@ def render_section(mat, seed, bpm, bars=8, kind="groove", pan_drums=0.3,
     events.sort(key=lambda e: e[0])
     return Section(kind, bpm, bars, seed, stems, events, notes, root=root,
                    drum_style=drum_style, style=style, salts=salts, force=force,
-                   kit_salts=kit_salts, mode=mode, sub_notes=sub_notes, feel=feel_name)
+                   kit_salts=kit_salts, mode=mode, sub_notes=sub_notes, feel=feel_name,
+                   drum_kind=dkind if dkind != kind else None)
 
 
 SECTION_ROOT_MAX_S = 8.0     # the chroma looks at this much of the layers at most
