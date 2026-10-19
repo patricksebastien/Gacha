@@ -67,6 +67,10 @@ drown the notes. retrig_start(channel, note, velocity, period_s, length_s,
 fade) is the box's RETRIG function done from here, since it has no CC: the
 note again every period until retrig_stop(channel), the velocity fading in
 (fade > 0) or out (fade < 0) over length_s like the box's FDE and LEN.
+cc_at(), retrig_at() and retrig_stop_at() are the same at a moment given,
+on the notes' time base (the audio engine's auto fx m:c, ahead of the
+block like the hits); a retrig started that way never replaces one held
+by hand, and drop_scheduled() takes back what has not left yet.
 
 Built on mido over python-rtmidi; without them everything here is inert and
 MIDI_AVAILABLE is False.
@@ -522,8 +526,14 @@ class MidiOut:
         self.ccs = 0                  # CCs that left, for the status line
         # retrigs: channel -> [note, velocity, period, length, fade, t0, next]
         self._retrigs = {}
+        self._auto_rt = set()         # channels whose retrig came from retrig_at (not a hand)
+        self._rt_args = {}            # seq -> a scheduled retrig's (note, vel, period, length, fade)
         # mirrors: other ports (the Erae's) given the clock and the transport
         self._sinks = {}              # sink -> {"clock": bool, "transport": bool, "stop": bool}
+        # the performance recording (gacha_showrec): every message that
+        # left the port but the clock, as (perf_counter, message), from the
+        # sender thread; a list's append will do
+        self.tap = None
 
     @property
     def is_open(self):
@@ -675,10 +685,53 @@ class MidiOut:
             return
         now = time.perf_counter()
         with self._cond:
-            self._retrigs[channel] = [int(note), max(1, min(127, int(velocity))),
-                                      float(period_s), max(0.0, float(length_s)),
-                                      max(-128, min(127, int(fade))), now, now]
+            self._retrig_set_locked(channel, note, velocity, period_s, length_s, fade, now)
+            self._auto_rt.discard(channel)          # a hand's: auto ones leave it alone
             self._cond.notify()
+
+    def _retrig_set_locked(self, channel, note, velocity, period_s, length_s, fade, now):
+        self._retrigs[channel] = [int(note), max(1, min(127, int(velocity))),
+                                  float(period_s), max(0.0, float(length_s)),
+                                  max(-128, min(127, int(fade))), now, now]
+
+    def cc_at(self, channel, cc, value, due):
+        """A control change at `due` (perf_counter), exactly then rather
+        than gathered; dropped if the controller already holds the value."""
+        if self._port is None or not 0 <= cc <= 127:
+            return
+        with self._cond:
+            self._push(float(due), "cc", int(channel), int(cc), max(0, min(127, int(round(value)))))
+            self._cond.notify()
+
+    def retrig_at(self, channel, note, velocity, period_s, length_s, fade, due):
+        """retrig_start() at `due`; skipped then if a hand holds a retrig on
+        the channel."""
+        if self._port is None or not 0 <= note <= 127 or period_s <= 0:
+            return
+        with self._cond:
+            self._push(float(due), "rt", int(channel))
+            self._rt_args[self._seq] = (int(note), velocity, period_s, length_s, fade)
+            self._cond.notify()
+
+    def retrig_stop_at(self, channel, due):
+        """A retrig started by retrig_at() over at `due`; one held by hand
+        goes on."""
+        if self._port is None:
+            return
+        with self._cond:
+            self._push(float(due), "rtx", int(channel))
+            self._cond.notify()
+
+    def drop_scheduled(self):
+        """The timed CCs and retrigs not yet out taken back, and every
+        retrig retrig_at() started stopped (auto fx m:c switched off)."""
+        with self._cond:
+            self._heap = [e for e in self._heap if e[2] not in ("cc", "rt", "rtx")]
+            heapq.heapify(self._heap)
+            self._rt_args.clear()
+            for ch in self._auto_rt:
+                self._retrigs.pop(ch, None)
+            self._auto_rt.clear()
 
     def retrig_stop(self, channel=None):
         """The retrig on `channel` over, or every one; the note sounding
@@ -686,8 +739,10 @@ class MidiOut:
         with self._cond:
             if channel is None:
                 self._retrigs.clear()
+                self._auto_rt.clear()
             else:
                 self._retrigs.pop(channel, None)
+                self._auto_rt.discard(channel)
 
     @property
     def retrigging(self):
@@ -744,6 +799,8 @@ class MidiOut:
         self._off_seq.clear()
         self._dropped.clear()
         self._retrigs.clear()
+        self._auto_rt.clear()
+        self._rt_args.clear()
         self._cc_pending.clear()
         self._cc_due = None
         for ch, n in list(self._sounding):
@@ -776,14 +833,16 @@ class MidiOut:
             t.join(1.0)
         self._thread = None
 
-    @staticmethod
-    def _send(port, msg):
+    def _send(self, port, msg):
         if port is None:
             return
         try:
             port.send(msg)
         except Exception:
-            pass
+            return
+        tap = self.tap
+        if tap is not None and msg.type != "clock":
+            tap((time.perf_counter(), msg))
 
     def _cc_flush_locked(self, port, now):
         """Every pending CC whose controller is free to take one, the
@@ -891,6 +950,27 @@ class MidiOut:
                         self._sounding.discard((ch, note))
                         if self._off_seq.get((ch, note), (0, -1))[1] == _seq:
                             del self._off_seq[(ch, note)]
+                    elif kind == "cc":               # a timed one (cc_at): exactly now
+                        key = (ch, note)
+                        if self._cc_last.get(key) != vel:
+                            self._cc_last[key] = vel
+                            self._cc_ok_at[key] = time.perf_counter() + self.CC_MIN_S
+                            self._cc_pending.pop(key, None)   # newer than a gathered one
+                            self._send(port, mido.Message("control_change", channel=ch - 1,
+                                                          control=note, value=vel))
+                            self.ccs += 1
+                        continue
+                    elif kind == "rt":               # retrig_at: not over a hand's
+                        args = self._rt_args.pop(_seq, None)
+                        if args is not None and (ch not in self._retrigs or ch in self._auto_rt):
+                            self._retrig_set_locked(ch, *args, time.perf_counter())
+                            self._auto_rt.add(ch)
+                        continue
+                    elif kind == "rtx":
+                        if ch in self._auto_rt:
+                            self._retrigs.pop(ch, None)
+                            self._auto_rt.discard(ch)
+                        continue
                     elif kind == "start":
                         self._running = True
                         if self.transport_on:

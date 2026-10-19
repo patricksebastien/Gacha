@@ -97,7 +97,9 @@ SNAP_LA = [
     ((ATTR, "block"),), ((ATTR, "in_name"),), ((ATTR, "out_latency_ms"),),
     ((ATTR, "buffer_ms"),), ((ATTR, "ping_result"),), ((ATTR, "midi_sent"),),
     ((ATTR, "in_peak"),), ((ATTR, "out_peak"),), ((ATTR, "move_values"),),
+    ((ATTR, "mc_values"),), ((ATTR, "mc_retrigs"),),
     ((ATTR, "stats"), (CALL, None)),
+    ((ATTR, "show_rec_state"), (CALL, None)),
     ((ATTR, "player"), (ATTR, "playing")), ((ATTR, "player"), (ATTR, "bpm")),
     ((ATTR, "player"), (ATTR, "bars")), ((ATTR, "player"), (ATTR, "n")),
     ((ATTR, "player"), (ATTR, "sr")), ((ATTR, "player"), (ATTR, "pending")),
@@ -133,6 +135,8 @@ SYNC = {
     LA + ((ATTR, "player"), (ATTR, "queue")): 20.0,
     LA + ((ATTR, "player"), (ATTR, "replace")): 20.0,
     LA + ((ATTR, "record_stop"),): 20.0,
+    LA + ((ATTR, "show_rec_start"),): 10.0,
+    LA + ((ATTR, "show_rec_stop"),): 60.0,
     INSERTS + ((ATTR, "add"),): 120.0,
     INSERTS + ((ATTR, "remove"),): 10.0,
     INSERTS + ((ATTR, "move"),): 10.0,
@@ -607,6 +611,16 @@ class _MidiRelay:
 
     def grid(self, beat_t, beat_s):
         self._push("grid", (None if beat_t is None else float(beat_t), float(beat_s)))
+
+    def cc_at(self, channel, cc, value, due):
+        self._push("cc_at", (int(channel), int(cc), int(value), float(due)))
+
+    def retrig_at(self, channel, note, velocity, period_s, length_s, fade, due):
+        self._push("retrig_at", (int(channel), int(note), int(velocity), float(period_s),
+                                 float(length_s), int(fade), float(due)))
+
+    def retrig_stop_at(self, channel, due):
+        self._push("retrig_stop_at", (int(channel), float(due)))
 
     def start(self, due):
         self._push("start", (float(due),))

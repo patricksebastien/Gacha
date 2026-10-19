@@ -7,15 +7,21 @@ chops, events; a section from the section engine and a generated song both
 come as these stems), plus one per drum voice of a section (VOICES: kick,
 snare, closed and open hat, ride, hat stutter, sub bass), summed into the
 drums channel after their racks, so the drums channel is the kit's bus.
-Each channel has eleven effects and a volume, every one a knob from 0 to 1 (a
-MIDI CC 0..127 spread over it):
+Each channel has eleven effects, a pan and a volume, every one a knob from 0
+to 1 (a MIDI CC 0..127 spread over it):
 
     0          bypassed, no CPU spent
     small      a little of the effect on top of the dry sound
     1 (127)    fully wet: the dry sound is gone, only the effect remains
                (a reverb wash, only repeats, the filter fully closed)
 
-Pitch is the one bipolar knob: -1..1, off in the middle, -12 to +12 semitones.
+Pitch and pan are the bipolar knobs: -1..1, off in the middle; pitch -12 to
++12 semitones, pan hard left to hard right. The pan is no effect in the
+chain: it moves the channel's picture after the effects (pan_gains, an
+equal-power law that narrows the stereo image towards the side it goes, so
+a stereo stem never loses one of its channels), before the volume, and an
+auto fx move on it wins over the knob while it is on (1/8 left, 1/8 right,
+back to the centre), where the effects take the larger of the two.
 
 Built on pedalboard plugins streamed block by block (`reset=False`) plus the
 engine's tanh saturator (gain-compensated, so drive gets denser, not louder)
@@ -75,8 +81,12 @@ AUDIO_FX = [
                                       "the wet mix, only echoes at full"),
     ("reverb", "reverb", 0.0, "Reverb at the size, damping and width settings; this knob "
                               "the wet mix, gentle over its first half, a wash at full"),
+    ("pan", "pan", 0.0, "Pan after the effects: the centre in the middle, hard left at the "
+                        "bottom, hard right at the top; equal power, the stereo picture "
+                        "narrowing towards the side it goes"),
 ]
-BIPOLAR = {"pitch"}                      # -1..1 knobs, off at 0 in the middle
+BIPOLAR = {"pitch", "pan"}               # -1..1 knobs, off at 0 in the middle
+NOT_IN_CHAIN = {"pan"}                   # a knob of the rack applied after the effects
 CHANNELS = ("live", "drums", "layers", "chops", "events")   # live = the input through
 STEM_CHANNELS = CHANNELS[1:]
 # the drum voices of a section, each a stem of its own with its own rack,
@@ -87,6 +97,17 @@ VOICE_LABELS = {"kick": "kick", "snare": "snare", "hihat": "closed hat", "ohat":
                 "ride": "ride", "glitch": "hat stutter", "sub": "sub bass"}
 ALL_CHANNELS = CHANNELS + VOICES         # every rack there is
 PITCH_DEAD = 0.04                        # |pitch| below this = off (knob centre)
+
+
+def pan_gains(p):
+    """The four gains of a pan at `p` (-1..1): (mid to left, mid to right,
+    side kept). The mid (L+R)/2 goes through an equal-power law (unity in
+    the middle, +3 dB on one side at the end), the side (L-R)/2 shrinks
+    with |p|, so a stereo stem narrows towards where it goes and a mono
+    one moves whole."""
+    p = max(-1.0, min(1.0, float(p)))
+    th = (p + 1.0) * np.pi / 4.0
+    return np.sqrt(2.0) * np.cos(th), np.sqrt(2.0) * np.sin(th), 1.0 - abs(p)
 
 
 def _tanh_drive(x, amount, db=30.0, bias=0.15):
@@ -445,6 +466,29 @@ class Rack:
         self._fifo[key] = q
         return np.zeros_like(x)
 
+    def _pan(self, y, moves):
+        """The pan, after the effects: the knob, or an auto fx move on it
+        while one is (a move wins, either way); ramped over the block."""
+        m = moves.get("pan")
+        target = float(m) if m is not None else float(self.amounts.get("pan", 0.0))
+        target = max(-1.0, min(1.0, target))
+        if abs(target) < 0.005:
+            target = 0.0
+        now = self._now.get("pan", 0.0)
+        if target == 0.0 and now == 0.0:
+            return y
+        bs = y.shape[1]
+        mid = (y[0] + y[1]) * 0.5
+        side = (y[0] - y[1]) * 0.5
+        if target != now:
+            g0, g1 = pan_gains(now), pan_gains(target)
+            r = np.linspace(0.0, 1.0, bs, dtype=np.float32)
+            gl, gr, gs = (a + (b - a) * r for a, b in zip(g0, g1))
+        else:
+            gl, gr, gs = pan_gains(target)
+        self._now["pan"] = target
+        return np.stack([mid * gl + side * gs, mid * gr - side * gs]).astype(np.float32)
+
     def process(self, x):
         """(2, bs) float32 in, (2, bs) float32 out. Bypassed effects cost
         nothing; an effect coming back from 0 starts from a clean state."""
@@ -452,6 +496,8 @@ class Rack:
         y = x
         moves = self.moves
         for key, _l, _d, _t in AUDIO_FX:
+            if key in NOT_IN_CHAIN:
+                continue
             target = float(self.amounts.get(key, 0.0))
             m = moves.get(key)
             if m is not None and abs(m) > abs(target):    # an auto fx move on it, larger
@@ -483,6 +529,7 @@ class Rack:
                 w = w_t
             y = y * (1.0 - w) + wet * w
             self._now[key] = target
+        y = self._pan(y, moves)
         vol = max(0.0, min(1.0, float(self.vol))) ** 2      # a gentle taper
         if vol != self._vol_now:
             y = y * np.linspace(self._vol_now, vol, bs, dtype=np.float32)

@@ -94,6 +94,7 @@ import time
 from collections import deque
 
 import contextlib
+import bisect
 import math
 import os
 import random
@@ -116,8 +117,10 @@ from gacha_frag import Fragments
 from gacha_freeze import Freeze
 from gacha_metro import Metronome, VEL as METRO_VEL
 from gacha_fx import ALL_CHANNELS, Gestures, Rack, STEM_CHANNELS, VOICES
+from gacha_showrec import BUSES as SHOW_BUSES, ROWS as SHOW_ROWS, ShowRecorder
 from gacha_midi import DRUM_NOTES, DRUM_ROLES, ROOT_ROLES, ROOT_VEL, root_shift, style_offset
 
+assert SHOW_BUSES == ("live",) + tuple(STEM_CHANNELS)    # the recording's rows, in the mix's order
 assert VOICES[:len(DRUM_ROLES)] == DRUM_ROLES      # one voice per MIDI role, then the sub
 
 SR = 48000
@@ -458,6 +461,7 @@ class SectionPlayer:
         self.burst_fired = None              # (number, monotonic start) of the last one out
         self.loop_t0 = None                  # monotonic time the loop last wrapped
         self.swapped = False                 # a pending section just went live
+        self.swaps = 0                       # how many went live: the engine's auto fx m:c follows it
         self._replace = None                 # (stems, events, table): the loop's stems anew, on the bar
         self._bar_crossed = False            # the last block crossed a bar line
         self.replaced = False                # a replace just landed (the GUI resets)
@@ -1132,6 +1136,7 @@ class SectionPlayer:
         if from_silence:
             self.started = (self._lead, self.pos)
         self.swapped = True
+        self.swaps += 1
 
     # ---- the MIDI out's window: the hits `lookahead` frames ahead of the block
     def _next_table(self):
@@ -1578,6 +1583,13 @@ class LiveAudio:
         self.moves = None                    # auto fx moves (gacha_fx.Gestures), set_moves()
         self.move_values = {}                # knob id -> a move's amount now, for the GUI's grid
         self._moved = set()                  # the racks with moves on them
+        # auto fx m:c (set_mc_moves): the box's CCs and retrigs on the loop
+        self.mc_moves = None                 # (rows, bars, restore) running
+        self._mc_next = None                 # the same armed for the next section to go live
+        self._mc_st = None                   # [rows, swaps, loop count, last i0, sent keys]
+        self._mc_rt = set()                  # channels with a retrig of ours on
+        self.mc_values = {}                  # "channel_cc" -> the tab value auto fx m:c holds now
+        self.mc_retrigs = []                 # channels with a retrig of ours on, for the tab
         self.beat_s = 0.5                    # the delays follow this
         self.gain = 1.0
         self.mute = False
@@ -1635,6 +1647,7 @@ class LiveAudio:
         self._pre = deque(maxlen=int(self.pre_roll * self.sr / self.block) + 1)
         self._rec = None                     # [(stereo block, end time)] while recording
         self._rec_req = None                 # pre-roll seconds asked for, once
+        self._show = None                    # gacha_showrec.ShowRecorder: the performance to disk
         # stats
         self.in_peak = self.out_peak = 0.0   # last block's peaks, 0..1
         self.load = 0.0                      # DSP time / block time, smoothed
@@ -1847,6 +1860,7 @@ class LiveAudio:
 
     def stop(self):
         self._stop.set()
+        self.show_rec_stop()                         # a recording running: its files closed
         st = getattr(self, "_cb_stream", None)
         if st is not None:                           # ASIO: same thread as start()
             self._cb_stream = None
@@ -1883,6 +1897,28 @@ class LiveAudio:
             blocks, self._rec = self._rec, None
             self._rec_req = None
         return blocks or []
+
+    def show_rec_start(self, folder):
+        """Record the performance into `folder` (gacha_showrec): the
+        master and the five buses from the next block on. Returns an error
+        text, or None."""
+        if self._show is not None:
+            return "already recording"
+        try:
+            self._show = ShowRecorder(folder, self.sr)
+        except Exception as e:
+            return str(e)
+        return None
+
+    def show_rec_stop(self):
+        """Stop the performance recording, its files closed; returns
+        ShowRecorder.close()'s dict, None if nothing was recording."""
+        rec, self._show = self._show, None
+        return None if rec is None else rec.close()
+
+    def show_rec_state(self):
+        rec = self._show
+        return None if rec is None else rec.state()
 
     def ping(self):
         """Arm the round-trip test: the next block puts a short 1 kHz burst
@@ -2123,6 +2159,134 @@ class LiveAudio:
         position; None or empty, no moves."""
         self.moves = Gestures(gestures, bars) if gestures else None
 
+    def set_mc_moves(self, rows=None, bars=8, restore=(), on_swap=False):
+        """Auto fx m:c (gacha_autofx.compile_mc): `rows` of (beat, order,
+        kind, args) on the loop, kind "cc" (channel, cc, value), "rt"
+        (channel, role, note, velocity, rate in bars, curve in 16ths,
+        fade) or "rx" (channel,), sent to the MIDI out ahead of the block
+        on the hits' time base; `restore` (channel, cc, value) sent once as
+        they start. `on_swap`: armed for the next section to go live (the
+        one queued), the running ones kept until then; else at once.
+        None: off, now and armed (`restore` still sent)."""
+        rows = tuple(tuple(r) for r in rows or ())
+        restore = tuple(tuple(x) for x in restore or ())
+        mv = (rows, float(bars), restore) if rows or restore else None   # no rows: a restore alone
+        if on_swap:
+            self._mc_next = (self.player.swaps + 1, mv)
+        else:
+            self._mc_next = None
+            self.mc_moves = mv
+
+    def _run_mc(self, mo, base, bs, L, sr):
+        """The audio thread, every block with the MIDI out open: the auto fx
+        m:c rows whose moment falls in this block's window, `L` frames
+        ahead like the hits, out at `base` + their offset; a section going
+        live takes the rows armed for it. On a start (new rows, a section
+        in) each controller first gets the value it holds at that point of
+        the loop. A row never stops the sound."""
+        pl = self.player
+        try:
+            nxt = self._mc_next
+            if nxt is not None and pl.swaps >= nxt[0]:
+                self._mc_next, self.mc_moves = None, nxt[1]
+            mv = self.mc_moves
+            playing = pl.playing and pl.grid_i0 is not None and pl.beat_frames and pl.n
+            if mv is None or not mv[0] or not playing:
+                if self._mc_rt:                       # stopped: our retrigs with it
+                    for ch in self._mc_rt:
+                        mo.retrig_stop_at(ch, base)
+                    self._mc_rt = set()
+                if mv is not None and not mv[0]:      # a restore alone: sent, done
+                    for ch, cc, v in mv[2]:
+                        mo.cc_at(ch, cc, v, base)
+                    self.mc_moves = None
+                self._mc_st = None
+                if self.mc_values or self.mc_retrigs:
+                    self.mc_values, self.mc_retrigs = {}, []
+                return
+            rows, bars, restore = mv
+            n, bf, r, i0, start = pl.n, pl.beat_frames, pl.rate, pl.grid_i0, pl.grid_lead
+            fpb = n / (bars * 4.0)                    # loop frames a beat
+            st = self._mc_st
+            if st is None or st[0] is not rows:       # a start: old retrigs off, the state now
+                for ch in self._mc_rt:
+                    mo.retrig_stop_at(ch, base)
+                self._mc_rt = set()
+                for ch, cc, v in restore:
+                    mo.cc_at(ch, cc, v, base)
+                cur = i0 + (L - start) * r            # the window's first loop frame
+                now_v = {}                            # controller -> its value at `cur`; every
+                for beat, _o, kind, args in rows:     # one has a row on beat 1, so before it
+                    if kind == "cc" and beat * fpb < cur:   # (a fresh start) the window
+                        now_v[(args[0], args[1])] = args[2]   # sends that row itself
+                for (ch, cc), v in now_v.items():
+                    mo.cc_at(ch, cc, v, base)
+                sent = set()
+                for i, (beat, _o, kind, args) in enumerate(rows):
+                    if beat * fpb >= cur:
+                        continue
+                    sent.add((i, 0))
+                    if beat * fpb >= i0 and kind == "rx":     # the window's lag: a retrig
+                        mo.retrig_stop_at(args[0], base)      # starting or ending under it
+                        self._mc_rt.discard(args[0])          # goes out now, late by
+                    elif beat * fpb >= i0 and kind == "rt":   # less than the lead
+                        self._mc_retrig(mo, args, base, bf, r, sr)
+                shown = {}                            # "ch_cc" -> ([loop frames], [tab values])
+                for beat, _o, kind, args in rows:
+                    if kind == "cc" and len(args) > 3:
+                        fr, vs = shown.setdefault(f"{args[0]}_{args[1]}", ([], []))
+                        fr.append(beat * fpb)
+                        vs.append(args[3])
+                st = self._mc_st = [rows, 0, i0, sent, [row[0] * fpb for row in rows], shown]
+            if i0 < st[2] - n / 2:                    # the loop came round
+                st[1] += 1
+                st[3] = {k for k in st[3] if k[1] >= st[1]}
+            st[2] = i0
+            loop, sent, frames = st[1], st[3], st[4]
+            lo = i0 + (L - 2 - start) * r             # the window in loop frames
+            hi = i0 + (bs + L - start) * r
+            for j in (0, 1):                          # this loop and the next one's start
+                a = bisect.bisect_left(frames, lo - j * n)
+                b = bisect.bisect_left(frames, hi - j * n)
+                for i in range(a, b):
+                    beat, _o, kind, args = rows[i]
+                    f = start + (frames[i] + j * n - i0) / r   # output frames from the block
+                    key = (i, loop + j)
+                    if key in sent:
+                        continue
+                    sent.add(key)
+                    due = base + max(0.0, f - L) / sr
+                    if kind == "cc":
+                        mo.cc_at(args[0], args[1], args[2], due)
+                    elif kind == "rt":
+                        self._mc_retrig(mo, args, due, bf, r, sr)
+                    elif kind == "rx":
+                        mo.retrig_stop_at(args[0], due)
+                        self._mc_rt.discard(args[0])
+            vals = {}                                 # what the box holds at the loop's place now
+            for key, (fr, vs) in st[5].items():
+                k = bisect.bisect_right(fr, i0) - 1
+                vals[key] = vs[k] if k >= 0 else vs[-1]   # before the first: the loop's last
+            if vals != self.mc_values:
+                self.mc_values = vals
+            rts = sorted(self._mc_rt)
+            if rts != self.mc_retrigs:
+                self.mc_retrigs = rts
+        except Exception:                             # never stop the sound over a row
+            self.mc_moves, self._mc_st = None, None
+            self.mc_values, self.mc_retrigs = {}, []
+
+    def _mc_retrig(self, mo, args, due, bf, r, sr):
+        """An "rt" row out: the retrig at `due`, its rate and curve at the
+        section's tempo (the gears included); not while its drum is muted,
+        the section is under the pedal or the freeze holds."""
+        ch, role, note, vel, rate, steps, fade = args
+        if role not in self._audible() or float(self.ab) < 0.05 or self.freeze.active:
+            return
+        beat_s = bf / (sr * r)
+        mo.retrig_at(ch, note, vel, rate * 4 * beat_s, steps * beat_s / 4, fade, due)
+        self._mc_rt.add(ch)
+
     def _apply_moves(self):
         """The audio thread, every block, after the player: the moves on at
         this block's beat of the loop onto their racks (Rack.moves), the
@@ -2254,6 +2418,12 @@ class LiveAudio:
         if pg is not None:
             y = y * 0.0          # round-trip test: no input to the output, or the
                                  # cable feeds the burst back round and round
+        # the performance recording (gacha_showrec): the master and the
+        # buses of this block, gathered as they pass, handed over at the end
+        show = self._show
+        cap = np.zeros((SHOW_ROWS, bs), np.float32) if show is not None else None
+        if cap is not None:
+            cap[2:4] = y
         # the MIDI out's window: hits are listed this far ahead of the block,
         # so a note can leave before the block it sits in is even rendered
         mo = self.midi_out
@@ -2288,6 +2458,8 @@ class LiveAudio:
         sw_off = self._land_switches(self.player.grid_off)
         if midi or (mo is not None and mo.mirrored):   # a mirror (the Erae) wants the grid too
             self._midi_sync(mo, t_block + out_lat - lead_s, sr)
+        if midi and (self.mc_moves is not None or self._mc_next is not None or self._mc_rt):
+            self._run_mc(mo, t_block + out_lat - lead_s + L / sr, bs, L, sr)   # auto fx m:c
         if midi and (self.player.hits or self.song.hits or self.pad_hits):
             aud_after, aud_before = self._audible(), self._aud_before
             base = t_block + out_lat - lead_s + L / sr        # >= t_block by the choice of L
@@ -2367,7 +2539,7 @@ class LiveAudio:
             blk = rack.process(blk)
             bus = blk if bus is None else bus + blk
         burst = sec.get("burst")                    # the bursts: into the events
-        for stem in STEM_CHANNELS:                  # rack, but not under A/B
+        for si, stem in enumerate(STEM_CHANNELS):   # rack, but not under A/B
             if stem == "drums":
                 blk = bus
             else:
@@ -2387,6 +2559,8 @@ class LiveAudio:
                 self._stem_gain[stem] = on
             elif not on:
                 continue
+            if cap is not None:
+                cap[4 + 2 * si:6 + 2 * si] = blk
             y = y + blk
         # the freeze (gacha_freeze): the whole mix held on the instant of the
         # press, the live mix crossfaded out under the cloud and back on the
@@ -2439,6 +2613,9 @@ class LiveAudio:
         y = self._limiter.process(y, sr, reset=False)      # the racks can get loud
         np.clip(y, -1.0, 1.0, out=y)
         self.out_peak = float(np.abs(y).max()) if y.size else 0.0
+        if cap is not None:
+            cap[0:2] = y
+            show.push(cap, t_block + out_lat, now)
         return y
 
 

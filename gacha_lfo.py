@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-gacha_lfo.py — the LFOs: eight modulators over any knob of the Controls tab.
+gacha_lfo.py — the LFOs: sixteen modulators over any knob of the Controls tab.
 
 An LFO slot has a destination (a knob id, the same ids the keyboard and the
 MIDI map use), a shape, a rate as a cycle length in bars, a depth, a phase,
@@ -47,7 +47,7 @@ RATES = [("8 bars", 8.0), ("4 bars", 4.0), ("2 bars", 2.0), ("1 bar", 1.0), ("1/
          ("1/4", 0.25), ("1/8", 0.125), ("1/16", 1 / 16), ("1/32", 1 / 32)]
 RATE_DEFAULT = "1 bar"
 MODES = ["cycle", "trig", "one-shot"]
-N_SLOTS = 8
+N_SLOTS = 16                     # (the Erae's LFO page draws the first eight)
 EPS = 1e-6
 
 

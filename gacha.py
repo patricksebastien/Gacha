@@ -58,7 +58,9 @@ from gacha_link import INSTALL_HINT as LINK_INSTALL_HINT, LINK_AVAILABLE, LinkCl
 from gacha_audio import audio_apis, audio_devices, audio_status, PHRASE_BARS
 from gacha_audioproc import AudioProxy, audio_host      # the engine, in its own process
 from gacha_takes import TakeStore
-from gacha_section import (EXTRA_KINDS, Material, cut_burst, render_section, render_oneshot,
+from gacha_showrec import new_folder as show_rec_folder, write_meta as show_rec_meta, \
+    write_midi as show_rec_midi
+from gacha_section import (DRUM_KINDS, DRUM_SAME, EXTRA_KINDS, Material, cut_burst, render_section, render_oneshot,
                            render_swell, KINDS, STEMS, SHUFFLE_STEMS, SHUFFLE_ROLES, KIT_PARTS)
 import gacha_engine as E
 from scipy.signal import resample_poly
@@ -70,7 +72,7 @@ from gacha_midi import (CYCLES_CHANNELS, CYCLES_FX_PARAMS, CYCLES_LISTS, CYCLES_
                         CYCLES_PARAMS, CYCLES_RANGES, CYCLES_RETRIG_LENS, CYCLES_RETRIG_RATES,
                         CYCLES_ROOT, CYCLES_SAMPLER_KNOBS, CYCLES_SAMPLER_MODES, CYCLES_SLICE_NOTE,
                         DRUM_LABELS, DRUM_NOTES, DRUM_ROLES, MIDI_AVAILABLE, MidiIn, MidiOut,
-                        STYLE_VOICING, cycles_cc_value, format_binding, midi_inputs,
+                        STYLE_VOICING, cycles_cc_value, format_binding, midi_inputs, root_shift,
                         midi_outputs, parse_binding)
 from gacha_freeze import FREEZE
 from gacha_frag import (FRAG_DIRS, FRAG_DIVS, FRAG_PLAYS, FRAG_RATES, FRAG_UNITS, FRAGMENTS,
@@ -98,6 +100,7 @@ GACHA = BASE / "gacha_engine.py"
 SAMPLES_DIR = BASE / "samples"
 OUT_DIR = BASE / "output"
 VIDEOS_DIR = BASE / "videos"
+RECORDINGS_DIR = BASE / "recordings"         # the performances (gacha_showrec), a folder each
 DEFAULT_VIDEO = VIDEOS_DIR / "gacha.mp4"     # shipped with the repo, shown at start
 VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mkv")
 
@@ -333,6 +336,8 @@ KEYMAP = [
     ("tape", "record", "R", "take: start / stop recording the live feed into RAM"),
     ("tape", "discard", "Shift+R", "forget the last take, or the one recording (RAM only)"),
     ("tape", "clear_takes", "Ctrl+Shift+R", "forget every take (RAM only, the files stay)"),
+    ("tape", "show_record", "Ctrl+R", "record the performance: the master, the five buses and "
+                                      "the MIDI out into a new folder of recordings/, start / stop"),
     ("clock", "tap", "T", "tap tempo, first tap on the downbeat"),
     ("clock", "downbeat", "D", "restart the bar now, tempo kept"),
     ("clock", "live", "L", "live mode (audio drives the visuals) off/on"),
@@ -361,6 +366,7 @@ KEYMAP = [
     ("show", "grade_neutral", "", "source grade back to neutral"),
     ("show", "blend_next", "", "next shader blend mode (mix, add, screen)"),
     ("section", "kind_next", "", "next section kind (random, groove, break, ...)"),
+    ("section", "drum_kind_next", "", "next drums kind (same as kind, random, groove, ...)"),
     ("clock", "link", "", "Ableton Link: tempo and start/stop shared with the network, off/on"),
     ("clock", "link_play", "", "Ableton Link: play / stop sent to the session (the section follows)"),
     ("section", "picture_next", "", "picture while a section plays: follow, take, live"),
@@ -376,7 +382,7 @@ KEYMAP += [("grade", f"grade_{k}", "", f"{lbl}: {lo:g} to {hi:g}, neutral {val:g
            for k, lbl, (lo, hi, _s, val), _t in VIDEO_GRADE]
 KEYMAP += [("fx", f"fx_{k}", "", f"{lbl} strength, 0 (off) to 1")
            for k, lbl, _d, _t in VIDEO_EFFECTS]
-# the audio racks: eleven effects and a volume per channel (the live input and
+# the audio racks: eleven effects, a pan and a volume per channel (the live input and
 # the four stems), every one a knob; then a focused set (the same knobs for
 # whichever channel was focused last) and the five focus buttons
 for _ch in CHANNELS:
@@ -447,7 +453,7 @@ KEYMAP += [("show", "video_off", "V", "video off: no picture, no decoding, no GP
                                       "(the sound runs as usual), off/on")]
 # the drum voices of a section (gacha_fx.VOICES): each in or out and soloed,
 # all back in, the grid the switches, events and bursts land on, and a rack
-# per voice (eleven effects and a volume, like the five channels above) with
+# per voice (eleven effects, a pan and a volume, like the five channels above) with
 # its focus button
 KEYMAP += [("voices", f"voice_{_v}", f"Shift+F{_i}",
             f"{VOICE_LABELS[_v]} in/out, on the quantize grid; its MIDI notes follow")
@@ -1694,6 +1700,43 @@ class AfxSpin(QDoubleSpinBox):
         super().focusInEvent(e)
 
 
+class McSpin(QSpinBox):
+    """A number cell of the M:C tab. While auto fx m:c holds its knob at
+    another value (the audio engine sends it, LiveAudio.mc_values) it shows
+    that value, lit, instead of its own; the value itself never changes, so
+    what is saved, the MIDI map, the scenes, the macros and the LFOs keep
+    reading the setting. Clicked into, it shows its own value again."""
+
+    _shown = None                     # a class default: Qt asks for the text while building
+
+    def textFromValue(self, v):
+        if self._shown is not None:
+            return str(int(self._shown))
+        return super().textFromValue(v)
+
+    def show_move(self, v):
+        """The held value (None: none) on display, the edit's text set with
+        its signals blocked, so the box never reads it back."""
+        if self.hasFocus():
+            v = None
+        if v is not None:
+            v = int(v)
+        if v == self._shown:
+            return
+        self._shown = v
+        ed = self.lineEdit()
+        ed.blockSignals(True)
+        ed.setText(self.prefix() + self.textFromValue(self.value()) + self.suffix())
+        ed.blockSignals(False)
+        self.setStyleSheet("" if v is None else "background: rgba(255, 150, 110, 200);")
+
+    def focusInEvent(self, e):
+        if self._shown is not None:
+            self.show_move(None)
+        self._shown = None
+        super().focusInEvent(e)
+
+
 class LfoBar(QWidget):
     """An LFO's wave right now: a bar from the middle, right for positive,
     left for negative, lit while the slot is on."""
@@ -2208,6 +2251,10 @@ class Main(QMainWindow):
         self._auto_fx_lfos = {}                     # LFO slot -> the group ("stems", "drums") that filled it
         self._auto_fx_gest = None                   # gacha_fx.Gestures: the moves, run by the engine
         self._auto_fx_shown = set()                 # grid cells showing a move
+        self._auto_mc_running = set()               # (track, key) auto fx m:c moves in the engine
+        self._auto_mc_shown = {}                    # M:C tab widget -> the held value it shows
+        self._auto_mc_rt_until = {}                 # track -> lit until (an auto retrig's button)
+        self._auto_mc_armed = None                  # the same for the section queued, till it lands
         self._perf_playing = None                   # Section on the player
         self._perf_current = None                   # (Section, stems, sr): the last one played,
                                                     # what stop / Link start bring back
@@ -2218,6 +2265,9 @@ class Main(QMainWindow):
         self.takes.changed.connect(self._takes_changed)
         self._take_timer = QTimer(self)             # limit check + status while recording
         self._take_timer.timeout.connect(self._poll_take)
+        self._show_rec = None                       # the performance recording: its GUI half
+        self._show_rec_timer = QTimer(self)         # its status line, while it runs
+        self._show_rec_timer.timeout.connect(self._poll_show_record)
         self._through_timer = QTimer(self)          # feeds the analyzer, status line
         self._through_timer.timeout.connect(self._poll_through)
         self._through_ticks = 0
@@ -2410,6 +2460,7 @@ class Main(QMainWindow):
             "record": self.toggle_take,
             "discard": self.discard_take,
             "clear_takes": self.clear_takes,
+            "show_record": self.toggle_show_record,
             "tap": self.tap_tempo,
             "downbeat": self.live_downbeat,
             "live": self.live_on.toggle,
@@ -2465,6 +2516,7 @@ class Main(QMainWindow):
             "grade_neutral": self._reset_grade,
             "blend_next": lambda: self._combo_next(self.shader_blend),
             "kind_next": lambda: self._combo_next(self.perf_kind),
+            "drum_kind_next": lambda: self._combo_next(self.perf_drum_kind),
             "link": self.link_on.toggle,
             "link_play": self._link_press,
             "picture_next": lambda: self._combo_next(self.perf_picture),
@@ -2755,6 +2807,10 @@ class Main(QMainWindow):
         if feel != E.FEEL_SAME:
             now = getattr(sec, "feel", None) if sec is not None else None
             style += f"  feel {feel}" + (f" ({now} now)" if feel == "random" and now else "")
+        dk = self.perf_drum_kind.currentText()
+        if dk != DRUM_SAME:
+            now = getattr(sec, "drum_kind", None) if sec is not None else None
+            style += f"  kind {dk}" + (f" ({now} now)" if dk == "random" and now else "")
         parts.append(f"next N  {self.perf_kind.currentText()} 8 bars {8 * bar_s:.1f} s  "
                      f"drums {style}")
         intro = self.intro_style.currentText()
@@ -3544,7 +3600,7 @@ All three sit next to the program.</li>
             w.currentIndexChanged.connect(lambda *_a, t=t, key=key: self._mc_changed(t, key))
         else:
             lo, hi = CYCLES_RANGES[kind]
-            w = QSpinBox(minimum=lo, maximum=hi)
+            w = McSpin(minimum=lo, maximum=hi)
             if kind in ("pct", "swing"):
                 w.setSuffix(" %")
             elif kind == "semi":
@@ -4526,6 +4582,8 @@ All three sit next to the program.</li>
             return w.isChecked()
         if ident == "record":
             return self.takes.recording
+        if ident == "show_record":
+            return self._show_rec is not None
         if ident == "shader":
             return self.shader.currentText() != "off"
         if ident == "pitch_lock":
@@ -5211,6 +5269,21 @@ All three sit next to the program.</li>
             "hits ratcheted; it takes a while to render). random: one of those eight. intro and outro: 8 bars shaped by the intro "
             "and outro styles above; an outro is entered at bar 5, ends in silence and "
             "stops the sections on its last bar.")
+        self.perf_drum_kind = QComboBox()
+        self.perf_drum_kind.addItems(DRUM_KINDS)
+        self.perf_drum_kind.setToolTip(
+            "The drums' own kind: the drums and the sub play this rung while the "
+            "layers, chops and events follow next kind (insane drums under sparse "
+            "layers, a sparse beat under overload textures). same as kind: the "
+            "section's kind for everything, as before. random: one of the eight, "
+            "drawn per section. An intro keeps its own drums. Remembered; "
+            "drum_kind_next in the Controls tab steps through it.")
+        self.perf_drum_kind.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.perf_drum_kind.setMinimumContentsLength(9)
+        v = str(self.settings.value("perform/drum_kind", DRUM_SAME))
+        self.perf_drum_kind.setCurrentText(v if self.perf_drum_kind.findText(v) >= 0 else DRUM_SAME)
+        self.perf_drum_kind.currentTextChanged.connect(
+            lambda t: self.settings.setValue("perform/drum_kind", t))
         # the live clock's bpm box again (the Sections tab's), the two one value
         self.perf_bpm = QDoubleSpinBox(minimum=40.0, maximum=240.0, singleStep=1.0,
                                        decimals=1, suffix=" bpm")
@@ -5221,6 +5294,7 @@ All three sit next to the program.</li>
         self.live_bpm.valueChanged.connect(self.perf_bpm.setValue)
         form.addRow("Material", self._row([("", self.perf_material),
                                            ("next kind", self.perf_kind),
+                                           ("drum kind", self.perf_drum_kind),
                                            ("", self.perf_bpm)]))
         # the takes above the section buttons: what the section is built from,
         # then what plays it
@@ -5264,10 +5338,23 @@ All three sit next to the program.</li>
                              "the files already written to videos/ stay. Key "
                              "Ctrl+Shift+R, and a MIDI button.")
         clear_btn.clicked.connect(self.clear_takes)
+        # the performance to disk: what the room heard, the buses, the MIDI
+        self.show_rec_btn = QPushButton("● record performance (Ctrl+R)")
+        self.show_rec_btn.setCheckable(True)
+        self.show_rec_btn.setToolTip(
+            "Record the performance to disk until the next press, in a new folder "
+            "of recordings/ (the date and time): master.wav, the output as heard "
+            "(after the racks, the VST inserts, the volume and the limiter), 24-bit; "
+            "live, drums, layers, chops and events as stereo 24-bit FLACs each, after "
+            "their racks and their mutes, to mix again in a DAW, sample-aligned with "
+            "the master; midi.mid, what left the MIDI out (notes, CCs), with a marker "
+            "per section; meta.json. Needs the audio stream open. Key Ctrl+R, and a "
+            "MIDI button.")
+        self.show_rec_btn.clicked.connect(self.toggle_show_record)
         form.addRow("Takes", self._row([("", self.rec_btn), ("", drop_btn),
                                         ("pre-roll", self.take_pre),
                                         ("limit", self.take_limit), ("", save_btn),
-                                        ("", clear_btn)]))
+                                        ("", clear_btn), ("", self.show_rec_btn)]))
         self.take_status = QLabel("no takes")
         self.take_status.setProperty("role", "sub")
         form.addRow("", self.take_status)
@@ -5382,7 +5469,9 @@ All three sit next to the program.</li>
             "section lands on its bar. Some styles move a knob instead: an LFO on the "
             "ladder rising over 4 bars for house, on the chops' pitch stepping at random "
             "for glitch, on the events' delay drifting for dub, into LFO slots that are "
-            "off (never one you turned on), taken back before the next section. And "
+            "off (never one you turned on), taken back before the next section; a knob one "
+            "of your own LFOs holds is left to it: not set, not cleared, no LFO of auto fx's "
+            "on it, no move. And "
             "the racks move in time: a delay thrown on an 8th now and then, a crusher "
             "for a beat, a reverb tail on the loop's last bar, the ladder closing over "
             "the last two, several at once, each style its own moves, drawn afresh per "
@@ -5396,8 +5485,10 @@ All three sit next to the program.</li>
         self.perf_auto_fx_drums = QCheckBox("auto fx drums")
         self.perf_auto_fx_drums.setToolTip(
             "The same for the drum voices' racks (kick, snare, hats, ride, the stutter, "
-            "the sub; the Audio FX tab's second grid): set, moved and thrown for the "
-            "style as each section lands, a reverb on the snare, the snare into the echo "
+            "the sub; the Audio FX tab's second grid): set, moved and thrown for the drum "
+            "style, the kit's own (the stems' tick follows the feel; the two are one unless "
+            "the Feel box says otherwise), as each section lands, a reverb on the snare, the "
+            "snare into the echo "
             "on the fourth beat of the even bars for dub, the codec on the snare for a "
             "16th here and there for glitch, drive on the kick for gabber, the hats' "
             "highpass rising over the last four bars for house. Their racks sit before "
@@ -5406,8 +5497,36 @@ All three sit next to the program.</li>
         self.perf_auto_fx_drums.setChecked(
             self.settings.value("perform/auto_fx_drums", False, type=bool))
         self.perf_auto_fx_drums.toggled.connect(lambda on: self._auto_fx_changed("drums", on))
+        self.perf_auto_fx_mc = QCheckBox("auto fx m:c")
+        self.perf_auto_fx_mc.setToolTip(
+            "The Model:Cycles' own sound moved for the drum style (the kit's own, as the drum "
+            "voices' racks), over CC on the MIDI out "
+            "(the M:C tab's box, the MIDI out open): its tracks' pitch, decay, color, "
+            "shape, sweep, contour, pan, delay and reverb sends, chance, punch and gate, "
+            "its delay time and feedback, its reverb size and tone, held for the section "
+            "or thrown in time, and the retrig, each with its own rate, length, fade and "
+            "velocity: the hats rolled in 32nds for a beat for halftime, the snare's roll "
+            "fading in over the last beats, the snare into the box's echo on the fourth "
+            "beat of the even bars for dub, the glitch and idm tracks retriggered in 64ths. "
+            "The drum kind playing sets how much: a sparse beat moves the box a little, "
+            "an overload one a lot, a build adds the roll into the drop. The M:C tab's "
+            "values are the centre the moves come back to (read as each section is "
+            "queued; the cells are never changed, but one the moves hold elsewhere lights up "
+            "showing what the box gets, as on the Audio FX grid, and a track's retrig "
+            "button turns blue and reads auto while an auto retrig runs), a cell an LFO "
+            "holds is left alone, a "
+            "sampler track's pitch too. The moves run in the audio engine on the "
+            "section's loop, ahead like the hits, and switch with the section on its "
+            "bar. A retrig plays only while its drum is heard (the mutes, the pedal), "
+            "never over one held by hand, and not at all for a drum whose note is off in "
+            "the MIDI out panel. The log says what was drawn. Unticked or the "
+            "section stopped, the box gets the tab's values back. Remembered.")
+        self.perf_auto_fx_mc.setChecked(
+            self.settings.value("perform/auto_fx_mc", False, type=bool))
+        self.perf_auto_fx_mc.toggled.connect(self._auto_mc_changed)
         form.addRow("Break", self._row([("", glitch_btn), ("", break_btn), ("", self.perf_gap),
-                                        ("", self.perf_auto_fx), ("", self.perf_auto_fx_drums)]))
+                                        ("", self.perf_auto_fx), ("", self.perf_auto_fx_drums),
+                                        ("", self.perf_auto_fx_mc)]))
         form.addRow("Stems", stems_row)
         drums_at = form.rowCount()                     # the Drums row goes right under
         # the repeat: held from a key, a note or this latching button
@@ -6027,7 +6146,7 @@ All three sit next to the program.</li>
         return self._wrap(form, self._randomize_video)
 
     def _tab_lfo(self):
-        """Eight LFOs, every slot a row: on, destination (any knob of the
+        """Sixteen LFOs, every slot a row: on, destination (any knob of the
         Controls tab), shape, rate (a cycle length in bars, on the live
         clock), depth, phase, polarity, mode, and its wave right now. The
         rows are remembered as the stage setup, on states included."""
@@ -6484,7 +6603,7 @@ All three sit next to the program.</li>
                              "inserts bypass",
                     "voices": "the drum voices in or out, the solos, the stems, the quantize "
                               "grid",
-                    "lfo": "the eight LFO rows, on states included",
+                    "lfo": "the sixteen LFO rows, on states included",
                     "video": "the source grade, every effect strength, the shader, its "
                              "opacity and blend, video-only, the picture mode and the "
                              "dissolve",
@@ -7342,12 +7461,14 @@ All three sit next to the program.</li>
             "lists the WASAPI devices. When it cannot be opened, songs fall "
             "back to Qt's player, without racks.")
         self.through_block = QComboBox()
-        self.through_block.addItems(["64", "128", "256", "480", "512", "1024", "2048"])
+        self.through_block.addItems(["16", "48", "64", "96", "128", "160", "192", "256", "480",
+                                     "512", "1024", "2048"])
         self.through_block.setToolTip(
-            "Frames per block, the usual driver sizes: at 48 kHz 64 = 1.3 ms, 128 = "
-            "2.7 ms, 256 = 5.3 ms, 512 = 10.7 ms, 1024 = 21 ms, 2048 = 43 ms each "
+            "Frames per block, the usual driver sizes: at 48 kHz 16 = 0.3 ms, 48 = "
+            "1 ms, 64 = 1.3 ms, 96 = 2 ms, 128 = 2.7 ms, 160 = 3.3 ms, 192 = 4 ms, "
+            "256 = 5.3 ms, 512 = 10.7 ms, 1024 = 21 ms, 2048 = 43 ms each "
             "way. 480 is WASAPI shared mode's 10 ms period. Python processes one "
-            "block per round, so 64 and 128 want ASIO or an exclusive device and "
+            "block per round, so the sizes up to 128 want ASIO or an exclusive device and "
             "a quiet machine; raise the size if xruns appear. On ASIO match the "
             "driver panel's buffer.")
         self.through_sr = QComboBox()
@@ -7800,6 +7921,7 @@ All three sit next to the program.</li>
         self.perf_gap.setChecked(sv("perform/gap", False, type=bool))
         self.perf_auto_fx.setChecked(sv("perform/auto_fx", False, type=bool))
         self.perf_auto_fx_drums.setChecked(sv("perform/auto_fx_drums", False, type=bool))
+        self.perf_auto_fx_mc.setChecked(sv("perform/auto_fx_mc", False, type=bool))
         combo(self.rep_div, "perform/rep_div", REPEAT_DEFAULT)
         combo(self.speed_sync, "perform/speed_sync", SPEED_SYNC_DEFAULT)
         combo(self.pitch_mode, "perform/pitch", PITCH_MODES[0])
@@ -7819,6 +7941,7 @@ All three sit next to the program.</li>
             getattr(self, f"freeze_{name}").setValue(sv(f"perform/freeze_{name}", d, type=int))
         self.burst_len.setValue(sv("perform/burst_ms", 100.0, type=float))
         combo(self.perf_quant, "perform/quant", QUANT_DEFAULT)
+        combo(self.perf_drum_kind, "perform/drum_kind", DRUM_SAME)
         # the M:C tab: the cells, the modes, the FX channel, the retrig
         try:
             saved = json.loads(sv("mc/values", "") or "{}")
@@ -8903,7 +9026,8 @@ All three sit next to the program.</li>
                 "drum_style": self.drum_style.currentText(),
                 "feel": self.feel.currentText(),
                 "intro_style": self.perf_intro.currentText(),      # the Perform tab's copies:
-                "outro_style": self.perf_outro.currentText()}      # never none
+                "outro_style": self.perf_outro.currentText(),      # never none
+                "drum_kind": self.perf_drum_kind.currentText()}    # the drums' own rung
 
     def generate(self):
         self._show_log()                        # watch the render as it goes
@@ -9649,6 +9773,7 @@ All three sit next to the program.</li>
         # an outro is entered at its second half: four bars of groove into
         # the ending effect and the ring-out, then the stop
         start_bar = sec.bars // 2 if sec.kind == "outro" else 0
+        self._auto_mc_arm(sec)              # the box's moves for it, armed before it is queued
         pl.queue(stems, sec.events, sec.bpm, sec.bars, bar_t0, start_bar,
                  style=getattr(sec, "drum_style", None), root=getattr(sec, "root", None),
                  mode=getattr(sec, "mode", None), sub=getattr(sec, "sub_notes", None))
@@ -9658,8 +9783,8 @@ All three sit next to the program.</li>
         self._perf_playing = sec
         self._perf_current = (sec, stems, self.through.sr)   # what a start brings back
         self.perf_next_btn.setText("next section")           # from here on N moves on
-        self._auto_fx_pending = (getattr(sec, "feel", None) or getattr(sec, "drum_style", None),
-                                 getattr(sec, "seed", None))   # applied as it lands on the bar
+        self._auto_fx_pending = (self._auto_fx_styles(sec),      # applied as it lands on the bar
+                                 getattr(sec, "seed", None))
         wait = "" if bar_t0 is None or bar_t0 <= time.monotonic() \
             else f", on the Link bar in {bar_t0 - time.monotonic():.1f} s"
         self.log.appendPlainText(f"section: {sec.kind} {sec.bpm:.0f} bpm, "
@@ -9892,6 +10017,24 @@ All three sit next to the program.</li>
 
     AUTO_FX_GROUPS = {"stems": STEMS, "drums": VOICES}   # a tick's racks
 
+    @staticmethod
+    def _auto_fx_styles(sec, feel=None, drum_style=None):
+        """The style each auto fx group draws from, {group: style}: the
+        stems follow the section's feel (it shapes the layers, the chops
+        and the events), the drum voices, and auto fx m:c with them, the
+        drum style (it shapes the kit); the two are one unless the Feel
+        box says otherwise, and either stands in for the other when
+        missing. `sec` a Section, or None with the two names given (a
+        song's)."""
+        if sec is not None:
+            feel = getattr(sec, "feel", None)
+            drum_style = getattr(sec, "drum_style", None)
+        return {"stems": feel or drum_style, "drums": drum_style or feel}
+
+    def _lfo_held(self):
+        """The knob ids the LFO slots that are on hold right now."""
+        return {r["dest"].currentData() for r in self.lfo_rows if r["on"].isChecked()}
+
     def _auto_fx_changed(self, group, on):
         """A tick: on, the section playing gets that group's racks now; off,
         everything that group set is cleared at once (its LFO slots off,
@@ -9905,13 +10048,13 @@ All three sit next to the program.</li>
             return
         sec = self._perf_playing
         if sec is not None:
-            self._auto_fx_apply(getattr(sec, "feel", None) or getattr(sec, "drum_style", None),
-                                getattr(sec, "seed", None), only=group)
+            self._auto_fx_apply(self._auto_fx_styles(sec), getattr(sec, "seed", None), only=group)
 
     def _auto_fx_clear(self, group):
         """Everything auto fx set for `group`: its LFO slots switched off
         (the knob back to its centre), its moves dropped, then its racks'
-        effect knobs to 0 (the volumes stay)."""
+        effect knobs to 0 (the volumes stay; a knob one of your own LFOs
+        holds is left to it)."""
         channels = self.AUTO_FX_GROUPS[group]
         for i in [i for i, g in self._auto_fx_lfos.items() if g == group]:
             self.lfo_rows[i]["on"].setChecked(False)
@@ -9922,27 +10065,33 @@ All three sit next to the program.</li>
             base = {d: v for d, v in g.base.items() if d[4:].split("_", 1)[0] not in channels}
             self._auto_fx_gest = gacha_autofx.Gestures(keep, g.loop / 4, base) if keep else None
             self._auto_fx_send()
+        held = self._lfo_held()                       # yours: ours for this group are off now
         for (ch, key), sp in self.afx.items():
-            if ch in channels and key != "vol":
+            if ch in channels and key != "vol" and f"afx_{ch}_{key}" not in held:
                 sp.setValue(0.0)
 
-    def _auto_fx_apply(self, style, seed=None, only=None):
+    def _auto_fx_apply(self, styles, seed=None, only=None):
         """Auto fx: the racks of the ticked groups (the four stems, the
-        drum voices; `only` one of them) cleared, then the style's plan
-        (gacha_autofx.plan) onto their knobs in the Audio FX grids, so the
-        racks take it and the grids show it, its LFOs into free slots, its
-        moves onto the loop clock. The live input's rack is left alone,
-        and a group not redrawn keeps what it has."""
+        drum voices; `only` one of them) cleared, then each group's style's
+        plan (gacha_autofx.plan; `styles` {group: style} as _auto_fx_styles
+        gives it, or one name for both) onto their knobs in the Audio FX
+        grids, so the racks take it and the grids show it, its LFOs into
+        free slots, its moves onto the loop clock. The live input's rack
+        is left alone, a group not redrawn keeps what it has, and a knob
+        one of your own LFOs holds is left to it: not set, not cleared,
+        no LFO of ours on it, no move."""
         A = gacha_autofx
+        if styles is None or isinstance(styles, str):
+            styles = {"stems": styles, "drums": styles}
         groups = []
         if getattr(self, "perf_auto_fx", None) and self.perf_auto_fx.isChecked() \
-                and only in (None, "stems"):
+                and only in (None, "stems") and styles.get("stems"):
             groups.append(("stems", STEMS, A.AUTO_FX, A.AUTO_LFO, A.AUTO_GESTURES, A.DEFAULT_GESTURES))
         if getattr(self, "perf_auto_fx_drums", None) and self.perf_auto_fx_drums.isChecked() \
-                and only in (None, "drums"):
+                and only in (None, "drums") and styles.get("drums"):
             groups.append(("drums", VOICES, A.AUTO_FX_VOICES, A.AUTO_LFO_VOICES,
                            A.AUTO_GESTURES_VOICES, A.DEFAULT_GESTURES_VOICES))
-        if not groups or not style or not hasattr(self, "afx"):
+        if not groups or not hasattr(self, "afx"):
             return
         rng = random.Random(seed) if seed is not None else random.Random()
         for name, *_ in groups:                       # last section's work for these groups: gone
@@ -9953,27 +10102,33 @@ All three sit next to the program.</li>
         moves = list(old.gestures) if old is not None else []
         said = []
         for name, channels, t_fx, t_lfo, t_moves, t_default in groups:
+            style = styles[name]
+            # the knobs your LFOs hold (ours for this group are off since the
+            # clear): never set, never given an LFO of ours; the draws are made
+            # all the same, so the section's seed alone decides them
+            held = self._lfo_held()
             p = A.plan(style, rng, t_fx, channels)
+            p = {(ch, key): v for (ch, key), v in p.items() if f"afx_{ch}_{key}" not in held}
             for (ch, key), sp in self.afx.items():
-                if ch in channels and key != "vol":
+                if ch in channels and key != "vol" and f"afx_{ch}_{key}" not in held:
                     sp.setValue(p.get((ch, key), 0.0))
-            lfos = A.plan_lfos(style, rng, t_lfo, channels)
+            lfos = [l for l in A.plan_lfos(style, rng, t_lfo, channels) if l["dest"] not in held]
             placed = self._auto_fx_place_lfos(lfos, name)
             if len(lfos) > len(placed):
                 self.log.appendPlainText(f"auto fx: {len(lfos) - len(placed)} LFO(s) left out, "
                                          "no slot off")
             # the moves in time, run by the audio engine on the loop; a knob an
-            # LFO holds, ours or the player's, is the LFO's
-            held = {r["dest"].currentData() for r in self.lfo_rows if r["on"].isChecked()}
+            # LFO holds, ours or yours, is the LFO's
+            held = self._lfo_held()
             group_moves = A.plan_gestures(style, rng, bars, exclude=held, table=t_moves,
                                           default=t_default, channels=channels)
             moves += group_moves
             base.update({f"afx_{ch}_{key}": v for (ch, key), v in p.items()})
-            said.append(f"{name}: {A.describe(p, placed)}"
+            said.append(f"{name} ({style}): {A.describe(p, placed)}"
                         + (f", {len(group_moves)} moves" if group_moves else ""))
         self._auto_fx_gest = A.Gestures(moves, bars, base) if moves else None
         self._auto_fx_send()
-        self.log.appendPlainText(f"auto fx ({style}) " + " | ".join(said))
+        self.log.appendPlainText("auto fx " + " | ".join(said))
 
     def _auto_fx_place_lfos(self, lfos, group):
         """The plan's LFOs into slots that are off, never a player's; the
@@ -10027,12 +10182,182 @@ All three sit next to the program.</li>
         self._auto_fx_shown = cells
 
     def _auto_fx_idle(self):
-        """The section stopped: the engine's moves off, the grid as set."""
+        """The section stopped: the engine's moves off, the grid as set, the
+        box's values back and the M:C tab's cells and retrig buttons their
+        own again (the poll no longer refreshes them, so here, once)."""
         self._auto_fx_gest = None
         self._auto_fx_send()
+        if self._auto_mc_running:                    # (the engine stopped its retrigs)
+            self._auto_mc_back(self._auto_mc_running)
+            self._auto_mc_running = set()            # nothing of ours on the box any more
+        self._auto_mc_rt_until = {}
+        self._auto_mc_show()                         # nothing held: every lit cell and button back
         for sp in self._auto_fx_shown:
             sp.show_move(None)
         self._auto_fx_shown = set()
+
+    # ---- auto fx m:c: the Model:Cycles moved for the style
+    def _auto_mc_changed(self, on):
+        """The tick: on, the section playing gets the box's moves now (and
+        each one queued from here on); off, the box gets the tab back."""
+        self.settings.setValue("perform/auto_fx_mc", bool(on))
+        if not on:
+            self._auto_mc_off()
+            self.log.appendPlainText("auto fx m:c: off, the box has the M:C tab's values back")
+            return
+        sec = self._perf_playing
+        la = self.through
+        if sec is not None and la is not None and la.running and la.player.playing:
+            self._auto_mc_arm(sec, now=True)
+
+    def _auto_mc_restore_rows(self, keys):
+        """(channel, cc, value) giving the box the M:C tab's values for
+        `keys`, (track, key) with a track named by its drum or "fx"."""
+        out = []
+        for track, key in keys:
+            t = "fx" if track == "fx" else CYCLES_CHANNELS.get(track)
+            if (t, key) not in self.mc:
+                continue
+            cc, _label, kind, _d, _w = MC_PARAM[key]
+            ch = self.mc_fx_channel.value() if t == "fx" else t
+            out.append((ch, cc, int(cycles_cc_value(kind, self._mc_value(t, key)))))
+        return out
+
+    def _auto_mc_arm(self, sec, now=False):
+        """Auto fx m:c for `sec`: its plan (gacha_autofx.plan_mc, from the
+        section's seed, its feel, its drum kind) compiled on the M:C tab's
+        values and handed to the engine, armed for the section's bar (`now`:
+        at once, for the one playing); the knobs the section before moved and
+        this one does not get the tab's values back as it lands."""
+        la = self.through
+        if la is None or not la.running or not hasattr(self, "mc")                 or not self.perf_auto_fx_mc.isChecked():
+            return                                    # (unticking gave the box its values back)
+        old = self._auto_mc_running
+        A = gacha_autofx
+        style = self._auto_fx_styles(sec)["drums"]    # the kit's own, as the voices' racks
+        rung = getattr(sec, "drum_kind", None) or getattr(sec, "kind", "groove")
+        seed = getattr(sec, "seed", None)
+        rng = random.Random(f"{seed}:mc") if seed is not None else random.Random()
+        bars = getattr(sec, "bars", 8) or 8
+        tracks = {role: t for t, role in MC_ROLE.items()}
+        held = self._lfo_held()
+        exclude = {(role, key) for role, t in tracks.items() for key in A.MC_KEYS
+                   if self._mc_ident(t, key) in held}
+        exclude |= {("fx", key) for key in A.MC_FX_KEYS if self._mc_ident("fx", key) in held}
+        sampler = {role for role, t in tracks.items() if self._mc_is_sampler(t)}
+        plan = A.plan_mc(style, rng, bars, rung, exclude, sampler)
+        base = {(role, key): self._mc_value(t, key) for role, t in tracks.items()
+                for key in A.MC_KEYS if (t, key) in self.mc}
+        base.update({("fx", key): self._mc_value("fx", key) for key in A.MC_FX_KEYS
+                     if ("fx", key) in self.mc})
+        voicing = self.midi_out_voicing.isChecked()   # the retrig's note as the hits': the map's,
+        shift = root_shift(sec.root) if voicing and getattr(sec, "root", None) else 0
+        notes = {}                                    # moved into the key with the voicing
+        for role in tracks:
+            note = self.midi_out_notes[role].value()
+            if note < 0:                              # the drum's note off: no hits, no retrig
+                continue
+            if voicing:
+                note += shift + 12 * self.midi_out_oct[role].value()
+            notes[role] = min(127, max(0, note))
+        rows, _touched = A.compile_mc(plan, base, bars, self.mc_fx_channel.value(), notes)
+        off = sorted({r[0] for r in plan["retrigs"] if r[0] not in notes})
+        keys = {(t, k) for t, k, *_ in plan["moves"]} | set(plan["held"])
+        restore = self._auto_mc_restore_rows(old - keys)
+        la.set_mc_moves(rows, bars, restore, on_swap=not now)
+        if now:
+            self._auto_mc_running, self._auto_mc_armed = keys, None
+        else:
+            self._auto_mc_armed = keys
+        mo = getattr(self, "midi_out", None)
+        closed = "" if mo is not None and mo.is_open \
+            else " (the MIDI out is closed, Controls tab: nothing reaches the box)"
+        left = f" (no retrig on {', '.join(off)}: the note is off)" if off else ""
+        self.log.appendPlainText(f"auto fx m:c ({style}, {rung}): {A.describe_mc(plan)}{left}{closed}")
+
+    MC_BY_CC = {cc: key for key, cc, *_ in CYCLES_PARAMS + CYCLES_FX_PARAMS}
+    MC_FX_KEYS = {key for key, *_ in CYCLES_FX_PARAMS}
+    MC_LIT = "rgba(255, 150, 110, 200)"
+    MC_RT_LIT = ("QPushButton { background: rgba(80, 200, 255, 230); color: rgb(10, 20, 30); "
+                 "font-weight: bold; border: 1px solid rgba(200, 240, 255, 250); }")
+    MC_RT_HOLD_S = 0.3             # an auto retrig's button stays lit at least this long
+
+    def _auto_mc_show(self):
+        """What auto fx m:c holds the box at, on the M:C tab, as the Audio FX
+        grid shows its moves: a cell whose knob it holds at another value
+        than the cell's own shows that value, lit (a switch lit full when
+        held on, outlined when held off), the cell's value untouched; a
+        track's retrig button lit while an auto retrig runs on it."""
+        if not hasattr(self, "mc"):
+            return
+        la = self.through
+        vals, rts = {}, []
+        if la is not None and la.running and self._auto_mc_running:
+            vals = la.mc_values or {}
+            rts = la.mc_retrigs or []
+        shown = {}
+        for k, v in vals.items():
+            try:
+                ch, cc = (int(x) for x in str(k).split("_"))
+            except ValueError:
+                continue
+            key = self.MC_BY_CC.get(cc)
+            t = "fx" if key in self.MC_FX_KEYS else ch
+            w = self.mc.get((t, key))
+            if w is None or isinstance(w, QComboBox):
+                continue
+            mine = self._mc_value(t, key)
+            if (bool(v) if isinstance(w, QCheckBox) else int(v)) == mine:
+                continue                              # back at the cell's own value
+            shown[w] = v
+        for w, v in shown.items():
+            if isinstance(w, McSpin):
+                w.show_move(v)
+            elif self._auto_mc_shown.get(w) != v:
+                w.setStyleSheet(f"QCheckBox::indicator {{ background: {self.MC_LIT}; }}" if v
+                                else f"QCheckBox::indicator {{ border: 2px solid {self.MC_LIT}; }}")
+        for w in set(self._auto_mc_shown) - set(shown):
+            if isinstance(w, McSpin):
+                w.show_move(None)
+            else:
+                w.setStyleSheet("")
+        self._auto_mc_shown = shown
+        now = time.monotonic()
+        for t in rts:                                 # held lit a moment: a 16th's roll
+            self._auto_mc_rt_until[t] = now + self.MC_RT_HOLD_S   # falls between two polls
+        for t, b in getattr(self, "mc_retrig_btns", {}).items():
+            on = self._auto_mc_rt_until.get(t, 0.0) > now and not self._mc_retrig_src[t]
+            if bool(b.property("auto_lit")) != on:    # (a hand's shows as its own: checked)
+                b.setProperty("auto_lit", on)
+                b.setText("auto" if on else "hold")
+                b.setStyleSheet(self.MC_RT_LIT if on else "")
+
+    def _auto_mc_off(self):
+        """Every auto fx m:c move stopped, now and armed, what the MIDI out
+        holds of them taken back, the box given the tab's values for the
+        knobs they touched; again a moment later for what was on its way."""
+        keys = self._auto_mc_running | (self._auto_mc_armed or set())
+        self._auto_mc_running, self._auto_mc_armed = set(), None
+        la = self.through
+        if la is not None and la.running:
+            la.set_mc_moves(None)
+        self._auto_mc_back(keys)
+
+    def _auto_mc_back(self, keys):
+        """The MIDI out's timed auto fx m:c CCs and retrigs not yet out taken
+        back, and the box given the tab's values for `keys`; again a moment
+        later for what the engine still had on its way."""
+        mo = getattr(self, "midi_out", None)
+        keys = set(keys)
+
+        def back():
+            if mo is None or not mo.is_open:
+                return
+            mo.drop_scheduled()
+            for ch, cc, v in self._auto_mc_restore_rows(keys):
+                mo.cc(ch, cc, v, force=True)
+        back()
+        QTimer.singleShot(200, back)
 
     # ---- the repeat
     def _rep_hold(self, source, on):
@@ -10423,13 +10748,16 @@ All three sit next to the program.</li>
         self._perf_sounding = True
         if pl.swapped:                                 # the live clock follows the loop
             pl.swapped = False
+            self._show_rec_mark(pl)
             if self._rep_sources:                      # still held: on the new section too
                 self._rep_apply()
             self.lfo.trigger(time.monotonic())         # trig and one-shot LFOs restart
+            if self._auto_mc_armed is not None:        # the box's moves went live with it
+                self._auto_mc_running, self._auto_mc_armed = self._auto_mc_armed, None
             if self._auto_fx_pending:                  # the racks for the section, on its bar
-                style, seed = self._auto_fx_pending
+                styles, seed = self._auto_fx_pending
                 self._auto_fx_pending = None
-                self._auto_fx_apply(style, seed)
+                self._auto_fx_apply(styles, seed)
             self.tempo.set_bpm(pl.bpm)
             self.tempo.anchor = pl.loop_t0 if pl.loop_t0 else time.monotonic()
             self._show_live_bpm()
@@ -10469,6 +10797,7 @@ All three sit next to the program.</li>
         bar_pos = pos * pl.bpm / 60.0 / 4                # bars into the loop
         bar = int(bar_pos) + 1
         self._auto_fx_show()                             # the engine's auto fx moves, on the grid
+        self._auto_mc_show()                             # and the box's, on the M:C tab
         busy = self._perf_busy
         ready = "next ready" if self._perf_ready else (
             "" if not busy else f"randomizing {busy[1]}..." if busy[0] == "shuffle" else "rendering next...")
@@ -10508,6 +10837,8 @@ All three sit next to the program.</li>
                 big += f"  ·  {sec.drum_style}"
                 if getattr(sec, "feel", None) and sec.feel != sec.drum_style:
                     big += f" / {sec.feel} feel"
+            if getattr(sec, "drum_kind", None):
+                big += f"  ·  drums {sec.drum_kind}"
             if ready:
                 big += f"  ·  {ready}"
             # an outro: silent by its last bar, the sections stop there
@@ -10598,6 +10929,118 @@ All three sit next to the program.</li>
             self.log.appendPlainText(f"take {len(self.takes.takes) + 1}: recording {what} "
                                      f"(pre-roll {self.takes.pre_roll:.0f} s, "
                                      f"limit {self.takes.limit:.0f} s)")
+
+    # ---------- the performance recording ----------
+    def toggle_show_record(self):
+        """Ctrl+R / the button / a MIDI button: start or stop recording the
+        performance (gacha_showrec)."""
+        if self._show_rec is not None:
+            self._show_record_stop()
+            return
+        la = self.through
+        if la is None or not la.running:
+            self.log.appendPlainText("recording: the audio stream is not open (Settings, audio)")
+            self._show_rec_faces()
+            return
+        try:
+            folder = show_rec_folder(RECORDINGS_DIR)
+        except OSError as e:
+            self.log.appendPlainText(f"recording: {e}")
+            self._show_rec_faces()
+            return
+        try:
+            err = la.show_rec_start(str(folder))
+        except RuntimeError as e:                    # the engine did not answer
+            err = str(e)
+        if err:
+            self.log.appendPlainText(f"recording: {err}")
+            try:
+                folder.rmdir()                       # nothing in it
+            except OSError:
+                pass
+            self._show_rec_faces()
+            return
+        rec = {"folder": folder, "midi": [], "marks": [], "bpm": float(self.tempo.bpm),
+               "lead_ms": float(self.midi_out_lead.value()),
+               "started": time.strftime("%Y-%m-%d %H:%M:%S")}
+        self._show_rec = rec
+        self.midi_out.tap = rec["midi"].append       # what leaves the port from now on
+        sec = self._perf_playing
+        if sec is not None and la.player.playing:    # the section under way: a mark at 0
+            rec["marks"].append((None, self._show_rec_label(sec)))
+        self._show_rec_timer.start(500)
+        self._show_rec_faces()
+        self.log.appendPlainText(f"recording: {folder.name}/ (master, 5 buses, MIDI)")
+
+    def _show_record_stop(self):
+        rec, self._show_rec = self._show_rec, None
+        self.midi_out.tap = None
+        self._show_rec_timer.stop()
+        la = self.through
+        info = None
+        if la is not None:
+            try:
+                info = la.show_rec_stop()
+            except Exception as e:
+                self.log.appendPlainText(f"recording: stop failed: {e}")
+        self._show_rec_faces()
+        folder = rec["folder"]
+        if not info:
+            self.log.appendPlainText(f"recording: {folder.name}/ the engine had none running")
+            return
+        t0, t0m = info.get("t0"), info.get("t0_mono")
+        marks = [(0.0 if t is None else max(0.0, t - t0m), text)
+                 for t, text in rec["marks"]] if t0m is not None else []
+        n_midi = 0
+        if t0 is not None:
+            try:
+                n_midi = show_rec_midi(folder / "midi.mid", rec["midi"], t0,
+                                       rec["lead_ms"] / 1000.0, rec["bpm"], marks)
+            except Exception as e:
+                self.log.appendPlainText(f"recording: midi.mid not written: {e}")
+        show_rec_meta(folder / "meta.json", info, started=rec["started"], bpm=rec["bpm"],
+                      midi_messages=n_midi, midi_lead_ms=rec["lead_ms"],
+                      sections=[{"t": round(t, 3), "what": text} for t, text in marks])
+        clipped = sum((info.get("clipped") or {}).values())
+        self.log.appendPlainText(
+            f"✔ recording: {folder.name}/ {info.get('seconds', 0.0):.1f} s, "
+            f"{n_midi} MIDI messages, {len(marks)} sections"
+            + (f"  ·  {clipped} samples clipped in the buses" if clipped else "")
+            + (f"  ·  error: {info['error']}" if info.get("error") else ""))
+
+    @staticmethod
+    def _show_rec_label(sec):
+        bits = [getattr(sec, "kind", None), getattr(sec, "drum_style", None)]
+        bpm = getattr(sec, "bpm", None)
+        text = " ".join(str(b) for b in bits if b)
+        return (f"{text} {bpm:g} bpm" if bpm else text) or "section"
+
+    def _show_rec_mark(self, pl):
+        """A section landed (the swap): its moment and name for the
+        recording's markers."""
+        rec, sec = self._show_rec, self._perf_playing
+        if rec is None or sec is None:
+            return
+        t = pl.loop_t0 or time.monotonic()
+        rec["marks"].append((t, self._show_rec_label(sec)))
+
+    def _show_rec_faces(self):
+        on = self._show_rec is not None
+        self.show_rec_btn.setChecked(on)
+        self.show_rec_btn.setText("■ 0:00:00" if on else "● record performance")
+
+    def _poll_show_record(self):
+        rec, la = self._show_rec, self.through
+        if rec is None:
+            return
+        st = la.show_rec_state() if la is not None else None
+        if not isinstance(st, dict):
+            return
+        s = int(st.get("s") or 0)
+        self.show_rec_btn.setText(f"■ {s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}")
+        if st.get("error") and not rec.get("error_logged"):   # disk full, the drive gone
+            rec["error_logged"] = True
+            self.log.appendPlainText(f"recording: {st['error']}, the files stop there")
 
     def discard_take(self):
         """Shift+R / the button / a pad: the take recording is dropped, nothing
@@ -10854,6 +11297,8 @@ All three sit next to the program.</li>
                 self.player.stop()
                 self.log.appendPlainText("audio: stream reopening, the song stopped")
             self._through_timer.stop()
+            if self._show_rec is not None:
+                self._show_record_stop()               # its files closed before the stream goes
             self.through.stop()
             self.through = None
         if not out_name:
@@ -11298,7 +11743,8 @@ All three sit next to the program.</li>
                      for s in meta.get("sections") or [] if "start_sec" in s],
                     {int(b): str(name) for b, name in meta.get("sub_notes") or []})
             if self.through is not None and self.through.running:   # through the racks
-                self._auto_fx_apply(meta.get("feel") or meta.get("style"), meta.get("seed"))
+                self._auto_fx_apply(self._auto_fx_styles(None, meta.get("feel"), meta.get("style")),
+                                    meta.get("seed"))
             self._sections = meta["sections"]
             self._sec_bounds = [int(s["start_sec"] * 1000)
                                 for s in self._sections]
@@ -11842,6 +12288,8 @@ All three sit next to the program.</li>
         self.live.stop()
         if self.takes.recording:
             self.takes.stop()
+        if self._show_rec is not None:
+            self._show_record_stop()            # the performance's files closed and complete
         self._flush_takes()                     # the takes reach the disk now, not during the show
         if self.through is not None:
             self.through.stop()
