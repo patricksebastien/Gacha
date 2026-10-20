@@ -462,6 +462,7 @@ AUTO_SONG = {
     "break": 0.2,                 # the change a break of a random kind, else a plain next
     "kind_next": 0.35,            # a plain next changes next kind this often (a break always)
     "drum_kind": 0.3,             # ...and drum kind, either way (same as kind favoured)
+    "skip_kinds": ("insane",),    # kinds it never draws, for either box
     "mute_pass": 0.45,            # a stem out once in an 8-bar pass this often
     "mute_stems": (("drums", 0.5), ("layers", 0.2), ("chops", 0.15), ("events", 0.15)),
     "mute_bars": ((0.25, 0.3), (0.5, 0.3), (1.0, 0.3), (2.0, 0.1)),
@@ -5529,7 +5530,7 @@ All three sit next to the program.</li>
             "section's start it draws the bars to the next change (16, 32 or 48), a plain "
             "next section or, now and then, a break of a random kind, and the next "
             "section's kinds (next kind always changes before a break and sometimes before "
-            "a plain next, drum kind sometimes, never an intro or an outro), set in the "
+            "a plain next, drum kind sometimes, never an intro, an outro or insane), set in the "
             "boxes right away so the next is rendered ahead and lands on the bar. On the "
             "way it takes a stem out for a beat, half a bar, a bar or two (the drums "
             "mostly, the layers, the chops or the events), one at a time, on the quantize "
@@ -10131,7 +10132,8 @@ All three sit next to the program.</li>
         """A section's plan (AUTO_SONG): the bars to the next change, a
         plain next or a break of a random kind; the next section's kinds
         set in the boxes now, so it renders ahead and lands on the bar
-        (never an intro or an outro); and the moves on the way: a stem out
+        (never an intro, an outro or a kind in AUTO_SONG["skip_kinds"]:
+        insane); and the moves on the way: a stem out
         for a beat to two bars, rarely the repeat run from a bar down to
         1/32 (AUTO_SONG_LADDER), a freeze for an eighth, a burst, none of
         them over the change. `start_bar`: where the loop is now (the tick
@@ -10155,13 +10157,14 @@ All three sit next to the program.</li>
         how = "break" if random.random() < C["break"] else "next"
         kind = random.choice(BREAK_KINDS) if how == "break" else None
         said = []
+        pool = [x for x in KINDS if x not in C["skip_kinds"]]   # the kinds it may draw
         if how == "break" or random.random() < C["kind_next"]:
             now_k = self.perf_kind.currentText()
-            k = random.choice([x for x in KINDS if x != now_k] or list(KINDS))
+            k = random.choice([x for x in pool if x != now_k] or pool)
             self.perf_kind.setCurrentText(k)
             said.append(f"next kind {k}")
         if random.random() < C["drum_kind"]:
-            dk = random.choices(list(DRUM_KINDS), [4, 2] + [1] * len(KINDS))[0]
+            dk = random.choices(list(DRUM_KINDS[:2]) + pool, [4, 2] + [1] * len(pool))[0]
             if dk != self.perf_drum_kind.currentText():
                 self.perf_drum_kind.setCurrentText(dk)
                 said.append(f"drum kind {dk}")
