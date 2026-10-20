@@ -8281,7 +8281,7 @@ All three sit next to the program.</li>
                                   "polyrhythm", "electro", "acid", "jungle", "gabber", "jersey",
                                   "gqom", "amapiano", "jazz", "industrial", "bruk", "ambient",
                                   "motorik", "afrobeat", "cumbia"])
-        self.drum_style.setToolTip(
+        self.style.setToolTip(
             "The style of the whole song or section, not the kit alone: its pattern "
             "family, and with it how the textures loop, where the chops land, how "
             "long the one-shots are, the swing, the fills, the sub (the README's "
