@@ -452,13 +452,13 @@ KEYMAP += [("section", "burst", "B", "burst: a slice of the material from a rand
            ("section", "break_kind_next", "", "next kind in the Break row's box (random, glitch, "
                                               "repeat, roll, rewind, echo out, riser)"),
            ("section", "auto_song", "", "auto song off/on: the set played by itself, a next or a "
-                                        "break every 16, 32 or 48 bars, stems out now and then, "
+                                        "break every 8 to 32 bars, stems out now and then, "
                                         "rarely the repeat run, a freeze, a burst")]
 BREAK_IDENTS = {"glitch": "glitch", "break": "repeat", "roll": "roll", "rewind": "rewind",
                 "echo": "echo out", "riser": "riser"}   # a key row -> SectionPlayer.fill's kind
 # auto song (Main._auto_song_plan, _auto_song_tick): the odds the conductor plays with
 AUTO_SONG = {
-    "lengths": ((16, 0.35), (32, 0.45), (48, 0.20)),   # bars to the next change, with the odds
+    "lengths": ((8, 0.2), (16, 0.4), (24, 0.2), (32, 0.2)),   # bars to the next change, with the odds
     "break": 0.2,                 # the change a break of a random kind, else a plain next
     "kind_next": 0.35,            # a plain next changes next kind this often (a break always)
     "drum_kind": 0.3,             # ...and drum kind, either way (same as kind favoured)
@@ -5543,7 +5543,7 @@ All three sit next to the program.</li>
         self.perf_auto_song = QCheckBox("auto song")
         self.perf_auto_song.setToolTip(
             "The set played by itself over the current drum style and feel: at each "
-            "section's start it draws the bars to the next change (16, 32 or 48), a plain "
+            "section's start it draws the bars to the next change (8, 16, 24 or 32), a plain "
             "next section or, now and then, a break of a random kind, and the next "
             "section's kinds (next kind always changes before a break and sometimes before "
             "a plain next, drum kind sometimes, never an intro, an outro or overload), set in the "
@@ -11187,7 +11187,7 @@ All three sit next to the program.</li>
                 big += f" | drum - {sec.drum_kind}"
             big += f" at {pl.bpm:.0f} bpm{spd}"
             if note:                                   # auto song's word stays on the line
-                big += f"  ·  {note}"
+                big += f" | {note}"
             # an outro: silent by its last bar, the sections stop there
             if sec.kind == "outro" and bar >= pl.bars and pl.pending is None:
                 self.perform_stop()                    # _perf_playing is None from here
