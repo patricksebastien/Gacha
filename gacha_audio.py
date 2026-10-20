@@ -359,6 +359,21 @@ def table_hits(table, lo, hi, shift, out):
 
 
 PHRASE_BARS = 4        # a live break lands on these bars' one (the loop's end too)
+BREAK_KINDS = ("glitch", "repeat", "roll", "rewind", "echo out", "riser")   # SectionPlayer.fill
+HOLD_KINDS = ("glitch", "repeat", "roll")   # breaks whose picture holds the slice's frame
+REWIND_SPEED = 2.5     # a rewind's speed at its end, over the transport's
+ECHO_FB = 0.68         # an echo out's feedback, a repeat over the one before
+ECHO_REPEATS = 10      # ...and how many it rings for (0.68^10 is -33 dB)
+
+
+def riser_settings(phase, up=12.0):
+    """The master freeze's settings `phase` (0..1) into a riser break: the
+    cloud smearing out (past the middle it scatters into octaves, fifths
+    and reversed grains), the grains shortening, the pitch climbing `up`
+    semitones; a quick grab, a quick let-go on the drop."""
+    p = max(0.0, min(1.0, float(phase)))
+    return {"smear": 0.15 + 0.75 * p ** 1.5, "pitch": up * p, "size_ms": 110.0 - 70.0 * p,
+            "attack": 0.02, "release": 0.02}
 RATE_MIN, RATE_MAX = 0.25, 4.0    # the transport's rate: a quarter to four times as rendered
 GRAIN, HOP = 1024, 512            # the stretch: grain length and spacing in output frames
 SEARCH = 256                      # WSOLA: how far a grain may move to line up with the last
@@ -376,14 +391,22 @@ class SectionPlayer:
     a section queued meanwhile drops in on the phrase's one, the loop's
     middle or its end. Asked earlier it waits, armed, for that bar; asked
     inside it, it runs from the next beat to the end, a beat at the least.
-    Two kinds, as in a generated song's run-up to a drop:
+    Six kinds (BREAK_KINDS). As in a generated song's run-up to a drop:
     "glitch" throws sixteenths of the bar that was playing about, some
     backwards, a stutter roll on the last beat and a gap right before the
-    bar; "break" is the song's own transition, a beat-repeat of the bar's
+    bar; "repeat" is the song's own transition, a beat-repeat of the bar's
     first slice (accelerating, steady or halving), a gap of silence before
     the drop, and a reverse cymbal swell handed in by the GUI rising under
-    it. With `gap` off neither leaves silence: the roll and the repeat run
-    right into the one. `fill_state()` tells the picture what is happening.
+    it. Then the deck's and the drummer's: "roll" repeats the snare's slice
+    (the kick's without one) in 8ths, 16ths and 32nds, rising, over the
+    loop running on underneath; "rewind" spins the loop backwards and
+    faster to the one and starts it over from bar 1 (a section queued
+    drops in instead); "echo out" cuts the last beat and throws the slice
+    before the cut into a synced delay that rings over the drop (a tail
+    per stem, through the racks); "riser" holds the mix in the master
+    freeze and climbs over the bar, let go on the one. With `gap` off none
+    leaves silence: the roll, the repeat and the rest run right into the
+    one. `fill_state()` tells the picture what is happening.
 
     A repeat (`repeat`, set from the GUI while a key or a note is held): a
     cell of the bar, a division of it (4 bars, 2 bars, bar, 1/2, ... 1/64), is read in place
@@ -469,6 +492,8 @@ class SectionPlayer:
         self.fill_armed = None               # (kind, swell): a break asked, next beat
         self._fill = None                    # dict: the break playing, see _fill_start
         self.dropped = False                 # a break just ended in a swap (GUI resets)
+        self.riser = None                    # a riser break: (phase 0..1, semitones up), LiveAudio drives the freeze
+        self._echo = None                    # an echo out's tail: per-stem delay rings, see _echo_block
         self._ev = None                      # drum_table of the section: the MIDI out
         self.lookahead = 0                   # frames ahead of the block the hits are listed
         self.hits = []                       # [(block offset, role, vel, semitones)] listed by block()
@@ -527,16 +552,19 @@ class SectionPlayer:
         return min(self.n, (pos // ph + 1) * ph) if ph else self.n
 
     def fill(self, kind="glitch", swell=None):
-        """A break of `kind` ("glitch" or "break"), on the phrase's last bar:
-        see the class note. `swell`: a (2, n) float32 clip at sr to rise into
-        the drop (the break kind), its end on the bar. No-op with no section."""
+        """A break of `kind` (BREAK_KINDS; "break" still means "repeat"), on
+        the phrase's last bar: see the class note. `swell`: a (2, n) float32
+        clip at sr to rise into the drop (the repeat kind), its end on the
+        bar. No-op with no section."""
         if self.playing:
-            self.fill_armed = (kind, swell)
+            kind = "repeat" if kind == "break" else kind
+            self.fill_armed = (kind if kind in BREAK_KINDS else "glitch", swell)
 
     def fill_state(self):
         """What the break is doing now, for the picture: {kind, k (retrigger
         count so far), frac (0..1 into the slice), gap, swell (0..1 up to the
-        drop)}, or None."""
+        drop), hold (the picture holds the slice's frame: glitch, repeat
+        and roll; a rewind, an echo out and a riser let it run)}, or None."""
         f = self._fill
         if f is None:
             return None
@@ -544,8 +572,11 @@ class SectionPlayer:
         sw = 0.0
         if f["swell"] is not None and k >= f["swell_k0"]:
             sw = (k - f["swell_k0"]) / max(1, f["swell"].shape[1])
+        elif f["kind"] == "riser":                      # the climb, to white
+            sw = k / max(1, len(f["idx"]) - f["gap_n"])
         return {"kind": f["kind"], "k": int(f["retrig"][k]), "frac": float(f["frac"][k]),
-                "gap": bool(f["retrig"][k] < 0), "swell": min(1.0, sw)}
+                "gap": bool(f["retrig"][k] < 0), "swell": min(1.0, sw),
+                "hold": f["kind"] in HOLD_KINDS}
 
     def set_repeat(self, div, offset=0, rev=False):
         """Hold: repeat `div` of a bar (4.0, 2.0, 1.0, 0.5, ... 1/64) from the cell
@@ -890,11 +921,12 @@ class SectionPlayer:
         self.hits = [(lead + int(round((off - lead + Lt - f0) / r)) - L, role, v, semis)
                      for off, role, v, semis in self.hits]
 
-    def _src_hits(self, lo, cnt, off, rev):
+    def _src_hits(self, lo, cnt, off, rev, out=None):
         """The hits of loop frames [lo, lo+cnt) (round the loop's end) to
-        the MIDI window, the first frame at block offset `off`, the range
-        played backwards with `rev`."""
+        the MIDI window (`out`, the block's hits by default), the first
+        frame at block offset `off`, the range played backwards with `rev`."""
         n = self.n
+        out = self.hits if out is None else out
         lo %= n
         done = 0
         while done < cnt:
@@ -903,7 +935,7 @@ class SectionPlayer:
             table_hits(self._ev, lo, lo + take, 0, tmp)
             for s, role, v, semis in tmp:
                 j = (s - lo) + done
-                self.hits.append((off + (cnt - 1 - j if rev else j), role, v, semis))
+                out.append((off + (cnt - 1 - j if rev else j), role, v, semis))
             done += take
             lo = 0
 
@@ -928,39 +960,125 @@ class SectionPlayer:
 
     # ---- the break's index map, built when it starts (audio thread)
     def _fill_map(self, start, beats, rng, kind):
-        """(idx, gain, retrig, frac) for `beats` beats from `start`, drawn
-        from the bar `start` sits in. glitch: random sixteenths, some
+        """(idx, gain, retrig, frac, extra) for `beats` beats from `start`,
+        drawn from the bar `start` sits in. glitch: random sixteenths, some
         reversed, repeats, the last beat a stutter roll, a sixteenth of
-        silence. break: a beat-repeat of the bar's first slice, per beat
+        silence. repeat: a beat-repeat of the bar's first slice, per beat
         1/8 1/16 1/32 1/64 (accelerate), 1/16 throughout (stutter) or 1/4
         1/8 1/16 1/32 (halving), then half a beat or a beat of silence.
-        retrig counts the slices (-1 in the gap), frac runs 0..1 in each."""
+        roll: the snare's slice (the kick's in a bar without one) repeated
+        1/8 1/8 1/16 1/32 a beat, rising in level, over the loop running on
+        (extra "bg": the frames the other stems read, "bg_role" the drum
+        rolled, "rolled" its stems); a sixteenth of rest at the end with
+        `gap`. rewind: the loop read backwards from `start`, faster and
+        faster (REWIND_SPEED at the end), a sixteenth of silence with
+        `gap`; the loop starts over after it (extra "resume" 0, "mute_hits").
+        echo out: the loop on to its last beat, which is cut; the slice
+        before the cut (a dotted 8th, an 8th or a beat) goes into delay
+        rings (extra "echo", see _echo_block) that ring on past the bar.
+        riser: the loop on under the master freeze (`riser` drives it,
+        LiveAudio applies it; extra "riser" the semitones climbed, "gap_n"
+        the rest at the end). retrig counts the slices (-1 in a gap or a
+        cut), frac runs 0..1 in each."""
         bf, n = self.beat_frames, self.n
         sx = max(1, bf // 4)                            # a sixteenth
         bar0 = (start // (4 * bf)) * 4 * bf
         idx, gain, retrig, frac = [], [], [], []
         count = [0]
+        extra = {}
 
-        def piece(src, m, rev=False):
+        def piece(src, m, rev=False, level=1.0):
             a = np.arange(src, src + m) if not rev else np.arange(src + m - 1, src - 1, -1)
             idx.append(a % n)
-            g = np.ones(m, np.float32)
+            g = np.full(m, level, np.float32)
             f = min(int(0.002 * self.sr), m // 2)      # 2 ms fades: no clicks
             if f:
-                g[:f] = np.linspace(0.0, 1.0, f, dtype=np.float32)
-                g[-f:] = np.linspace(1.0, 0.0, f, dtype=np.float32)
+                g[:f] *= np.linspace(0.0, 1.0, f, dtype=np.float32)
+                g[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
             gain.append(g)
             retrig.append(np.full(m, count[0], np.int32))
             frac.append(np.linspace(0.0, 1.0, m, endpoint=False, dtype=np.float32))
             count[0] += 1
 
         def silence(m):
+            if m <= 0:
+                return
             idx.append(np.zeros(m, np.int64))
             gain.append(np.zeros(m, np.float32))
             retrig.append(np.full(m, -1, np.int32))
             frac.append(np.zeros(m, np.float32))
 
-        if kind == "break":
+        def run(src, m, rid=0):
+            """The loop on from `src` for `m` frames as one piece: no fade
+            in (it continues what played), a 2 ms fade out."""
+            if m <= 0:
+                return
+            idx.append(np.arange(src, src + m) % n)
+            g = np.ones(m, np.float32)
+            f = min(int(0.002 * self.sr), m // 2)
+            if f:
+                g[-f:] = np.linspace(1.0, 0.0, f, dtype=np.float32)
+            gain.append(g)
+            retrig.append(np.full(m, rid, np.int32))
+            frac.append(np.linspace(0.0, 1.0, m, endpoint=False, dtype=np.float32))
+            count[0] += 1
+
+        T = beats * bf
+        rest = sx if self.gap else 0                    # the breath before the one
+        if kind == "roll":
+            tmp = []                                    # the drum rolled: the snare, else the kick
+            table_hits(self._ev, bar0, bar0 + 4 * bf, 0, tmp)
+            src, role = bar0, "snare"
+            for want in ("snare", "kick"):
+                at = sorted(t for t, r_, _v, _s in tmp if r_ == want)
+                if at:
+                    src, role = int(at[0]), want
+                    break
+            rolled = {role} if role in self.stems else set(self.stems)
+            plan = [2, 2, 4, 8][-beats:]                # pieces a beat: 1/8 1/8 1/16 1/32
+            n_pieces = sum(plan)
+            i = 0
+            for div in plan:
+                m = max(1, bf // div)
+                for _ in range(div):
+                    if sum(len(a) for a in idx) + m > T - rest:
+                        break
+                    piece(src, m, level=0.55 + 0.45 * i / max(1, n_pieces - 1))
+                    i += 1
+            silence(rest)
+            if rolled != set(self.stems):               # the rest of the kit and the music go on
+                extra = {"bg": (start + np.arange(T)) % n, "bg_role": role, "rolled": rolled}
+        elif kind == "rewind":
+            move = T - rest
+            u = np.arange(1, move + 1, dtype=np.float64) / move
+            head = start - np.cumsum(1.0 + (REWIND_SPEED - 1.0) * u * u)
+            idx.append(np.floor(head).astype(np.int64) % n)
+            g = np.ones(move, np.float32)
+            f = min(int(0.002 * self.sr), move // 2)
+            if f:
+                g[-f:] = np.linspace(1.0, 0.0, f, dtype=np.float32)
+            gain.append(g)
+            retrig.append(np.zeros(move, np.int32))
+            frac.append(np.linspace(0.0, 1.0, move, endpoint=False, dtype=np.float32))
+            silence(rest)
+            extra = {"resume": 0, "mute_hits": True}
+        elif kind == "echo out":
+            cut = T - bf if beats >= 2 else 0           # the last beat is cut
+            run(start, cut)
+            silence(T - cut)
+            D = int(rng.choice([3 * sx, 3 * sx, 2 * sx, 4 * sx]))   # a dotted 8th mostly
+            C = start + cut                             # the cut, a loop frame
+            src_i = (C - D + np.arange(D)) % n
+            extra = {"echo": {"rings": {name: data[:, src_i] * ECHO_FB
+                                        for name, data in self.stems.items()},
+                              "prev": {name: np.zeros(2, np.float32) for name in self.stems},
+                              "D": D, "fb": ECHO_FB, "pos": 0, "left": ECHO_REPEATS * D,
+                              "at": cut, "on": False}}
+        elif kind == "riser":
+            run(start, T - rest, rid=-1)                # the mix on, under the freeze
+            silence(rest)
+            extra = {"riser": float(rng.choice([7.0, 12.0, 12.0])), "gap_n": rest}
+        elif kind == "repeat":
             flavour = rng.choice(["accelerate", "accelerate", "stutter", "halving"])
             full = {"accelerate": [1, 2, 4, 8, 16], "halving": [1, 1, 2, 4, 8],
                     "stutter": [4, 4, 4, 4, 4]}[flavour]
@@ -1004,7 +1122,7 @@ class SectionPlayer:
             gain = np.concatenate([gain, np.zeros(pad, np.float32)])
             retrig = np.concatenate([retrig, np.full(pad, -1, np.int32)])
             frac = np.concatenate([frac, np.zeros(pad, np.float32)])
-        return idx[:want], gain[:want], retrig[:want], frac[:want]
+        return idx[:want], gain[:want], retrig[:want], frac[:want], extra
 
     def _fill_start(self, i0):
         """A beat has just passed at `i0`, inside a phrase's last bar: the
@@ -1014,17 +1132,29 @@ class SectionPlayer:
         beat = i0 // bf                                 # the beat we are in
         end = self.phrase_end(i0)                       # in loop frames
         beats = max(1, -(-(end - beat * bf) // bf))     # beats to it, this one included
-        idx, gain, retrig, frac = self._fill_map(beat * bf, beats, random.Random(), kind)
+        idx, gain, retrig, frac, extra = self._fill_map(beat * bf, beats, random.Random(), kind)
         late = i0 - beat * bf                           # the block boundary: a few ms in
         idx, gain, retrig, frac = idx[late:], gain[late:], retrig[late:], frac[late:]
+        bg = extra.get("bg")
+        if bg is not None:
+            bg = bg[late:]
         k0 = 0
         if swell is not None:                           # its end on the drop
             if swell.shape[1] > len(idx):
                 swell = swell[:, swell.shape[1] - len(idx):]
             k0 = len(idx) - swell.shape[1]
+        echo = extra.get("echo")
+        if echo is not None:                            # replaces a tail still ringing
+            echo["at"] = max(0, echo["at"] - late)
+            self._echo = echo
         self._fill = {"idx": idx, "gain": gain, "retrig": retrig, "frac": frac, "k": 0,
                       "end": end, "kind": kind, "swell": swell, "swell_k0": k0, "ko": 0,
-                      "covered": 0, "after": 0}     # the MIDI out's window, see _fill_hits
+                      "covered": 0, "after": 0,       # the MIDI out's window, see _fill_hits
+                      "bg": bg, "bg0": int(bg[0]) if bg is not None and len(bg) else 0,
+                      "bg_role": extra.get("bg_role"), "rolled": extra.get("rolled") or set(),
+                      "resume": int(extra.get("resume", end)),
+                      "mute_hits": bool(extra.get("mute_hits")),
+                      "gap_n": int(extra.get("gap_n", 0)), "riser": extra.get("riser")}
         self.fill_armed = None
 
     def queue(self, stems, events, bpm, bars, bar_t0=None, start_bar=0, style=None,
@@ -1105,6 +1235,7 @@ class SectionPlayer:
                 self.stopped = True
             self.stems, self.events, self.n, self.pos = None, [], 0, 0
             self._ev = None
+            self.fill_armed, self._echo, self.riser = None, None, None
             self.repeat, self._rep_anchor, self._heard = None, None, None
             self._rep_release = None
             self._brake, self._tfrac, self._hcov = None, 0.0, None
@@ -1182,17 +1313,20 @@ class SectionPlayer:
 
     def _fill_hits(self, k, bs):
         """A break: the window over the fill's slice map, each slice's hits
-        where they sound (reversed slices reversed), then what follows the
-        drop: the pending section from 0, or the loop on from the bar."""
+        where they sound (reversed slices reversed; a roll's map gives the
+        rolled drum's, the loop running on under it the other roles'; a
+        rewind gives none), then what follows the drop: the pending section
+        from 0, or the loop on from where it resumes."""
         f = self._fill
-        idx, retrig, end = f["idx"], f["retrig"], f["end"]
+        idx, retrig = f["idx"], f["retrig"]
         L = self._L
         a0, b = k + L, k + L + bs
         a = max(k, min(a0, f["covered"]))
         f["covered"] = b
         w1 = min(b, len(idx))
+        rolled = f["bg_role"]                              # None: every role from the map
         p = a
-        while p < w1:
+        while p < w1 and not f["mute_hits"]:
             r = retrig[p]
             q = p + 1
             while q < w1 and retrig[q] == r:
@@ -1200,14 +1334,18 @@ class SectionPlayer:
             if r >= 0:
                 src0 = int(idx[p])
                 rev = q - p > 1 and idx[q - 1] < src0
+                tmp, got = [], []
                 if rev:                                    # frames src0, src0-1, ...
-                    tmp = []
                     table_hits(self._ev, src0 - (q - p) + 1, src0 + 1, 0, tmp)
-                    self.hits.extend((p - a0 + (src0 - t), role, v, semis)
-                                     for t, role, v, semis in tmp)
+                    got = [(p - a0 + (src0 - t), role, v, semis) for t, role, v, semis in tmp]
                 else:
-                    table_hits(self._ev, src0, src0 + (q - p), p - a0 - src0, self.hits)
+                    table_hits(self._ev, src0, src0 + (q - p), p - a0 - src0, got)
+                self.hits.extend(h for h in got if rolled is None or h[1] == rolled)
             p = q
+        if f["bg"] is not None and w1 > a and not f["mute_hits"]:   # the loop under a roll
+            got = []
+            self._src_hits(f["bg0"] + a, w1 - a, a - a0, False, got)
+            self.hits.extend(h for h in got if h[1] != rolled)
         if b > len(idx):                                   # past the drop
             start = max(a, len(idx))
             if self.pending is not None:
@@ -1216,7 +1354,7 @@ class SectionPlayer:
                     self._collect(nxt, start - len(idx), b - start, start - a0, nxt)
                 self._pend_covered = b - len(idx)
             elif self.n:
-                self._collect(self._ev, (end + start - len(idx)) % self.n, b - start,
+                self._collect(self._ev, (f["resume"] + start - len(idx)) % self.n, b - start,
                               start - a0, self._ev)
             f["after"] = b - len(idx)
 
@@ -1284,6 +1422,8 @@ class SectionPlayer:
                     gain = np.ones(n_out, np.float32)
                     gain[:f] = np.linspace(0.0, 1.0, f, dtype=np.float32)
             self._render(out, P, rep, lead, gain)
+            if self._echo is not None and self._echo["on"]:   # an echo out's tail rings on
+                self._echo_block(out, bs, lead)
             last = int(math.floor(P[-1])) if n_out else i0
             if rep is not None:
                 idx, _g, self._rep_info = self._rep_map(np.array([last]), rep)
@@ -1375,11 +1515,27 @@ class SectionPlayer:
             hi = np.minimum(lo + 1, len(idx) - 1)
             g_lo, g_hi = gain[lo] * (1.0 - fr), gain[hi] * fr
             sl, sh = idx[lo], idx[hi]
+        bg, rolled = f["bg"], f["rolled"]
+        if mo and bg is not None:
+            bl, bh = bg[lo], bg[hi]
         for name, data in self.stems.items():
             blk = np.zeros((2, bs), np.float32)
             if mo:
-                blk[:, :mo] = data[:, sl] * g_lo + data[:, sh] * g_hi
+                if bg is not None and name not in rolled:   # the loop on, under a roll
+                    blk[:, :mo] = data[:, bl] * (1.0 - fr) + data[:, bh] * fr
+                else:
+                    blk[:, :mo] = data[:, sl] * g_lo + data[:, sh] * g_hi
             out[name] = blk
+        e = self._echo
+        if e is not None:                         # an echo out: its tail from the cut on
+            if not e["on"] and k + m > e["at"]:
+                e["on"] = True
+                self._echo_block(out, bs, min(bs, int(round(max(0.0, e["at"] - k - f0) / r))))
+            elif e["on"]:
+                self._echo_block(out, bs, 0)
+        if f["riser"] is not None:                # the freeze's climb, LiveAudio applies it
+            on_n = len(idx) - f["gap_n"]
+            self.riser = (min(1.0, k / max(1, on_n)), f["riser"]) if k < on_n else None
         if self.frag.sounding or self.frag._req:  # the fragments over the break too
             duck = self.frag.block(self.stems, self.n, 4 * self.beat_frames, self.grid_i0 + f0,
                                    r, False, out, bs)
@@ -1404,19 +1560,55 @@ class SectionPlayer:
         if k + m < len(idx):
             f["k"] = k + m
             if mo:
-                self.pos = int(sl[-1]) if g_lo[-1] + g_hi[-1] > 0 else self.pos
+                if bg is not None:                    # the picture follows the music
+                    self.pos = int(bl[-1])
+                elif g_lo[-1] + g_hi[-1] > 0:
+                    self.pos = int(sl[-1])
         else:                                         # done: the drop
             self._fill = None
-            self.pos = end % self.n
+            self.riser = None
+            self.pos = f["resume"] % self.n           # the bar, or bar 1 after a rewind
             self._bar_crossed = True                  # the one: a replace lands here
             self._covered = self.pos + f["after"]
             if self.pending is not None:
                 self._swap()
                 self.dropped = True
-            elif self.pos == 0:
-                self.loop_t0 = time.monotonic()
+            else:
+                if self.pos == 0:
+                    self.loop_t0 = time.monotonic()
+                if f["kind"] == "rewind":             # the same section again: a drop all the same
+                    self.dropped = True
             on_beat = True
         return on_beat
+
+    def _echo_block(self, out, bs, off):
+        """An echo out's tail into `out` from `off` frames into the block:
+        the delay rings (one per stem, the slice before the cut) read out
+        and written back a round later at ECHO_FB, averaged two taps per
+        round so every repeat comes back darker, until the repeats have
+        rung out (ECHO_REPEATS rounds)."""
+        e = self._echo
+        m = bs - off
+        if e is None or m <= 0:
+            return
+        D, p = e["D"], e["pos"]
+        i = (p + np.arange(m)) % D
+        for name, ring in e["rings"].items():
+            y = ring[:, i]
+            blk = out.get(name)
+            if blk is None:
+                blk = out[name] = np.zeros((2, bs), np.float32)
+            blk[:, off:] += y
+            prev = e["prev"][name]
+            w = np.empty_like(y)
+            w[:, 0] = 0.5 * (y[:, 0] + prev)
+            w[:, 1:] = 0.5 * (y[:, 1:] + y[:, :-1])
+            e["prev"][name] = y[:, -1].copy()
+            ring[:, i] = w * e["fb"]
+        e["pos"] = (p + m) % D
+        e["left"] -= m
+        if e["left"] <= 0:
+            self._echo = None
 
     @staticmethod
     def _sum_clips(clips, bs, blk=None):
@@ -2436,6 +2628,11 @@ class LiveAudio:
         self.player.out_lat = out_lat                 # a Link bar is placed as heard
         t_block = time.perf_counter()
         sec = self.player.block(bs, now, ramp)
+        rz, fz = self.player.riser, self.freeze       # a riser break: the master freeze, driven
+        if rz is not None:
+            fz.override, fz.auto = riser_settings(*rz), True
+        elif fz.auto:
+            fz.auto, fz.override = False, None
         self._apply_moves()                           # auto fx moves for this block, before the racks
         song = self.song.block(bs)
         # the drum pads: on the quantize grid like a one-shot while a
