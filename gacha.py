@@ -11180,8 +11180,10 @@ All three sit next to the program.</li>
                 style += f" ({sec.feel} feel)"
             big = (f"{style} - {kind}" if style else kind) + root
             if getattr(sec, "drum_kind", None):
-                big += f" drum - {sec.drum_kind}"
+                big += f" | drum - {sec.drum_kind}"
             big += f" at {pl.bpm:.0f} bpm{spd}"
+            if note:                                   # auto song's word stays on the line
+                big += f"  ·  {note}"
             # an outro: silent by its last bar, the sections stop there
             if sec.kind == "outro" and bar >= pl.bars and pl.pending is None:
                 self.perform_stop()                    # _perf_playing is None from here
