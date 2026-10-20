@@ -11076,6 +11076,10 @@ All three sit next to the program.</li>
                 self.perf_meter.set_state("rendering...")
             else:
                 self.perf_meter.set_state("no section")
+            base = "play" if self._perf_current is None else "next section"
+            txt = f"{base}: rendering... (N)" if self._perf_busy else f"{base} (N)"
+            if self.perf_next_btn.text() != txt:         # the render's word on the button here too
+                self.perf_next_btn.setText(txt)
             return
         self._perf_sounding = True
         if pl.swapped:                                 # the live clock follows the loop
