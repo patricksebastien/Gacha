@@ -5302,8 +5302,8 @@ All three sit next to the program.</li>
             mine.currentTextChanged.connect(theirs.setCurrentText)
             theirs.currentTextChanged.connect(
                 lambda t, m=mine: m.setCurrentText(t) if m.findText(t) >= 0 else None)
-        form.addRow("Shapes", self._row([("intro", self.perf_intro), ("style", self.perf_style),
-                                         ("drums", self.perf_drum_style), ("outro", self.perf_outro)]))
+        form.addRow("Style", self._row([("", self.perf_style), ("drums", self.perf_drum_style),
+                                        ("intro", self.perf_intro), ("outro", self.perf_outro)]))
         self.perf_material = QComboBox()
         self.perf_material.addItems(["takes, else ticked samples", "takes only",
                                      "ticked samples"])
