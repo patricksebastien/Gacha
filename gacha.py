@@ -454,6 +454,8 @@ KEYMAP += [("section", "burst", "B", "burst: a slice of the material from a rand
            ("section", "auto_song", "", "auto song off/on: the set played by itself, a next or a "
                                         "break every 8 to 32 bars, stems out now and then, "
                                         "rarely the repeat run, a freeze, a burst")]
+KIND_ORDER = ("sparse", "break", "build", "groove", "dense", "heavy", "insane", "overload")
+assert set(KIND_ORDER) == set(KINDS)      # the kinds low to high in the boxes (the engine's own order apart)
 BREAK_IDENTS = {"glitch": "glitch", "break": "repeat", "roll": "roll", "rewind": "rewind",
                 "echo": "echo out", "riser": "riser"}   # a key row -> SectionPlayer.fill's kind
 # auto song (Main._auto_song_plan, _auto_song_tick): the odds the conductor plays with
@@ -5318,7 +5320,7 @@ All three sit next to the program.</li>
         self.perf_material.setMinimumContentsLength(9)
         self.perf_material.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         self.perf_kind = QComboBox()
-        self.perf_kind.addItems(["random"] + list(KINDS) + list(EXTRA_KINDS))
+        self.perf_kind.addItems(["random", "intro"] + list(KIND_ORDER) + ["outro"])
         self.perf_kind.setToolTip(
             "Shape of the next section. groove: full kit, one to three layers, "
             "maybe chops. break: one or two drum voices under more layers. "
@@ -5336,7 +5338,7 @@ All three sit next to the program.</li>
             "and outro styles above; an outro is entered at bar 5, ends in silence and "
             "stops the sections on its last bar.")
         self.perf_drum_kind = QComboBox()
-        self.perf_drum_kind.addItems(DRUM_KINDS)
+        self.perf_drum_kind.addItems([DRUM_SAME, "random"] + list(KIND_ORDER))
         self.perf_drum_kind.setToolTip(
             "The drums' own kind: the drums and the sub play this rung while the "
             "layers, chops and events follow next kind (insane drums under sparse "
