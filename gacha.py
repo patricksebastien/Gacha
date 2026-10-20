@@ -450,9 +450,27 @@ KEYMAP += [("section", "burst", "B", "burst: a slice of the material from a rand
            ("section", "break_any", "", "the Break row's button: the kind in its box, random "
                                         "draws one of the six"),
            ("section", "break_kind_next", "", "next kind in the Break row's box (random, glitch, "
-                                              "repeat, roll, rewind, echo out, riser)")]
+                                              "repeat, roll, rewind, echo out, riser)"),
+           ("section", "auto_song", "", "auto song off/on: the set played by itself, a next or a "
+                                        "break every 16, 32 or 48 bars, stems out now and then, "
+                                        "rarely the repeat run, a freeze, a burst")]
 BREAK_IDENTS = {"glitch": "glitch", "break": "repeat", "roll": "roll", "rewind": "rewind",
                 "echo": "echo out", "riser": "riser"}   # a key row -> SectionPlayer.fill's kind
+# auto song (Main._auto_song_plan, _auto_song_tick): the odds the conductor plays with
+AUTO_SONG = {
+    "lengths": ((16, 0.35), (32, 0.45), (48, 0.20)),   # bars to the next change, with the odds
+    "break": 0.2,                 # the change a break of a random kind, else a plain next
+    "kind_next": 0.35,            # a plain next changes next kind this often (a break always)
+    "drum_kind": 0.3,             # ...and drum kind, either way (same as kind favoured)
+    "mute_pass": 0.45,            # a stem out once in an 8-bar pass this often
+    "mute_stems": (("drums", 0.5), ("layers", 0.2), ("chops", 0.15), ("events", 0.15)),
+    "mute_bars": ((0.25, 0.3), (0.5, 0.3), (1.0, 0.3), (2.0, 0.1)),
+    "ladder": 0.1,                # the repeat run, per section
+    "freeze": 0.15,               # a freeze for an eighth, per section
+    "burst": 0.2,                 # a burst, per section
+}
+AUTO_SONG_LADDER = (("bar", 2.0), ("1/2", 1.0), ("1/4", 0.5), ("1/8", 0.25),
+                    ("1/16", 0.125), ("1/32", 0.125))   # the repeat run: (division, bars held)
 # the second video input: a webcam next to the VHS grabber, both kept open,
 # a cut between them (last in the table so the stock MIDI notes above stay put)
 KEYMAP += [("show", "video_second", "W", "second video input (the webcam) on the B side "
@@ -2262,6 +2280,7 @@ class Main(QMainWindow):
         self._shuffle_queue = []                    # parts asked for a shuffle, in turn
         self._shuffle_landing = []                  # parts handed to the player, not yet on the bar
         self._auto_fx_pending = None                # (style, seed) for the racks as a section lands
+        self._auto_song = None                      # auto song's plan for the section playing, see _auto_song_plan
         self._auto_fx_lfos = {}                     # LFO slot -> the group ("stems", "drums") that filled it
         self._auto_fx_gest = None                   # gacha_fx.Gestures: the moves, run by the engine
         self._auto_fx_shown = set()                 # grid cells showing a move
@@ -2491,6 +2510,7 @@ class Main(QMainWindow):
             "riser": lambda: self.perform_break("riser"),
             "break_any": lambda: self.perform_break(None),
             "break_kind_next": lambda: self._combo_next(self.perf_break_kind),
+            "auto_song": lambda: self.perf_auto_song.toggle(),
             "burst_len": self._burst_len_frac,
             "repeat": lambda: self._rep_hold("midi", True),
             "rep_finer": lambda: self._rep_div_step(1),
@@ -4603,7 +4623,8 @@ All three sit next to the program.</li>
                     "link": self.link_on, "midi_out": self.midi_out_on,
                     "metronome": self.midi_metro, "scene_morph": self.scene_morph_on,
                     "rep_rev": self.rep_rev, "half": self.half_btn, "double": self.double_btn,
-                    "live": self.live_on, "inserts": self.vst_bypass}
+                    "live": self.live_on, "inserts": self.vst_bypass,
+                    "auto_song": self.perf_auto_song}
         w = switches.get(ident)
         if w is not None:
             return w.isChecked()
@@ -5502,6 +5523,25 @@ All three sit next to the program.</li>
             "effect from the next break.")
         self.perf_gap.setChecked(self.settings.value("perform/gap", False, type=bool))
         self.perf_gap.toggled.connect(self._perf_gap_changed)
+        self.perf_auto_song = QCheckBox("auto song")
+        self.perf_auto_song.setToolTip(
+            "The set played by itself over the current drum style and feel: at each "
+            "section's start it draws the bars to the next change (16, 32 or 48), a plain "
+            "next section or, now and then, a break of a random kind, and the next "
+            "section's kinds (next kind always changes before a break and sometimes before "
+            "a plain next, drum kind sometimes, never an intro or an outro), set in the "
+            "boxes right away so the next is rendered ahead and lands on the bar. On the "
+            "way it takes a stem out for a beat, half a bar, a bar or two (the drums "
+            "mostly, the layers, the chops or the events), one at a time, on the quantize "
+            "grid like F1 to F4; rarely it runs the repeat from a bar down to 1/32 over "
+            "four bars, freezes the mix for an eighth, or fires a burst. The drum style, "
+            "the feel and the racks are left alone (auto fx is the racks), a stem you "
+            "muted too, and nothing it holds crosses the change. A section you start or "
+            "stop, a break you press or a rewind's re-drop start a new plan; unticked, "
+            "what it holds is let go. The log says every move, the status the bars left. "
+            "Remembered; a MIDI switch (auto_song).")
+        self.perf_auto_song.setChecked(self.settings.value("perform/auto_song", False, type=bool))
+        self.perf_auto_song.toggled.connect(lambda on: self._auto_song_changed(on))
         self.perf_auto_fx = QCheckBox("auto fx")
         self.perf_auto_fx.setToolTip(
             "Every section that starts (and a song started through the racks) has the "
@@ -5569,7 +5609,7 @@ All three sit next to the program.</li>
             self.settings.value("perform/auto_fx_mc", False, type=bool))
         self.perf_auto_fx_mc.toggled.connect(self._auto_mc_changed)
         form.addRow("Break", self._row([("", self.perf_break_kind), ("", self.break_btn),
-                                        ("", self.perf_gap),
+                                        ("", self.perf_gap), ("", self.perf_auto_song),
                                         ("", self.perf_auto_fx), ("", self.perf_auto_fx_drums),
                                         ("", self.perf_auto_fx_mc)]))
         form.addRow("Stems", stems_row)
@@ -7967,6 +8007,7 @@ All three sit next to the program.</li>
         self.perf_auto_fx.setChecked(sv("perform/auto_fx", False, type=bool))
         self.perf_auto_fx_drums.setChecked(sv("perform/auto_fx_drums", False, type=bool))
         self.perf_auto_fx_mc.setChecked(sv("perform/auto_fx_mc", False, type=bool))
+        self.perf_auto_song.setChecked(sv("perform/auto_song", False, type=bool))
         combo(self.rep_div, "perform/rep_div", REPEAT_DEFAULT)
         combo(self.speed_sync, "perform/speed_sync", SPEED_SYNC_DEFAULT)
         combo(self.pitch_mode, "perform/pitch", PITCH_MODES[0])
@@ -10069,6 +10110,213 @@ All three sit next to the program.</li>
                 self.afx[(v, key)].setValue(0.0)
             self.afx[(v, "vol")].setValue(1.0)
 
+    # ---- auto song: the set played by itself over the style and the feel
+    def _auto_song_changed(self, on, pl=None):
+        """The tick: on, a plan for the section playing from where it is;
+        off, everything auto song holds let go (its mutes, the repeat run,
+        the freeze) and the plan dropped."""
+        self.settings.setValue("perform/auto_song", bool(on))
+        if not on:
+            self._auto_song_release()
+            self.log.appendPlainText("auto song: off")
+            return
+        if pl is None:
+            pl = self._player()
+        if pl is not None and pl.playing:
+            self._auto_song_plan(pl, start_bar=pl.pos_s() * pl.bpm / 240.0)
+        else:
+            self.log.appendPlainText("auto song: on, waiting for a section (N)")
+
+    def _auto_song_plan(self, pl, start_bar=0.0, only_if_stale=False):
+        """A section's plan (AUTO_SONG): the bars to the next change, a
+        plain next or a break of a random kind; the next section's kinds
+        set in the boxes now, so it renders ahead and lands on the bar
+        (never an intro or an outro); and the moves on the way: a stem out
+        for a beat to two bars, rarely the repeat run from a bar down to
+        1/32 (AUTO_SONG_LADDER), a freeze for an eighth, a burst, none of
+        them over the change. `start_bar`: where the loop is now (the tick
+        turned on mid-section); the timeline counts bars from the loop's
+        current pass. `only_if_stale` keeps a plan made this half second
+        (a drop that came with a swap)."""
+        if not getattr(self, "perf_auto_song", None) or not self.perf_auto_song.isChecked():
+            return
+        a = self._auto_song
+        if only_if_stale and a is not None and time.monotonic() - a["t0"] < 0.5:
+            return
+        self._auto_song_release()
+        C = AUTO_SONG
+        bars = int(getattr(pl, "bars", 8) or 8)
+        cur = float(start_bar)
+        lens = [(L, w) for L, w in C["lengths"] if L >= cur + 4]
+        if lens:
+            T = random.choices([L for L, _w in lens], [w for _L, w in lens])[0]
+        else:
+            T = int(math.ceil((cur + 4) / bars)) * bars
+        how = "break" if random.random() < C["break"] else "next"
+        kind = random.choice(BREAK_KINDS) if how == "break" else None
+        said = []
+        if how == "break" or random.random() < C["kind_next"]:
+            now_k = self.perf_kind.currentText()
+            k = random.choice([x for x in KINDS if x != now_k] or list(KINDS))
+            self.perf_kind.setCurrentText(k)
+            said.append(f"next kind {k}")
+        if random.random() < C["drum_kind"]:
+            dk = random.choices(list(DRUM_KINDS), [4, 2] + [1] * len(KINDS))[0]
+            if dk != self.perf_drum_kind.currentText():
+                self.perf_drum_kind.setCurrentText(dk)
+                said.append(f"drum kind {dk}")
+        first_ok, last_ok = max(1.0, cur + 0.5), float(T - 2)
+        events = []
+        stems = [s for s, _w in C["mute_stems"]]
+        s_w = [w for _s, w in C["mute_stems"]]
+        m_len = [L for L, _w in C["mute_bars"]]
+        m_w = [w for _L, w in C["mute_bars"]]
+        for p in range(max(1, T // bars)):
+            if random.random() < C["mute_pass"]:
+                b = p * bars + random.randrange(bars * 4) / 4.0
+                L = random.choices(m_len, m_w)[0]
+                if first_ok <= b and b + L <= last_ok:
+                    events.append((b, "mute", (random.choices(stems, s_w)[0], L)))
+        ladder = None
+        total = sum(h for _d, h in AUTO_SONG_LADDER)
+        if random.random() < C["ladder"]:
+            lo, hi = int(math.ceil(first_ok)), int(math.floor(last_ok - total))
+            if hi >= lo:
+                ladder = float(random.randint(lo, hi))
+                events.append((ladder, "ladder", ()))
+        if last_ok - first_ok >= 0.5:
+            if random.random() < C["freeze"]:
+                events.append((random.randrange(int(first_ok * 4), int(last_ok * 4)) / 4.0,
+                               "freeze", (0.125,)))
+            if random.random() < C["burst"]:
+                events.append((random.randrange(int(first_ok * 16), int(last_ok * 16)) / 16.0,
+                               "burst", ()))
+        if ladder is not None:                            # nothing else over the run
+            def clear(e):
+                end = e[0] + (e[2][1] if e[1] == "mute" else e[2][0] if e[1] == "freeze" else 0.0)
+                return e[1] == "ladder" or end <= ladder or e[0] >= ladder + total
+            events = [e for e in events if clear(e)]
+        events.sort(key=lambda e: e[0])
+        self._auto_song = {"T": T, "how": how, "kind": kind, "events": events, "loops": 0,
+                           "last": None, "t": cur, "fired": False, "muted": {}, "ladder": None,
+                           "freeze_until": None, "t0": time.monotonic()}
+        self.log.appendPlainText(
+            f"auto song: {how}{' ' + kind if kind else ''} at bar {T}"
+            + (f" ({', '.join(said)})" if said else "")
+            + (f"; {len(events)} move(s) on the way" if events else ""))
+
+    def _auto_song_tick(self, pl):
+        """Every poll while a section plays: the bars since the plan's
+        pass (the loop's wraps counted), the change on its bar (a break two
+        bars before it, so it waits for the phrase's last bar; a next in
+        the bar before it), the moves at their bar, and the ends of what is
+        held: the mutes, the repeat run's steps, the freeze."""
+        a = self._auto_song
+        if a is None or not self.perf_auto_song.isChecked():
+            return
+        bars = int(pl.bars or 8)
+        bar_pos = pl.pos_s() * pl.bpm / 240.0
+        if pl.filling:                                   # a break owns the bar
+            a["last"] = None
+            return
+        if a["last"] is not None and bar_pos < a["last"] - bars / 2.0:
+            a["loops"] += 1                              # the loop came round
+        a["last"] = bar_pos
+        t = a["t"] = a["loops"] * bars + bar_pos
+        if not a["fired"]:
+            if a["how"] == "break" and t >= a["T"] - 2:
+                a["fired"] = True
+                self.perform_break(a["kind"])
+            elif a["how"] == "next" and t >= a["T"] - 1:
+                a["fired"] = True
+                self.perform_next()
+        while a["events"] and a["events"][0][0] <= t:
+            at, what, args = a["events"].pop(0)
+            self._auto_song_do(what, args, at)
+        for stem, until in list(a["muted"].items()):
+            if t >= until:
+                del a["muted"][stem]
+                cb = self.perf_stems.get(stem)
+                if cb is not None and cb.isChecked():
+                    cb.setChecked(False)
+        lad = a["ladder"]
+        if lad is not None and t >= lad["next"]:
+            lad["stage"] += 1
+            if lad["stage"] < len(AUTO_SONG_LADDER):
+                div, hold = AUTO_SONG_LADDER[lad["stage"]]
+                self.rep_div.setCurrentText(div)
+                lad["next"] += hold
+            else:
+                a["ladder"] = None
+                self._rep_hold("auto", False)
+                self.rep_div.setCurrentText(lad["div"])
+        if a["freeze_until"] is not None and t >= a["freeze_until"]:
+            a["freeze_until"] = None
+            self._freeze_hold("auto", False)
+
+    def _auto_song_do(self, what, args, at):
+        """One of the plan's moves, at its bar `at`: a stem out (never one
+        you muted, one at a time), the repeat run (not while you hold the
+        repeat), a freeze (not while you hold it), a burst."""
+        a = self._auto_song
+        if what == "mute":
+            stem, L = args
+            cb = self.perf_stems.get(stem)
+            if cb is None or cb.isChecked() or a["muted"]:
+                return
+            cb.setChecked(True)
+            a["muted"][stem] = at + L
+            self.log.appendPlainText(f"auto song: {stem} out for {L:g} bar{'s' if L > 1 else ''}")
+        elif what == "ladder":
+            if self._rep_sources or a["ladder"] is not None:
+                return
+            div, hold = AUTO_SONG_LADDER[0]
+            a["ladder"] = {"stage": 0, "next": at + hold, "div": self.rep_div.currentText()}
+            self.rep_div.setCurrentText(div)
+            self._rep_hold("auto", True)
+            self.log.appendPlainText("auto song: the repeat, a bar down to 1/32 over four bars")
+        elif what == "freeze":
+            if self._freeze_sources:
+                return
+            self._freeze_hold("auto", True)
+            a["freeze_until"] = at + float(args[0])
+            self.log.appendPlainText("auto song: a freeze for an eighth")
+        elif what == "burst":
+            self.perform_burst()
+            self.log.appendPlainText("auto song: a burst")
+
+    def _auto_song_release(self):
+        """What auto song holds, let go: its mutes (yours stay), the repeat
+        run (the division back), the freeze; the plan dropped."""
+        a = self._auto_song
+        self._auto_song = None
+        if a is None:
+            return
+        for stem in list(a["muted"]):
+            cb = self.perf_stems.get(stem)
+            if cb is not None and cb.isChecked():
+                cb.setChecked(False)
+        if a["ladder"] is not None:
+            self._rep_hold("auto", False)
+            self.rep_div.setCurrentText(a["ladder"]["div"])
+        if a["freeze_until"] is not None:
+            self._freeze_hold("auto", False)
+
+    def _auto_song_stop(self):
+        """The section stopped: nothing to conduct until the next one."""
+        if self._auto_song is not None:
+            self._auto_song_release()
+
+    def _auto_song_note(self, pl):
+        """The status line's word on the plan: the bars to the change."""
+        a = self._auto_song
+        if a is None or not getattr(self, "perf_auto_song", None) \
+                or not self.perf_auto_song.isChecked():
+            return ""
+        left = max(0, int(math.ceil(a["T"] - a["t"])))
+        what = f"{a['how']}{' ' + a['kind'] if a['kind'] else ''}"
+        return f"auto song: {what} in {left} bar{'s' if left != 1 else ''}"
+
     def _perf_gap_changed(self, on):
         self.settings.setValue("perform/gap", bool(on))
         if self.through is not None:
@@ -10776,6 +11024,7 @@ All three sit next to the program.</li>
                 self._perf_sounding = False            # or the output closed): the peers stop
                 self._link_transport(False)            # with it; idling alone sends nothing
                 self._auto_fx_idle()                   # the engine's moves off, the grid as set
+                self._auto_song_stop()                 # nothing to conduct until the next one
                 if "ui" in self._rep_sources:          # the latched repeat ends with it
                     self._rep_hold("ui", False)
                 if "ui" in self._brake_sources:        # and the latched tape stop
@@ -10816,6 +11065,7 @@ All three sit next to the program.</li>
                 styles, seed = self._auto_fx_pending
                 self._auto_fx_pending = None
                 self._auto_fx_apply(styles, seed)
+            self._auto_song_plan(pl)                   # auto song: this section's plan
             self.tempo.set_bpm(pl.bpm)
             self.tempo.anchor = pl.loop_t0 if pl.loop_t0 else time.monotonic()
             self._show_live_bpm()
@@ -10844,6 +11094,7 @@ All three sit next to the program.</li>
                 self._shuffle_faces()
         if pl.dropped:                                 # a break ended here: the drop
             pl.dropped = False
+            self._auto_song_plan(pl, only_if_stale=True)   # a rewind's re-drop: a plan anew
             self._perf_drop_t = time.monotonic()
             self.lfo.trigger(self._perf_drop_t)
             if self._live_active():
@@ -10856,9 +11107,13 @@ All three sit next to the program.</li>
         bar = int(bar_pos) + 1
         self._auto_fx_show()                             # the engine's auto fx moves, on the grid
         self._auto_mc_show()                             # and the box's, on the M:C tab
+        self._auto_song_tick(pl)                         # auto song: its moves on their bars
         busy = self._perf_busy
         ready = "next ready" if self._perf_ready else (
             "" if not busy else f"randomizing {busy[1]}..." if busy[0] == "shuffle" else "rendering next...")
+        note = self._auto_song_note(pl)
+        if note:
+            ready = f"{ready}  ·  {note}" if ready else note
         if self._shuffle_landing:
             landing = ", ".join(self._shuffle_landing) + " on the bar..."
             ready = f"{landing}  ·  {ready}" if ready else landing
