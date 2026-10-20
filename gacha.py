@@ -5358,10 +5358,9 @@ All three sit next to the program.</li>
                                  "the next section renders at it. Type it or tap it (T).")
         self.perf_bpm.valueChanged.connect(self.live_bpm.setValue)
         self.live_bpm.valueChanged.connect(self.perf_bpm.setValue)
-        form.addRow("Material", self._row([("", self.perf_material),
-                                           ("style energy", self.perf_kind),
-                                           ("drums energy", self.perf_drum_kind),
-                                           ("", self.perf_bpm)]))
+        form.addRow("Energy", self._row([("style", self.perf_kind),
+                                         ("drums", self.perf_drum_kind),
+                                         ("", self.perf_bpm)]))
         # the takes above the section buttons: what the section is built from,
         # then what plays it
         self.rec_btn = QPushButton("● record (R)")
@@ -6012,7 +6011,8 @@ All three sit next to the program.</li>
         self.perf_ab_lbl = QLabel("A 100 %  ·  B 0 %")
         self.perf_ab.setValue(100)                    # video in starts off: full B
         self.perf_ab_lbl.setProperty("role", "sub")
-        form.addRow("A/B", self._row([("", self.perf_ab), ("", self.perf_ab_lbl)]))
+        form.addRow("A/B", self._row([("", self.perf_ab), ("", self.perf_ab_lbl),
+                                      ("material", self.perf_material)]))
         # the section big, for the eyes on stage: what plays and the bar
         self.perf_meter = PerfMeter()
         self.perf_meter.setToolTip("What plays and where the loop is: the current bar lit, "
