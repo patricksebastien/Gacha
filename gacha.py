@@ -55,7 +55,7 @@ from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
 from gacha_link import INSTALL_HINT as LINK_INSTALL_HINT, LINK_AVAILABLE, LinkClock
-from gacha_audio import audio_apis, audio_devices, audio_status, PHRASE_BARS
+from gacha_audio import audio_apis, audio_devices, audio_status, BREAK_KINDS, PHRASE_BARS
 from gacha_audioproc import AudioProxy, audio_host      # the engine, in its own process
 from gacha_takes import TakeStore
 from gacha_showrec import new_folder as show_rec_folder, write_meta as show_rec_meta, \
@@ -434,11 +434,25 @@ KEYMAP += [("show", "video_prev", "", "previous ticked video, in list order"),
 KEYMAP += [("section", "burst", "B", "burst: a slice of the material from a random "
                                     "spot, now, its frame over the picture"),
            ("section", "burst_len", "", "burst length, 10 ms to 1 s (a knob, log scale)"),
-           ("section", "glitch", "G", "glitch: on the 4-bar phrase's last bar, sixteenths "
+           ("section", "glitch", "G", "glitch break: on the 4-bar phrase's last bar, sixteenths "
                                       "of it thrown about, then the next section on the one"),
-           ("section", "break", "Shift+G", "break: on the 4-bar phrase's last bar, beat-repeat, "
-                                           "gap and cymbal swell into the drop, then the next "
-                                           "section on the one")]
+           ("section", "break", "Shift+G", "repeat break (the one called break before): on the "
+                                           "phrase's last bar, the first slice beat-repeated, gap "
+                                           "and cymbal swell into the drop, then the next section"),
+           ("section", "roll", "", "roll break: the snare's slice rolled 1/8 1/16 1/32 over the "
+                                   "loop running on, then the next section"),
+           ("section", "rewind", "", "rewind break: the loop spun backwards and faster, then the "
+                                     "same section again from bar 1 (the queued one if any)"),
+           ("section", "echo", "", "echo out break: the last beat cut and thrown into a synced "
+                                   "delay that rings over the drop, then the next section"),
+           ("section", "riser", "", "riser break: the mix held in the freeze and climbing over "
+                                    "the bar, let go on the one, then the next section"),
+           ("section", "break_any", "", "the Break row's button: the kind in its box, random "
+                                        "draws one of the six"),
+           ("section", "break_kind_next", "", "next kind in the Break row's box (random, glitch, "
+                                              "repeat, roll, rewind, echo out, riser)")]
+BREAK_IDENTS = {"glitch": "glitch", "break": "repeat", "roll": "roll", "rewind": "rewind",
+                "echo": "echo out", "riser": "riser"}   # a key row -> SectionPlayer.fill's kind
 # the second video input: a webcam next to the VHS grabber, both kept open,
 # a cut between them (last in the table so the stock MIDI notes above stay put)
 KEYMAP += [("show", "video_second", "W", "second video input (the webcam) on the B side "
@@ -2470,7 +2484,13 @@ class Main(QMainWindow):
             "event": self.perform_event,
             "burst": self.perform_burst,
             "glitch": lambda: self.perform_break("glitch"),
-            "break": lambda: self.perform_break("break"),
+            "break": lambda: self.perform_break("repeat"),
+            "roll": lambda: self.perform_break("roll"),
+            "rewind": lambda: self.perform_break("rewind"),
+            "echo": lambda: self.perform_break("echo out"),
+            "riser": lambda: self.perform_break("riser"),
+            "break_any": lambda: self.perform_break(None),
+            "break_kind_next": lambda: self._combo_next(self.perf_break_kind),
             "burst_len": self._burst_len_frac,
             "repeat": lambda: self._rep_hold("midi", True),
             "rep_finer": lambda: self._rep_div_step(1),
@@ -4557,6 +4577,13 @@ All three sit next to the program.</li>
             pl = self._player()
             st = pl.frag_state() if pl is not None else None
             return st["slice"] if st else None
+        if ident in BREAK_IDENTS or ident == "break_any":   # lit while armed or running
+            pl = self._player()
+            if pl is None or not pl.playing:
+                return False
+            armed, st = pl.fill_armed, (pl.fill_state() if pl.filling else None)
+            now = (armed[0] if armed else None) or (st["kind"] if st else None)
+            return bool(now) if ident == "break_any" else now == BREAK_IDENTS[ident]
         if ident == "repeat":
             return bool(self._rep_sources)
         if ident == "brake":
@@ -5430,32 +5457,49 @@ All three sit next to the program.</li>
             self.perf_shuffles[stem] = sh
             pairs.append(("", sh))
         stems_row = self._row(pairs)                   # added under the Break row
-        glitch_btn = QPushButton("glitch (G)")
-        glitch_btn.setToolTip(
-            "A glitch break, on the phrase: it waits for the last bar of the "
-            "4-bar phrase (bar 4 or 8 of the loop), then sixteenths of the bar "
-            "are thrown about, some backwards, a "
-            "stutter roll, a sixteenth of silence, and the next section drops "
-            "in on the one. Pressed inside the last bar it runs from the next "
-            "beat. With no section playing: plain next.")
-        glitch_btn.clicked.connect(lambda: self.perform_break("glitch"))
-        break_btn = QPushButton("break (Shift+G)")
-        break_btn.setToolTip(
-            "The song's break, on the phrase: it waits for the last bar of the "
-            "4-bar phrase (bar 4 or 8 of the loop), then the bar's first slice "
-            "is beat-repeated, accelerating, steady "
-            "or halving, a reverse cymbal swell rises under it and the picture "
-            "with it to white, silence right before the drop, then the next "
-            "section on the one, with the flash. Pressed inside the last bar it "
-            "runs from the next beat. With no section playing: plain next. "
-            "Video FX flash sets the picture's share.")
-        break_btn.clicked.connect(lambda: self.perform_break("break"))
+        self.perf_break_kind = QComboBox()
+        self.perf_break_kind.addItems(["random"] + list(BREAK_KINDS))
+        self.perf_break_kind.setToolTip(
+            "The break the button fires, on the phrase: it waits for the last bar of "
+            "the 4-bar phrase (bar 4 or 8 of the loop), takes the section over for that "
+            "bar, and the next section drops in on the one; pressed inside the last bar "
+            "it runs from the next beat. random draws one of the six per press. "
+            "glitch (G): sixteenths of the bar thrown about, some backwards, a stutter "
+            "roll, a sixteenth of silence. repeat (Shift+G; the one called break before): "
+            "the bar's first slice beat-repeated, accelerating, steady or halving, the "
+            "reverse cymbal swell rising under it and the picture to white, silence before "
+            "the drop. roll: the snare's slice (the kick's in a bar without one) rolled in "
+            "8ths, then 16ths, then 32nds, rising, while the rest of the kit and the music "
+            "run on underneath. rewind: the loop spun backwards, faster and faster, the "
+            "picture with it, then the same section again from bar 1 (the queued one if a "
+            "next was asked); it queues no next by itself. echo out: the loop runs to the "
+            "last beat, which is cut, and the slice before the cut rings on in a synced "
+            "delay, darker on every repeat, through the stems' racks, over the drop. "
+            "riser: the whole mix held in the master freeze from the bar's start, the "
+            "grains shortening, the smear widening, the pitch climbing a fifth or an "
+            "octave, the picture building to white, let go on the one. Every kind is a "
+            "MIDI row too (glitch, break, roll, rewind, echo, riser; break_any is this "
+            "button, break_kind_next steps the box). Remembered.")
+        self.perf_break_kind.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.perf_break_kind.setMinimumContentsLength(8)
+        v = str(self.settings.value("perform/break_kind", "random"))
+        self.perf_break_kind.setCurrentText(v if self.perf_break_kind.findText(v) >= 0 else "random")
+        self.perf_break_kind.currentTextChanged.connect(
+            lambda t: self.settings.setValue("perform/break_kind", t))
+        self.break_btn = QPushButton("break")
+        self.break_btn.setToolTip(
+            "The break the box says, on the phrase's last bar (random: one of the six), "
+            "then the next section on the one; a rewind brings the same section back "
+            "instead. With no section playing: plain next. A MIDI button (break_any); "
+            "G and Shift+G fire glitch and repeat directly.")
+        self.break_btn.clicked.connect(lambda: self.perform_break(None))
         self.perf_gap = QCheckBox("gap before the drop")
         self.perf_gap.setToolTip(
             "The silence right before the one: a sixteenth after the glitch's "
-            "roll, half a beat or a beat after the break's repeat, as in the "
-            "generated songs. Off, the roll and the repeat run straight into "
-            "the drop. Remembered; takes effect from the next break.")
+            "roll, half a beat or a beat after the repeat, a sixteenth of rest "
+            "after the roll, the rewind and the riser, as in the generated songs. "
+            "Off, every break runs straight into the drop. Remembered; takes "
+            "effect from the next break.")
         self.perf_gap.setChecked(self.settings.value("perform/gap", False, type=bool))
         self.perf_gap.toggled.connect(self._perf_gap_changed)
         self.perf_auto_fx = QCheckBox("auto fx")
@@ -5524,7 +5568,8 @@ All three sit next to the program.</li>
         self.perf_auto_fx_mc.setChecked(
             self.settings.value("perform/auto_fx_mc", False, type=bool))
         self.perf_auto_fx_mc.toggled.connect(self._auto_mc_changed)
-        form.addRow("Break", self._row([("", glitch_btn), ("", break_btn), ("", self.perf_gap),
+        form.addRow("Break", self._row([("", self.perf_break_kind), ("", self.break_btn),
+                                        ("", self.perf_gap),
                                         ("", self.perf_auto_fx), ("", self.perf_auto_fx_drums),
                                         ("", self.perf_auto_fx_mc)]))
         form.addRow("Stems", stems_row)
@@ -7942,6 +7987,7 @@ All three sit next to the program.</li>
         self.burst_len.setValue(sv("perform/burst_ms", 100.0, type=float))
         combo(self.perf_quant, "perform/quant", QUANT_DEFAULT)
         combo(self.perf_drum_kind, "perform/drum_kind", DRUM_SAME)
+        combo(self.perf_break_kind, "perform/break_kind", "random")
         # the M:C tab: the cells, the modes, the FX channel, the retrig
         try:
             saved = json.loads(sv("mc/values", "") or "{}")
@@ -9904,17 +9950,30 @@ All three sit next to the program.</li>
         self._perf_start("shot", key)
 
     def perform_break(self, kind="glitch"):
-        """G / Shift+G: a break of `kind` on the 4-bar phrase's last bar, then
-        the next section on the one (the pre-rendered one when it fits)."""
+        """A break of `kind` (gacha_audio.BREAK_KINDS; None: the Break row's
+        box, random drawing one) on the 4-bar phrase's last bar, then the
+        next section on the one (the pre-rendered one when it fits); a
+        rewind brings the same section back instead and queues nothing."""
         if self.through is None or not self.through.running:
             self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
             return
+        if kind is None:
+            kind = self.perf_break_kind.currentText()
+        if kind == "random":
+            kind = random.choice(BREAK_KINDS)
+        if kind == "break":
+            kind = "repeat"
         pl = self.through.player
         if pl.playing and not pl.filling:
-            swell = getattr(self._perf_playing, "swell", None) if kind == "break" else None
+            swell = getattr(self._perf_playing, "swell", None) if kind == "repeat" else None
             pl.fill(kind, swell)
+            if kind == "rewind":
+                self.log.appendPlainText("rewind: on the phrase's last bar, then the same "
+                                         "section from the top" + (", or the one queued"
+                                                                   if pl.pending else ""))
+                return                                 # no next: the loop starts over
             self.log.appendPlainText(f"{kind}: on the phrase's last bar, then next"
-                                     + ("" if kind != "break" or swell is not None
+                                     + ("" if kind != "repeat" or swell is not None
                                         else " (no swell for this section)"))
         self.perform_next()                            # queued: lands when the break ends
 
@@ -12031,7 +12090,7 @@ All three sit next to the program.</li>
             if fs is not None:
                 if fs["gap"]:
                     st["freeze"] = True
-                else:
+                elif fs.get("hold", True):          # a rewind, an echo out, a riser: it runs
                     st["repeat"] = (fs["k"], fs["frac"])
                 if fs["swell"] > 0.0:
                     st["swell"] = fs["swell"]

@@ -17,8 +17,10 @@ Settings, one dict (FREEZE), set from the GUI thread and read per block:
 size (a grain, ms), smear (0..1: a position jitter round the spot of up
 to half a second, a few cents of detune and the stereo spray; past the
 middle, octave and fifth scatter and reversed grains), pitch (semitones),
-attack and release (seconds). `held` is the button; `active` tells the
-mix (and the MIDI out) whether the freeze sounds.
+attack and release (seconds). `held` is the button; `auto` the section
+player's hold (a riser break), with `override`, a dict of settings over
+FREEZE while it climbs; `active` tells the mix (and the MIDI out) whether
+the freeze sounds.
 
     fz = Freeze(48000)
     fz.held = True                       # any thread
@@ -47,6 +49,8 @@ class Freeze:
         self.ring = np.zeros((2, self.n), np.float32)
         self.rng = np.random.default_rng()
         self.held = False                                      # the button, any thread
+        self.auto = False                                      # the player's hold (a riser break)
+        self.override = None                                   # settings over FREEZE while set
         self.active = False                                    # the cloud sounds (audio thread)
         self.level = 0.0                                       # the cloud's peak, smoothed
         self._written = 0                                      # frames written in all
@@ -72,9 +76,8 @@ class Freeze:
         self.g_alpha = np.zeros(0, np.float64)                 # the Tukey ramp share
         self.g_gain = np.zeros((2, 0), np.float32)             # per channel, with the pan
 
-    @staticmethod
-    def _settings():
-        f = FREEZE
+    def _settings(self):
+        f = FREEZE if self.override is None else {**FREEZE, **self.override}
         size = max(0.02, min(0.25, float(f.get("size_ms", 80.0)) / 1000.0))
         smear = max(0.0, min(1.0, float(f.get("smear", 0.0))))
         pitch = max(-24.0, min(24.0, float(f.get("pitch", 0.0))))
@@ -172,7 +175,7 @@ class Freeze:
         """(2, bs) of the mix in, the mix with the freeze over it out."""
         bs = y.shape[1]
         sr = self.sr
-        held = bool(self.held)
+        held = bool(self.held or self.auto)
         if not held and not self._on:                          # idle: the ring only
             idx = (self._written + np.arange(bs)) % self.n
             self.ring[:, idx] = y
