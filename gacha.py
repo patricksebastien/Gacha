@@ -470,8 +470,24 @@ AUTO_SONG = {
     "freeze": 0.15,               # a freeze for an eighth, per section
     "burst": 0.2,                 # a burst, per section
 }
-AUTO_SONG_LADDER = (("bar", 2.0), ("1/2", 1.0), ("1/4", 0.5), ("1/8", 0.25),
-                    ("1/16", 0.125), ("1/32", 0.125))   # the repeat run: (division, bars held)
+AUTO_SONG_RUN = (("bar", 1.0), ("1/2", 0.5), ("1/4", 0.25), ("1/8", 0.125), ("1/16", 0.0625),
+                 ("1/32", 0.03125), ("1/64", 0.03125), ("1/64", 0.03125), ("1/32", 0.03125),
+                 ("1/16", 0.0625), ("1/8", 0.125), ("1/4", 0.25), ("1/2", 0.5))   # three bars
+
+
+def auto_song_run():
+    """The repeat auto song holds, one of three shapes drawn at random, as
+    (division, bars held) stages: the bar played again (the bar held two
+    bars); a cell of 1/2, 1/4, 1/8 or 1/16 twice; or the run (AUTO_SONG_RUN):
+    the bar, then down to 1/64 and back up to 1/2, a bar each way, so the
+    bar comes back whole after it. Let go on the bar line."""
+    r = random.random()
+    if r < 1 / 3:
+        return [("bar", 2.0)]
+    if r < 2 / 3:
+        d = random.choice(["1/2", "1/4", "1/8", "1/16"])
+        return [(d, 2 * dict(REPEAT_DIVS)[d])]
+    return list(AUTO_SONG_RUN)
 # the second video input: a webcam next to the VHS grabber, both kept open,
 # a cut between them (last in the table so the stock MIDI notes above stay put)
 KEYMAP += [("show", "video_second", "W", "second video input (the webcam) on the B side "
@@ -5534,8 +5550,9 @@ All three sit next to the program.</li>
             "boxes right away so the next is rendered ahead and lands on the bar. On the "
             "way it takes a stem out for a beat, half a bar, a bar or two (the drums "
             "mostly, the layers, the chops or the events), one at a time, on the quantize "
-            "grid like F1 to F4; rarely it runs the repeat from a bar down to 1/32 over "
-            "four bars, freezes the mix for an eighth, or fires a burst. The drum style, "
+            "grid like F1 to F4; rarely it holds the repeat (the bar again, a cell of 1/2 "
+            "to 1/16 twice, or the run from the bar down to 1/64 and back up), freezes "
+            "the mix for an eighth, or fires a burst. The drum style, "
             "the feel and the racks are left alone (auto fx is the racks), a stem you "
             "muted too, and nothing it holds crosses the change. A section you start or "
             "stop, a break you press or a rewind's re-drop start a new plan; unticked, "
@@ -10134,8 +10151,8 @@ All three sit next to the program.</li>
         set in the boxes now, so it renders ahead and lands on the bar
         (never an intro, an outro or a kind in AUTO_SONG["skip_kinds"]:
         overload); and the moves on the way: a stem out
-        for a beat to two bars, rarely the repeat run from a bar down to
-        1/32 (AUTO_SONG_LADDER), a freeze for an eighth, a burst, none of
+        for a beat to two bars, rarely the repeat held in one of three
+        shapes (auto_song_run), a freeze for an eighth, a burst, none of
         them over the change. `start_bar`: where the loop is now (the tick
         turned on mid-section); the timeline counts bars from the loop's
         current pass. `only_if_stale` keeps a plan made this half second
@@ -10181,7 +10198,8 @@ All three sit next to the program.</li>
                 if first_ok <= b and b + L <= last_ok:
                     events.append((b, "mute", (random.choices(stems, s_w)[0], L)))
         ladder = None
-        total = sum(h for _d, h in AUTO_SONG_LADDER)
+        run = auto_song_run()                              # the shape, if it is held at all
+        total = sum(h for _d, h in run)
         if random.random() < C["ladder"]:
             lo, hi = int(math.ceil(first_ok)), int(math.floor(last_ok - total))
             if hi >= lo:
@@ -10202,7 +10220,7 @@ All three sit next to the program.</li>
         events.sort(key=lambda e: e[0])
         self._auto_song = {"T": T, "how": how, "kind": kind, "events": events, "loops": 0,
                            "last": None, "t": cur, "fired": False, "muted": {}, "ladder": None,
-                           "freeze_until": None, "t0": time.monotonic()}
+                           "run": run, "freeze_until": None, "t0": time.monotonic()}
         self.log.appendPlainText(
             f"auto song: {how}{' ' + kind if kind else ''} at bar {T}"
             + (f" ({', '.join(said)})" if said else "")
@@ -10243,16 +10261,17 @@ All three sit next to the program.</li>
                 if cb is not None and cb.isChecked():
                     cb.setChecked(False)
         lad = a["ladder"]
-        if lad is not None and t >= lad["next"]:
+        while lad is not None and t >= lad["next"]:        # a stage, or several in one poll
             lad["stage"] += 1
-            if lad["stage"] < len(AUTO_SONG_LADDER):
-                div, hold = AUTO_SONG_LADDER[lad["stage"]]
+            if lad["stage"] < len(a["run"]):
+                div, hold = a["run"][lad["stage"]]
                 self.rep_div.setCurrentText(div)
                 lad["next"] += hold
             else:
                 a["ladder"] = None
                 self._rep_hold("auto", False)
                 self.rep_div.setCurrentText(lad["div"])
+                lad = None
         if a["freeze_until"] is not None and t >= a["freeze_until"]:
             a["freeze_until"] = None
             self._freeze_hold("auto", False)
@@ -10273,11 +10292,14 @@ All three sit next to the program.</li>
         elif what == "ladder":
             if self._rep_sources or a["ladder"] is not None:
                 return
-            div, hold = AUTO_SONG_LADDER[0]
+            run = a["run"]
+            div, hold = run[0]
             a["ladder"] = {"stage": 0, "next": at + hold, "div": self.rep_div.currentText()}
             self.rep_div.setCurrentText(div)
             self._rep_hold("auto", True)
-            self.log.appendPlainText("auto song: the repeat, a bar down to 1/32 over four bars")
+            shape = ", ".join(dict.fromkeys(d for d, _h in run))
+            self.log.appendPlainText(f"auto song: the repeat, {shape} over "
+                                     f"{sum(h for _d, h in run):g} bar(s)")
         elif what == "freeze":
             if self._freeze_sources:
                 return
