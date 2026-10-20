@@ -794,8 +794,9 @@ GENERIC = {id(AUTO_LFO): GENERIC_LFO, id(AUTO_LFO_VOICES): GENERIC_LFO_VOICES,
 
 # ---------------------------------------------------------------- the Model:Cycles
 # The box's own sound moved for the drum style (the kit's own), behind the Perform tab's third
-# tick, "auto fx m:c": its tracks' pitch, decay, color, shape, sweep,
-# contour, pan, delay and reverb sends, chance, punch and gate, its delay
+# tick, "auto fx m:c": its tracks' decay, color, shape, sweep, contour,
+# pan, delay and reverb sends, chance, punch and gate (never the pitch: the
+# box glides a CC jump into a portamento, and it sounded wrong), its delay
 # (time, feedback) and reverb (size, tone), and the retrig done from here,
 # each with its rate, its curve's length, its fade and its velocity: the
 # hats rolled in 32nds for a beat, the snare's build-up roll fading in over
@@ -815,8 +816,8 @@ from gacha_midi import (CYCLES_CHANNELS, CYCLES_FX_PARAMS, CYCLES_PARAMS,  # noq
                         CYCLES_RANGES, CYCLES_RETRIG_LENS, CYCLES_RETRIG_RATES,
                         cycles_cc_value)
 
-MC_KEYS = ("pitch", "decay", "color", "shape", "sweep", "contour", "pan", "dsend", "rsend",
-           "chance", "punch", "gate")
+MC_KEYS = ("decay", "color", "shape", "sweep", "contour", "pan", "dsend", "rsend",
+           "chance", "punch", "gate")                  # never the pitch (see above)
 MC_FX_KEYS = ("delay_time", "delay_fb", "rev_size", "rev_tone")
 MC_PARAMS = {key: (cc, kind) for key, cc, _l, kind, _d, _w in CYCLES_PARAMS + CYCLES_FX_PARAMS
              if key in MC_KEYS + MC_FX_KEYS}
@@ -872,14 +873,12 @@ AUTO_MC = {
                    retrig("snare", 2.0, ("1/16", "1/32"), ("8 steps",), (60, 127), (70, 100),
                           0.5, bars="last", beat=2)),
     "breakbeat": (retrig("snare", 0.5, ("1/32", "1/16"), ("1 step",), (-40, 40), (70, 110),
-                         0.5, grid=1.0, count=(1, 2)),
-                  throw("snare", "pitch", ("rel", -4, 4), 0.5, 1.0, (1, 2), 0.4)),
+                         0.5, grid=1.0, count=(1, 2)),),
     "boom-bap": (hold("snare", "punch", ("on", True), 0.6),
                  hold(HATS, "decay", ("rel", -25, -10), 0.5),
                  throw("snare", "dsend", ("abs", 50, 80), 1.0, 2.0, (1, 1), 0.4)),
     "halftime": (retrig("hihat", 1.0, ("1/24", "1/32", "1/48"), ("2 steps", "4 steps"),
                         (-90, 90), (60, 100), 0.85, grid=1.0, count=(2, 4)),
-                 throw("kick", "pitch", ("rel", -7, -3), 1.0, 2.0, (1, 2), 0.5),
                  onbar("snare", "rsend", ("abs", 70, 110), 1.0, "last", 2, 0.5)),
     "dnb": (retrig("snare", 0.5, ("1/32",), ("1 step", "2 steps"), (-40, 60), (70, 110),
                    0.6, grid=1.0, count=(1, 3)),
@@ -900,13 +899,10 @@ AUTO_MC = {
     "footwork": (retrig(HATS, 0.5, ("1/24", "1/12"), ("1 step", "2 steps"), (-60, 60),
                         (60, 100), 0.8, grid=0.5, count=(2, 5)),
                  retrig("kick", 0.5, ("1/12", "1/24"), ("1 step",), (-80, 0), (80, 110), 0.5,
-                        grid=1.0, count=(1, 2)),
-                 throw("kick", "pitch", ("rel", 3, 7), 0.5, 1.0, (1, 3), 0.4)),
-    "clave": (throw("ride", "pitch", ("rel", 3, 7), 0.5, 1.0, (1, 2), 0.4),
-              onbar("snare", "rsend", ("abs", 50, 80), 1.0, "last", 3, 0.4)),
+                        grid=1.0, count=(1, 2))),
+    "clave": (onbar("snare", "rsend", ("abs", 50, 80), 1.0, "last", 3, 0.4),),
     "idm": (retrig(ANY, 0.25, ("1/48", "1/64", "1/32", "1/20"), ("1/2 step", "1 step"),
                    (-128, 127), (50, 110), 0.85, grid=0.25, count=(3, 7)),
-            throw(ANY, "pitch", ("rel", -12, 12), 0.25, 0.25, (2, 5), 0.6),
             throw(ANY, "decay", ("rel", -40, 30), 0.5, 0.5, (2, 4), 0.6),
             throw(ANY, "shape", ("rel", -40, 40), 0.5, 0.5, (1, 3), 0.5)),
     "hypnotic": (count("hihat", "decay", ("rel", 15, 40), (5, 7), "all", 0.7),
@@ -918,7 +914,6 @@ AUTO_MC = {
               ramp(TONES, "sweep", ("rel", 15, 40), "last4", "in", 0.5)),
     "glitch": (retrig(ANY, 0.25, ("1/32", "1/48", "1/64"), ("1/2 step", "1 step"),
                       (-128, 127), (50, 110), 0.9, grid=0.25, count=(4, 8)),
-               throw(ANY, "pitch", ("rel", -12, 12), 0.25, 0.25, (2, 5), 0.7),
                throw(ANY, "decay", ("rel", -50, -20), 0.25, 0.25, (2, 5), 0.6),
                throw(ANY, "contour", ("rel", -40, 40), 0.5, 0.5, (1, 3), 0.5),
                hold(HATS, "chance", ("abs", 50, 85), 0.4)),
@@ -940,20 +935,16 @@ AUTO_MC = {
                     grid=1.0, count=(1, 2))),
     "jungle": (retrig("snare", 0.5, ("1/32", "1/24"), ("1 step", "2 steps"), (-60, 60),
                       (70, 110), 0.7, grid=0.5, count=(1, 3)),
-               throw("snare", "pitch", ("rel", -7, 7), 0.5, 1.0, (1, 3), 0.6),
                onbar("snare", "dsend", ("abs", 70, 100), 1.0, "even", 3, 0.5)),
     "gabber": (hold("kick", "punch", ("on", True), 0.95),
                retrig("kick", 2.0, ("1/16", "1/32"), ("8 steps",), (60, 127), (90, 120), 0.6,
                       bars="last", beat=2),
                throw("kick", "contour", ("rel", 15, 40), 1.0, 1.0, (1, 3), 0.5)),
     "jersey": (retrig("kick", 0.5, ("1/12", "1/24"), ("1 step",), (-40, 0), (80, 110), 0.7,
-                      grid=1.0, count=(1, 3)),
-               throw("snare", "pitch", ("rel", 3, 7), 0.5, 1.0, (1, 2), 0.4)),
+                      grid=1.0, count=(1, 3)),),
     "gqom": (hold("kick", "rsend", ("abs", 30, 60), 0.6),
-             throw("kick", "pitch", ("rel", -5, -2), 1.0, 2.0, (1, 2), 0.5),
              onbar("ride", "rsend", ("abs", 70, 100), 1.0, "even", 3, 0.5)),
-    "amapiano": (throw("kick", "pitch", ("rel", -12, -5), 0.5, 1.0, (2, 4), 0.7),
-                 hold("kick", "decay", ("rel", 20, 40), 0.6),
+    "amapiano": (hold("kick", "decay", ("rel", 20, 40), 0.6),
                  retrig("hihat", 0.5, ("1/16", "1/32"), ("1 step",), (0, 30), (50, 80), 0.4,
                         grid=1.0, count=(1, 2))),
     "jazz": (hold("ride", "rsend", ("abs", 40, 70), 0.8),
@@ -965,20 +956,17 @@ AUTO_MC = {
                           (90, 127), 0.7, grid=0.5, count=(2, 4)),
                    throw(ANY, "contour", ("rel", -40, 40), 1.0, 1.0, (2, 4), 0.6),
                    hold("fx", "rev_tone", ("rel", 10, 30), 0.4)),
-    "bruk": (throw("snare", "pitch", ("rel", -3, 3), 0.5, 1.0, (1, 2), 0.4),
-             retrig("hihat", 0.5, ("1/24",), ("1 step",), (-40, 40), (60, 90), 0.4,
-                    grid=1.0, count=(1, 2))),
+    "bruk": (retrig("hihat", 0.5, ("1/24",), ("1 step",), (-40, 40), (60, 90), 0.4,
+                    grid=1.0, count=(1, 2)),),
     "ambient": (hold(ANY, "rsend", ("abs", 70, 110), 0.9),
                 hold("fx", "rev_size", ("abs", 115, 126), 0.9),
                 hold(ANY, "decay", ("rel", 25, 50), 0.7),
                 ramp(TONES, "sweep", ("rel", 10, 30), "first4", "in", 0.5)),
     "motorik": (count("hihat", "decay", ("rel", 10, 30), (4, 8), "all", 0.4),
                 onbar("snare", "dsend", ("abs", 60, 90), 1.0, [8], 3, 0.5)),
-    "afrobeat": (throw("ride", "pitch", ("rel", 2, 5), 0.5, 1.0, (1, 2), 0.4),
-                 retrig("hihat", 0.5, ("1/16",), ("1 step",), (0, 30), (50, 80), 0.3,
-                        grid=1.0, count=(1, 2))),
-    "cumbia": (throw("ride", "pitch", ("rel", 2, 5), 0.5, 1.0, (1, 2), 0.4),
-               onbar("snare", "rsend", ("abs", 50, 80), 1.0, [8], 2, 0.4)),
+    "afrobeat": (retrig("hihat", 0.5, ("1/16",), ("1 step",), (0, 30), (50, 80), 0.3,
+                        grid=1.0, count=(1, 2)),),
+    "cumbia": (onbar("snare", "rsend", ("abs", 50, 80), 1.0, [8], 2, 0.4),),
 }
 
 
@@ -1006,13 +994,13 @@ def _mc_starts(rng, g, bars, k):
     return [(b - 1) * 4 + g["beat"] for b in _bars_of(g["bars"], bars)]
 
 
-def plan_mc(style, rng=None, bars=8, rung="groove", exclude=(), sampler=()):
+def plan_mc(style, rng=None, bars=8, rung="groove", exclude=()):
     """A section's moves for the Model:Cycles: the palette (MC_GENERIC)
     and the style's own (AUTO_MC), each line with its chance and the
     throws' counts scaled by the drum kind (`rung`, MC_INTENSITY); a build
     adds the snare's roll into the drop. `exclude`: (track, key) left
-    alone (an LFO holds the cell); `sampler`: the tracks on the Model-TG
-    sampler (no pitch: the CC would pin it). {"held": {(track, key):
+    alone (an LFO holds the cell); the pitch is not among the keys
+    (MC_KEYS) at all. {"held": {(track, key):
     amount}, "moves": [(track, key, start, length, amount, shape)],
     "retrigs": [(track, start, length, rate, curve, fade, velocity)]}, in
     beats from the loop's start; all empty for the default feel."""
@@ -1039,7 +1027,6 @@ def plan_mc(style, rng=None, bars=8, rung="groove", exclude=(), sampler=()):
                                        max(1, min(127, _mc_num(rng, g["vels"])))))
             continue
         if key not in MC_PARAMS or (track, key) in exclude \
-                or (key == "pitch" and track in sampler) \
                 or (track == "fx") != (key in MC_FX_KEYS) \
                 or (track != "fx" and track not in CYCLES_CHANNELS):
             continue

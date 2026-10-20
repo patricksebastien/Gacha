@@ -5501,7 +5501,7 @@ All three sit next to the program.</li>
         self.perf_auto_fx_mc.setToolTip(
             "The Model:Cycles' own sound moved for the drum style (the kit's own, as the drum "
             "voices' racks), over CC on the MIDI out "
-            "(the M:C tab's box, the MIDI out open): its tracks' pitch, decay, color, "
+            "(the M:C tab's box, the MIDI out open): its tracks' decay, color, "
             "shape, sweep, contour, pan, delay and reverb sends, chance, punch and gate, "
             "its delay time and feedback, its reverb size and tone, held for the section "
             "or thrown in time, and the retrig, each with its own rate, length, fade and "
@@ -5514,8 +5514,8 @@ All three sit next to the program.</li>
             "queued; the cells are never changed, but one the moves hold elsewhere lights up "
             "showing what the box gets, as on the Audio FX grid, and a track's retrig "
             "button turns blue and reads auto while an auto retrig runs), a cell an LFO "
-            "holds is left alone, a "
-            "sampler track's pitch too. The moves run in the audio engine on the "
+            "holds is left alone, and the pitch is never touched (the box glides a CC "
+            "jump into a portamento, and it sounded wrong). The moves run in the audio engine on the "
             "section's loop, ahead like the hits, and switch with the section on its "
             "bar. A retrig plays only while its drum is heard (the mutes, the pedal), "
             "never over one held by hand, and not at all for a drum whose note is off in "
@@ -10225,7 +10225,7 @@ All three sit next to the program.</li>
 
     def _auto_mc_arm(self, sec, now=False):
         """Auto fx m:c for `sec`: its plan (gacha_autofx.plan_mc, from the
-        section's seed, its feel, its drum kind) compiled on the M:C tab's
+        section's seed, its drum style, its drum kind) compiled on the M:C tab's
         values and handed to the engine, armed for the section's bar (`now`:
         at once, for the one playing); the knobs the section before moved and
         this one does not get the tab's values back as it lands."""
@@ -10244,8 +10244,7 @@ All three sit next to the program.</li>
         exclude = {(role, key) for role, t in tracks.items() for key in A.MC_KEYS
                    if self._mc_ident(t, key) in held}
         exclude |= {("fx", key) for key in A.MC_FX_KEYS if self._mc_ident("fx", key) in held}
-        sampler = {role for role, t in tracks.items() if self._mc_is_sampler(t)}
-        plan = A.plan_mc(style, rng, bars, rung, exclude, sampler)
+        plan = A.plan_mc(style, rng, bars, rung, exclude)
         base = {(role, key): self._mc_value(t, key) for role, t in tracks.items()
                 for key in A.MC_KEYS if (t, key) in self.mc}
         base.update({("fx", key): self._mc_value("fx", key) for key in A.MC_FX_KEYS
