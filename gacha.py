@@ -2856,14 +2856,14 @@ class Main(QMainWindow):
         bpm = self.tempo.bpm
         bar_s = 4 * 60.0 / bpm
         parts.append(f"clock {bpm:6.1f} bpm  bar {bar_s:.2f} s  beat {bar_s / 4:.3f} s")
-        style = self.drum_style.currentText()
+        style = self.style.currentText()
         sec = self._perf_playing
-        if sec is not None and getattr(sec, "drum_style", None) and style == "random":
-            style = f"random ({sec.drum_style} now)"
-        feel = self.feel.currentText()
-        if feel != E.FEEL_SAME:
-            now = getattr(sec, "feel", None) if sec is not None else None
-            style += f"  feel {feel}" + (f" ({now} now)" if feel == "random" and now else "")
+        if sec is not None and getattr(sec, "feel", None) and style == "random":
+            style = f"random ({sec.feel} now)"
+        drums = self.drum_style.currentText()
+        if drums != self.DRUMS_SAME:
+            now = getattr(sec, "drum_style", None) if sec is not None else None
+            style += f"  drums {drums}" + (f" ({now} now)" if drums == "random" and now else "")
         dk = self.perf_drum_kind.currentText()
         if dk != DRUM_SAME:
             now = getattr(sec, "drum_kind", None) if sec is not None else None
@@ -5264,8 +5264,8 @@ All three sit next to the program.</li>
         # own box again, the pairs one setting
         self.perf_intro = QComboBox()
         self.perf_outro = QComboBox()
+        self.perf_style = QComboBox()
         self.perf_drum_style = QComboBox()
-        self.perf_feel = QComboBox()
         for mine, theirs, tip in (
                 (self.perf_intro, self.intro_style,
                  "How an intro section is shaped (next kind: intro): random picks one of "
@@ -5281,15 +5281,16 @@ All three sit next to the program.</li>
                  "the last bars of a shorter groove and rings out to silence by bar 8, "
                  "where the sections stop by themselves; random picks one. The Generate "
                  "tab's box without its none, with its tail, bars, wet and amount."),
+                (self.perf_style, self.style,
+                 "The style of the next section: the feel its layers, chops, events, "
+                 "swing, fills, sub and racks play in, and its kit unless the drums box "
+                 "says another. random picks one per section (the one playing shows in "
+                 "the meter), default is the engine before the feels; the Sections tab's "
+                 "box, and a randomize keeps it."),
                 (self.perf_drum_style, self.drum_style,
-                 "The style of the next section, its drums and the feel of its layers, "
-                 "chops and events alike: the Sections tab's box; random picks one per "
-                 "section (the one playing shows in the meter), and a randomize keeps it."),
-                (self.perf_feel, self.feel,
-                 "The feel the next section's layers, chops, events, swing, fills and "
-                 "sub play in: same as style follows the drums box, default is the way "
-                 "they were before the feels, random draws a style's per section, or any "
-                 "style's feel under any kit. The Sections tab's box.")):
+                 "The kit's pattern alone: same as style plays the style's own kit (the "
+                 "usual), random draws one per section, or any kit under any style, a "
+                 "four-floor kit in the hypnotic feel. The Sections tab's box.")):
             # the same names but none (a live intro or outro always has a
             # shape), so the pair is kept by name: the Generate tab on none
             # leaves this box where it was, and the live render reads this one
@@ -5301,8 +5302,8 @@ All three sit next to the program.</li>
             mine.currentTextChanged.connect(theirs.setCurrentText)
             theirs.currentTextChanged.connect(
                 lambda t, m=mine: m.setCurrentText(t) if m.findText(t) >= 0 else None)
-        form.addRow("Shapes", self._row([("intro", self.perf_intro), ("drums", self.perf_drum_style),
-                                         ("feel", self.perf_feel), ("outro", self.perf_outro)]))
+        form.addRow("Shapes", self._row([("intro", self.perf_intro), ("style", self.perf_style),
+                                         ("drums", self.perf_drum_style), ("outro", self.perf_outro)]))
         self.perf_material = QComboBox()
         self.perf_material.addItems(["takes, else ticked samples", "takes only",
                                      "ticked samples"])
@@ -8272,8 +8273,8 @@ All three sit next to the program.</li>
 
     def _tab_drums(self):
         form = QFormLayout()
-        self.drum_style = QComboBox()
-        self.drum_style.addItems(["random", "four-floor", "breakbeat",
+        self.style = QComboBox()                # the music's style: the feel everything plays in
+        self.style.addItems(["random", E.FEEL_DEFAULT, "four-floor", "breakbeat",
                                   "boom-bap", "halftime", "dnb", "minimal",
                                   "ukg", "dembow", "one-drop", "footwork",
                                   "clave", "idm", "hypnotic", "drone", "glitch", "dub",
@@ -8315,17 +8316,17 @@ All three sit next to the program.</li>
             "motorik (the same bar forever), afrobeat (Tony Allen's kit under short guitar "
             "loops, the horn stabs chopped), cumbia (the caja on the offbeat 8ths, the "
             "guacharaca's chk-chk-chk, the kick on 1 and 3, the accordion's chord chopped on "
-            "the offbeats). random picks one per song, or per live section.")
-        self.feel = QComboBox()
-        self.feel.addItems(E.FEEL_CHOICES)
-        self.feel.setToolTip(
-            "The feel the layers, chops, events, swing, fills and sub play in, "
-            "apart from the kit's pattern: same as style follows the Drum style box "
-            "(the usual), default is the way they were before the feels (the knobs "
-            "alone, every style alike), random draws a style's feel per song or "
-            "section, or any style's own feel under any kit, a four-floor kit in the "
-            "hypnotic feel. The README's feel table says what each does.")
-        form.addRow("Drum style", self._row([("", self.drum_style), ("feel", self.feel)]))
+            "the offbeats). random picks one per song, or per live section; default is "
+            "the engine before the styles had a feel (the knobs alone), under whatever "
+            "kit the drums box says.")
+        self.drum_style = QComboBox()           # the kit's pattern
+        self.drum_style.addItems([self.DRUMS_SAME, "random"] + list(E.DRUM_STYLES))
+        self.drum_style.setToolTip(
+            "The kit's pattern alone: where the kick, snare, hats and ride fall on the "
+            "grid. same as style plays the style's own kit (the usual); random draws "
+            "one per song or section; or any kit under any style, a four-floor kit in "
+            "the hypnotic feel, a dnb kit with the dub's echoes and skank.")
+        form.addRow("Style", self._row([("", self.style), ("drums", self.drum_style)]))
 
         self.swing_random = QCheckBox("random (0–0.06)")
         self.swing_random.setChecked(True)
@@ -8440,9 +8441,9 @@ All three sit next to the program.</li>
         return form
 
     def _randomize_drums(self):
-        # a concrete style, never "random"
-        self.drum_style.setCurrentIndex(
-            random.randrange(1, self.drum_style.count()))
+        # a concrete style, never "random" nor "default", the kit its own
+        self.style.setCurrentIndex(random.randrange(2, self.style.count()))
+        self.drum_style.setCurrentText(self.DRUMS_SAME)
         self._shuffle(self.swing_random, self.swing, self.humanize,
                       self.mutation_chance, self.mutation_amount,
                       self.glitch_chance, self.break_chance,
@@ -9122,14 +9123,30 @@ All three sit next to the program.</li>
         return E.Knobs(**{k: v for k, v in self._knobs_dict().items()
                           if k in E.Knobs.__dataclass_fields__}).sanitized()
 
+    DRUMS_SAME = "same as style"        # the drums box's default: the style's own kit
+
+    def _style_kw(self):
+        """The Style box (the music's style, a feel) and the drums box (the
+        kit's pattern) as the engine takes them, (drum_style, feel): a
+        named style with its own kit is both; random with its own kit is a
+        random kit whose feel follows; default (the knobs alone) under a
+        random kit; and any kit under any style."""
+        style, drums = self.style.currentText(), self.drum_style.currentText()
+        if drums == self.DRUMS_SAME:
+            if style in E.STYLE_FEEL:
+                return style, style
+            return "random", (E.FEEL_SAME if style == "random" else E.FEEL_DEFAULT)
+        return drums, style
+
     def _section_kw(self):
         """The Generate tab's compose settings a live section takes as well:
-        the pans and the drum style. Read on the GUI thread."""
+        the pans, the style and the kit. Read on the GUI thread."""
+        drum_style, feel = self._style_kw()
         return {"pan_drums": min(1.0, abs(self.pan_drums.value())),
                 "pan_layers": min(1.0, abs(self.pan_layers.value())),
                 "pan_events": min(1.0, abs(self.pan_events.value())),
-                "drum_style": self.drum_style.currentText(),
-                "feel": self.feel.currentText(),
+                "drum_style": drum_style,
+                "feel": feel,
                 "intro_style": self.perf_intro.currentText(),      # the Perform tab's copies:
                 "outro_style": self.perf_outro.currentText(),      # never none
                 "drum_kind": self.perf_drum_kind.currentText()}    # the drums' own rung
@@ -9161,8 +9178,8 @@ All three sit next to the program.</li>
                "video_audio": video_audio,
                "intro_style": self.intro_style.currentText(),
                "outro_style": self.outro_style.currentText(),
-               "drum_style": self.drum_style.currentText(),
-               "feel": self.feel.currentText(),
+               "drum_style": self._style_kw()[0],
+               "feel": self._style_kw()[1],
                "pan_drums": self.pan_drums.value(),
                "pan_layers": self.pan_layers.value(),
                "pan_events": self.pan_events.value(),
@@ -11179,9 +11196,9 @@ All three sit next to the program.</li>
                 f"playing {sec.kind}{root} {pl.bpm:.0f} bpm{spd}  ·  bar {bar}/{pl.bars}"
                 f"  ·  {ready}")
             kind = sec.kind + (f" {sec.style}" if getattr(sec, "style", None) else "")
-            style = getattr(sec, "drum_style", None) or ""   # "afrobeat - heavy in E minor drum - dense at 120 bpm"
-            if style and getattr(sec, "feel", None) and sec.feel != sec.drum_style:
-                style += f" ({sec.feel} feel)"
+            style = getattr(sec, "feel", None) or getattr(sec, "drum_style", None) or ""
+            if style and getattr(sec, "drum_style", None) and sec.drum_style != style:
+                style += f" ({sec.drum_style} drums)"   # "afrobeat - heavy in E minor | drum - dense at 120 bpm"
             big = (f"{style} - {kind}" if style else kind) + root
             if getattr(sec, "drum_kind", None):
                 big += f" | drum - {sec.drum_kind}"
