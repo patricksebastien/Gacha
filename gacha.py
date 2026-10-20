@@ -1998,7 +1998,7 @@ class PerfMeter(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
         f = p.font()
-        f.setPixelSize(28)
+        f.setPixelSize(20)
         f.setBold(True)
         p.setFont(f)
         p.setPen(self.TEXT if self.pos is not None else self.DIM)
@@ -11136,6 +11136,11 @@ All three sit next to the program.</li>
         busy = self._perf_busy
         ready = "next ready" if self._perf_ready else (
             "" if not busy else f"randomizing {busy[1]}..." if busy[0] == "shuffle" else "rendering next...")
+        # the render's word on the N button itself, the meter's line stays the music's
+        state = "ready" if self._perf_ready else ready
+        txt = f"next section: {state} (N)" if state else "next section (N)"
+        if self.perf_next_btn.text() != txt:
+            self.perf_next_btn.setText(txt)
         note = self._auto_song_note(pl)
         if note:
             ready = f"{ready}  ·  {note}" if ready else note
@@ -11170,15 +11175,13 @@ All three sit next to the program.</li>
                 f"playing {sec.kind}{root} {pl.bpm:.0f} bpm{spd}  ·  bar {bar}/{pl.bars}"
                 f"  ·  {ready}")
             kind = sec.kind + (f" {sec.style}" if getattr(sec, "style", None) else "")
-            big = f"{kind}{root}  ·  {pl.bpm:.0f} bpm{spd}"
-            if getattr(sec, "drum_style", None):
-                big += f"  ·  {sec.drum_style}"
-                if getattr(sec, "feel", None) and sec.feel != sec.drum_style:
-                    big += f" / {sec.feel} feel"
+            style = getattr(sec, "drum_style", None) or ""   # "afrobeat - heavy in E minor drum - dense at 120 bpm"
+            if style and getattr(sec, "feel", None) and sec.feel != sec.drum_style:
+                style += f" ({sec.feel} feel)"
+            big = (f"{style} - {kind}" if style else kind) + root
             if getattr(sec, "drum_kind", None):
-                big += f"  ·  drums {sec.drum_kind}"
-            if ready:
-                big += f"  ·  {ready}"
+                big += f" drum - {sec.drum_kind}"
+            big += f" at {pl.bpm:.0f} bpm{spd}"
             # an outro: silent by its last bar, the sections stop there
             if sec.kind == "outro" and bar >= pl.bars and pl.pending is None:
                 self.perform_stop()                    # _perf_playing is None from here
