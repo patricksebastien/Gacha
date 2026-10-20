@@ -5358,10 +5358,10 @@ All three sit next to the program.</li>
                                  "the next section renders at it. Type it or tap it (T).")
         self.perf_bpm.valueChanged.connect(self.live_bpm.setValue)
         self.live_bpm.valueChanged.connect(self.perf_bpm.setValue)
-        form.addRow("Material", self._row([("", self.perf_material), ("", self.perf_bpm)]))
-        # the next section's density, then the drums' own, as the Shapes row
-        # reads style then drums
-        form.addRow("Next kind", self._row([("", self.perf_kind), ("drums", self.perf_drum_kind)]))
+        form.addRow("Material", self._row([("", self.perf_material),
+                                           ("style energy", self.perf_kind),
+                                           ("drums energy", self.perf_drum_kind),
+                                           ("", self.perf_bpm)]))
         # the takes above the section buttons: what the section is built from,
         # then what plays it
         self.rec_btn = QPushButton("● record (R)")
