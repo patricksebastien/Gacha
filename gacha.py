@@ -454,7 +454,8 @@ KEYMAP += [("section", "burst", "B", "burst: a slice of the material from a rand
            ("section", "auto_song", "", "auto song off/on: the set played by itself, a next or a "
                                         "break every 8 to 32 bars, stems out now and then, "
                                         "rarely the repeat run, a freeze, a burst")]
-KIND_ORDER = tuple(sorted(KINDS))         # the kinds A-Z in the Energy boxes (intro first, outro last)
+KIND_ORDER = ("sparse", "break", "build", "groove", "dense", "heavy", "insane", "overload")
+assert set(KIND_ORDER) == set(KINDS)      # the Energy boxes, low to high (intro first, outro last)
 BREAK_IDENTS = {"glitch": "glitch", "break": "repeat", "roll": "roll", "rewind": "rewind",
                 "echo": "echo out", "riser": "riser"}   # a key row -> SectionPlayer.fill's kind
 # auto song (Main._auto_song_plan, _auto_song_tick): the odds the conductor plays with
