@@ -92,9 +92,9 @@ RUNGS = {
 }
 EXTRA_KINDS = ("intro", "outro")                      # picked by name only
 # the drums' own kind (the Perform tab's drums box): the drums can sit on
-# another rung than the layers, chops and events; "same as kind" is the
+# another rung than the layers, chops and events; "same as style" is the
 # section's kind for all of them, as before
-DRUM_SAME = "same as kind"
+DRUM_SAME = "same as style"
 DRUM_KINDS = (DRUM_SAME, "random") + KINDS
 INTRO_STYLES = ("random", "ambient", "sparse", "none", "build", "drums-first",
                 "reverse-swell", "collage", "filtered")

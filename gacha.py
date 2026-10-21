@@ -366,7 +366,7 @@ KEYMAP = [
     ("show", "grade_neutral", "", "source grade back to neutral"),
     ("show", "blend_next", "", "next shader blend mode (mix, add, screen)"),
     ("section", "kind_next", "", "next section kind (random, groove, break, ...)"),
-    ("section", "drum_kind_next", "", "next drums kind (same as kind, random, groove, ...)"),
+    ("section", "drum_kind_next", "", "next drums kind (same as style, random, groove, ...)"),
     ("clock", "link", "", "Ableton Link: tempo and start/stop shared with the network, off/on"),
     ("clock", "link_play", "", "Ableton Link: play / stop sent to the session (the section follows)"),
     ("section", "picture_next", "", "picture while a section plays: follow, take, live"),
@@ -463,7 +463,7 @@ AUTO_SONG = {
     "lengths": ((8, 0.2), (16, 0.4), (24, 0.2), (32, 0.2)),   # bars to the next change, with the odds
     "break": 0.2,                 # the change a break of a random kind, else a plain next
     "kind_next": 0.35,            # a plain next changes next kind this often (a break always)
-    "drum_kind": 0.3,             # ...and drum kind, either way (same as kind favoured)
+    "drum_kind": 0.3,             # ...and drum kind, either way (same as style favoured)
     "skip_kinds": ("overload",),  # kinds it never draws, for either box
     "mute_pass": 0.45,            # a stem out once in an 8-bar pass this often
     "mute_stems": (("drums", 0.5), ("layers", 0.2), ("chops", 0.15), ("events", 0.15)),
@@ -5296,8 +5296,9 @@ All three sit next to the program.</li>
             # the same names but none (a live intro or outro always has a
             # shape), so the pair is kept by name: the Generate tab on none
             # leaves this box where it was, and the live render reads this one
-            mine.addItems([t for t in (theirs.itemText(i) for i in range(theirs.count()))
-                           if t != "none"])
+            names = [t for t in (theirs.itemText(i) for i in range(theirs.count())) if t != "none"]
+            first = [t for t in names if t in ("random", E.FEEL_DEFAULT, self.DRUMS_SAME)]
+            mine.addItems(first + sorted(t for t in names if t not in first))   # A-Z after them
             if mine.findText(theirs.currentText()) >= 0:
                 mine.setCurrentText(theirs.currentText())
             mine.setToolTip(tip)
@@ -5342,7 +5343,7 @@ All three sit next to the program.</li>
         self.perf_drum_kind.setToolTip(
             "The drums' own kind: the drums and the sub play this rung while the "
             "layers, chops and events follow next kind (insane drums under sparse "
-            "layers, a sparse beat under overload textures). same as kind: the "
+            "layers, a sparse beat under overload textures). same as style: the "
             "section's kind for everything, as before. random: one of the eight, "
             "drawn per section. An intro keeps its own drums. Remembered; "
             "drum_kind_next in the Controls tab steps through it.")
@@ -8276,13 +8277,7 @@ All three sit next to the program.</li>
     def _tab_drums(self):
         form = QFormLayout()
         self.style = QComboBox()                # the music's style: the feel everything plays in
-        self.style.addItems(["random", E.FEEL_DEFAULT, "four-floor", "breakbeat",
-                                  "boom-bap", "halftime", "dnb", "minimal",
-                                  "ukg", "dembow", "one-drop", "footwork",
-                                  "clave", "idm", "hypnotic", "drone", "glitch", "dub",
-                                  "polyrhythm", "electro", "acid", "jungle", "gabber", "jersey",
-                                  "gqom", "amapiano", "jazz", "industrial", "bruk", "ambient",
-                                  "motorik", "afrobeat", "cumbia"])
+        self.style.addItems(["random", E.FEEL_DEFAULT] + sorted(E.DRUM_STYLES))
         self.style.setToolTip(
             "The style of the whole song or section, not the kit alone: its pattern "
             "family, and with it how the textures loop, where the chops land, how "
@@ -8322,7 +8317,7 @@ All three sit next to the program.</li>
             "the engine before the styles had a feel (the knobs alone), under whatever "
             "kit the drums box says.")
         self.drum_style = QComboBox()           # the kit's pattern
-        self.drum_style.addItems([self.DRUMS_SAME, "random"] + list(E.DRUM_STYLES))
+        self.drum_style.addItems([self.DRUMS_SAME, "random"] + sorted(E.DRUM_STYLES))
         self.drum_style.setToolTip(
             "The kit's pattern alone: where the kick, snare, hats and ride fall on the "
             "grid. same as style plays the style's own kit (the usual); random draws "
