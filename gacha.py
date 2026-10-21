@@ -153,7 +153,10 @@ QPushButton#generate {
     font-weight: bold;
 }
 QPushButton#generate:hover { background: rgba(255, 96, 70, 220); }
-QPushButton#next { font-weight: bold; font-size: 20px; padding: 4px 14px; }
+QPushButton#next { font-weight: bold; font-size: 20px; padding: 4px 14px;
+                   background: rgb(0, 0, 0); color: rgb(255, 255, 255); }
+QPushButton#next:hover { background: rgb(30, 30, 30); }
+QPushButton#next:pressed { background: rgb(60, 60, 60); }
 QPushButton#small { padding: 2px 10px; font-size: 12px; }
 QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit {
     background: rgba(28, 11, 9, 117); border: 1px solid rgba(212, 48, 30, 170);
