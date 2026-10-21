@@ -5566,7 +5566,7 @@ All three sit next to the program.</li>
             "Remembered; a MIDI switch (auto_song).")
         self.perf_auto_song.setChecked(self.settings.value("perform/auto_song", False, type=bool))
         self.perf_auto_song.toggled.connect(lambda on: self._auto_song_changed(on))
-        self.perf_auto_fx = QCheckBox("auto fx")
+        self.perf_auto_fx = QCheckBox("auto fx style")
         self.perf_auto_fx.setToolTip(
             "Every section that starts (and a song started through the racks) has the "
             "four stems' racks (Audio FX tab: drums, layers, chops, events) reset and a "
