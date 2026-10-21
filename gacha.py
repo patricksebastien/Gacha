@@ -11200,8 +11200,8 @@ All three sit next to the program.</li>
             if style and getattr(sec, "drum_style", None) and sec.drum_style != style:
                 style += f" ({sec.drum_style} drums)"   # "afrobeat - heavy in E minor | drum - dense at 120 bpm"
             big = (f"{style} - {kind}" if style else kind) + root
-            if getattr(sec, "drum_kind", None):
-                big += f" | drum - {sec.drum_kind}"
+            if sec.kind not in EXTRA_KINDS:               # the drums' energy, the section's unless its own
+                big += f" | drums - {getattr(sec, 'drum_kind', None) or sec.kind}"
             big += f" at {pl.bpm:.0f} bpm{spd}"
             if note:                                   # auto song's word stays on the line
                 big += f" | {note}"
