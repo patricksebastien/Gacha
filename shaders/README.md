@@ -60,7 +60,7 @@ give `iDrop` a moment.
 | `plasma.frag` | slow plasma warping the picture in its own colours |
 | `pointcloud.frag` | LiDAR-style dot cloud with fake depth and parallax |
 | `relief.frag` | embossed relief lit by a light orbiting once per bar |
-| `slitscan.frag` | slit-scan sweeping once per bar, freezing motion into streaks |
+| `slitscan.frag` | a slit sweeping once per bar paints what passes under it into a frozen picture (a feedback flavour; the classic time-displacement slit-scan, every line from a different past frame, is the **slit-scan** video effect of the Video tab) |
 | `strips.frag` | a real slice of the picture, a vertical strip about 100 px wide and the full height, tiled across the screen; a new random strip every beat, wider when loud, a third of the screen on a drop (replaces the picture) |
 | `sparks.frag` | tiny particles born on bright spots, drifting up and fading |
 | `super8.frag` | Super 8 home movie: 18 fps frame hold, faded Kodachrome grade with halation, grain, dust, hairs and dark scratches, exposure flicker, splices and flash frames on downbeats, the reel burning out on a drop |

@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
 )
 
 from gacha_gl import (BG_MODES, BLEND_MODES, CANVAS_FITS, GLBackdrop, KEEP_FX, PIC_BLENDS,
-                      gl_available, shader_files)
+                      SLIT_N, gl_available, shader_files)
 from gacha_engine import (AUDIO_EXTS, RANDOM_START_MODES, SYNTH_STYLES,
                           sample_name)
 from gacha_live import NOTE_NAMES, LiveInput, TapTempo, audio_inputs
@@ -261,6 +261,17 @@ VIDEO_EFFECTS = [
     ("grain", "grain", 0.3, "Film grain"),
     ("zoom", "zoom", 0.5, "Zoom punches in with the loudness"),
     ("trails", "trails", 0.4, "Motion trails: bright parts linger"),
+    ("slit", "slit-scan", 0.4, "Slit-scan (time displacement): every line of the "
+                               "picture comes from a different moment, a ramp "
+                               "over the last 48 frames (about a second and a "
+                               "half), so anything that moves smears into "
+                               "time-sliced streaks. Each section picks the "
+                               "ramp: down the picture (the top now, the bottom "
+                               "the past), across it, out from the centre, or "
+                               "by brightness (the bright parts now, the dark "
+                               "ones the past), and its direction. Strength = "
+                               "how deep in time, breathing with the loudness; "
+                               "a drop dives all the way"),
     ("glitch", "glitch", 0.4, "Horizontal glitch tears, more when loud. Per "
      "section: thin sharp lines (0.4-1% of the frame), medium bands (4-14%) "
      "or anything from 4% up to 38% slabs"),
@@ -346,7 +357,8 @@ KEYMAP = [
     ("clock", "live", "L", "live mode (audio drives the visuals) off/on"),
     ("clock", "drop", "X", "mark a drop by hand"),
     ("section", "next", "N", "next section on the bar (pre-rendered)"),
-    ("section", "stop", "Shift+N", "stop the section on the bar; stopped, start it again"),
+    ("section", "stop", "Shift+N", "stop the clock and the section on the bar; stopped, start "
+                                   "the clock (and the last section again)"),
     ("section", "event", "E", "fire a one-shot from the material on the beat"),
     ("section", "ab_down", "[", "A/B 10 % toward the tape"),
     ("section", "ab_up", "]", "A/B 10 % toward the section"),
@@ -456,7 +468,10 @@ KEYMAP += [("section", "burst", "B", "burst: a slice of the material from a rand
                                               "repeat, roll, rewind, echo out, riser)"),
            ("section", "auto_song", "", "auto song off/on: the set played by itself, a next or a "
                                         "break every 8 to 32 bars, stems out now and then, "
-                                        "rarely the repeat run, a freeze, a burst")]
+                                        "rarely the repeat run, a freeze, a burst"),
+           ("section", "auto_material", "", "auto material off/on: under auto song, the ticked "
+                                            "samples (or videos) drawn again at random now and "
+                                            "then, one to four of them")]
 KIND_ORDER = ("sparse", "break", "build", "groove", "dense", "heavy", "insane", "overload")
 assert set(KIND_ORDER) == set(KINDS)      # the Energy boxes, low to high (intro first, outro last)
 BREAK_IDENTS = {"glitch": "glitch", "break": "repeat", "roll": "roll", "rewind": "rewind",
@@ -474,6 +489,8 @@ AUTO_SONG = {
     "ladder": 0.1,                # the repeat run, per section
     "freeze": 0.15,               # a freeze for an eighth, per section
     "burst": 0.2,                 # a burst, per section
+    "material": 0.5,              # with auto material ticked: the material drawn again, per plan
+    "material_n": ((1, 3), (2, 3), (3, 2), (4, 1)),   # how many files it ticks, with the odds
 }
 AUTO_SONG_RUN = (("bar", 1.0), ("1/2", 0.5), ("1/4", 0.25), ("1/8", 0.125), ("1/16", 0.0625),
                  ("1/32", 0.03125), ("1/64", 0.03125), ("1/64", 0.03125), ("1/32", 0.03125),
@@ -1010,6 +1027,10 @@ class VideoFX:
         self.rng = np.random.default_rng()
         self._vig = None
         self._kmaps = {}            # (h, w, n, angle) -> (rows, cols) lookup
+        self._ring = None           # slit-scan: the last SLIT_N frames, (n, h, w, 3) uint8
+        self._ring_head = self._ring_n = 0
+        self._ring_last = None      # the image last pushed (a frame is pushed once)
+        self._grid = None           # (rows, cols) index grids for the gather
 
     def kaleido_map(self, h, w, n, angle):
         """Nearest-neighbour lookup that folds the frame into n mirrored
@@ -1050,6 +1071,36 @@ class VideoFX:
             .reshape(h, bpl)[:, : w * 3].reshape(h, w, 3).astype("float32")
         g = st.get
         rng = self.rng
+
+        # slit-scan: the frame into the ring (once), then every pixel from
+        # the frame its ramp says, nearest frame, no mix (the GL path mixes)
+        if self._ring is None or self._ring.shape[1:3] != (h, w):
+            self._ring = np.empty((SLIT_N, h, w, 3), np.uint8)
+            self._ring_head = self._ring_n = 0
+            self._ring_last = None
+            self._grid = np.indices((h, w))
+        if img is not self._ring_last:
+            self._ring[self._ring_head] = px
+            self._ring_head = (self._ring_head + 1) % SLIT_N
+            self._ring_n = min(SLIT_N, self._ring_n + 1)
+            self._ring_last = img
+        sl = g("slit")                        # (depth, ramp, reversed)
+        if sl and self._ring_n > 1:
+            depth, mode, flip = sl
+            yy, xx = self._grid
+            if mode == 0:
+                r = yy / max(1, h - 1)                       # the top now
+            elif mode == 1:
+                r = xx / max(1, w - 1)                       # the left now
+            elif mode == 2:                                  # the centre now
+                r = np.hypot((xx - (w - 1) / 2) / (w / 2), (yy - (h - 1) / 2) / (h / 2)) / np.sqrt(2)
+            else:                                            # the bright parts now
+                r = 1.0 - (px @ np.array([0.299, 0.587, 0.114], dtype="float32")) / 255.0
+            if flip:
+                r = 1.0 - r
+            d = np.clip(np.rint(np.clip(r, 0, 1) * depth * (SLIT_N - 1)), 0,
+                        self._ring_n - 1).astype(np.intp)
+            px = self._ring[(self._ring_head - 1 - d) % SLIT_N, yy, xx].astype("float32")
 
         rpt = g("repeat")                     # (k, frac): k-th retrigger,
         if rpt:                               # frac = progress inside it
@@ -2249,6 +2300,7 @@ class Main(QMainWindow):
         self._song_visuals_pending = False   # a song is loading: its clip and shader wait
         self._clean_on = False      # this bar shows the video with no effects
         self._kaleido = 0
+        self._slit = (0, False)     # the slit-scan's ramp this section, reversed
         self._mono = (0, 0.5)
         self._pix_seed = 0.0
         self.hide_timer = QTimer(self)
@@ -2313,6 +2365,9 @@ class Main(QMainWindow):
         self._perf_playing = None                   # Section on the player
         self._perf_current = None                   # (Section, stems, sr): the last one played,
                                                     # what stop / Link start bring back
+        self._clock_run = False                     # the transport: the clock started by
+                                                    # Shift+N (a MIDI Start, Link play) with or
+                                                    # without a section; N lands on its bar
         self._perf_sounding = False                 # a section was on the player at the last poll
         self._perf_timer = QTimer(self)
         self._perf_timer.timeout.connect(self._poll_perform)
@@ -2533,6 +2588,7 @@ class Main(QMainWindow):
             "break_any": lambda: self.perform_break(None),
             "break_kind_next": lambda: self._combo_next(self.perf_break_kind),
             "auto_song": lambda: self.perf_auto_song.toggle(),
+            "auto_material": lambda: self.perf_auto_material.toggle(),
             "burst_len": self._burst_len_frac,
             "repeat": lambda: self._rep_hold("midi", True),
             "rep_finer": lambda: self._rep_div_step(1),
@@ -4646,7 +4702,8 @@ All three sit next to the program.</li>
                     "metronome": self.midi_metro, "scene_morph": self.scene_morph_on,
                     "rep_rev": self.rep_rev, "half": self.half_btn, "double": self.double_btn,
                     "live": self.live_on, "inserts": self.vst_bypass,
-                    "auto_song": self.perf_auto_song}
+                    "auto_song": self.perf_auto_song,
+                    "auto_material": self.perf_auto_material}
         w = switches.get(ident)
         if w is not None:
             return w.isChecked()
@@ -5438,12 +5495,16 @@ All three sit next to the program.</li>
             "next bar. One is rendered ahead while the current one loops, so "
             "this is instant; the very first waits about a second.")
         next_btn.clicked.connect(self.perform_next)
-        stop_btn = QPushButton("stop / start (Shift+N)")
+        stop_btn = QPushButton("start clock")       # says what a press does: stop, or start
+        self.perf_stop_btn = stop_btn
         stop_btn.setToolTip(
-            "Silence the section on the next bar; the tape stays. Pressed "
-            "with no section playing, the last one starts again as it was, "
-            "nothing new is rendered. With Ableton Link on, this is the "
-            "session's stop and play, both ways.")
+            "The transport (Shift+N). Stopped: starts the clock, with or without a "
+            "section: the bar restarts, a MIDI Start and Link play go out, "
+            "the metronome and the gear lock to it; the last section comes "
+            "back with it as it was when there is one, and N lands on the "
+            "clock's bar. Running: silences the section on the next bar and "
+            "stops the clock with it; the tape stays. With Ableton Link on, "
+            "this is the session's stop and play, both ways.")
         stop_btn.clicked.connect(self.perform_stop)
         event_btn = QPushButton("event (E)")
         event_btn.setToolTip("Fire a one-shot cut from the material on the next beat")
@@ -5537,9 +5598,9 @@ All three sit next to the program.</li>
             "instead. With no section playing: plain next. A MIDI button (break_any); "
             "G and Shift+G fire glitch and repeat directly.")
         self.break_btn.clicked.connect(lambda: self.perform_break(None))
-        self.perf_gap = QCheckBox("gap before the drop")
+        self.perf_gap = QCheckBox("gap")
         self.perf_gap.setToolTip(
-            "The silence right before the one: a sixteenth after the glitch's "
+            "The gap before the drop, the silence right before the one: a sixteenth after the glitch's "
             "roll, half a beat or a beat after the repeat, a sixteenth of rest "
             "after the roll, the rewind and the riser, as in the generated songs. "
             "Off, every break runs straight into the drop. Remembered; takes "
@@ -5566,6 +5627,20 @@ All three sit next to the program.</li>
             "Remembered; a MIDI switch (auto_song).")
         self.perf_auto_song.setChecked(self.settings.value("perform/auto_song", False, type=bool))
         self.perf_auto_song.toggled.connect(lambda on: self._auto_song_changed(on))
+        self.perf_auto_material = QCheckBox("auto material")
+        self.perf_auto_material.setToolTip(
+            "Under auto song only (greyed otherwise): with each plan auto song makes, "
+            "half the time, the material is drawn again: one to four files of the "
+            "Samples tab picked at random and ticked, the rest unticked (the Videos "
+            "tab's when the videos are the material: video audio on, or no sample "
+            "ticked); takes, when they are the material, are left alone. The next "
+            "section is then rendered from the new material and lands on the bar. "
+            "The log says what was drawn. Remembered; a MIDI switch (auto_material).")
+        self.perf_auto_material.setChecked(
+            self.settings.value("perform/auto_material", False, type=bool))
+        self.perf_auto_material.setEnabled(self.perf_auto_song.isChecked())
+        self.perf_auto_material.toggled.connect(
+            lambda on: self.settings.setValue("perform/auto_material", bool(on)))
         self.perf_auto_fx = QCheckBox("auto fx style")
         self.perf_auto_fx.setToolTip(
             "Every section that starts (and a song started through the racks) has the "
@@ -5634,6 +5709,7 @@ All three sit next to the program.</li>
         self.perf_auto_fx_mc.toggled.connect(self._auto_mc_changed)
         form.addRow("Break", self._row([("", self.perf_break_kind), ("", self.break_btn),
                                         ("", self.perf_gap), ("", self.perf_auto_song),
+                                        ("", self.perf_auto_material),
                                         ("", self.perf_auto_fx), ("", self.perf_auto_fx_drums),
                                         ("", self.perf_auto_fx_mc)]))
         form.addRow("Stems", stems_row)
@@ -6241,7 +6317,7 @@ All three sit next to the program.</li>
                 ("Pixels", ("pixel", "bits", "dither")),
                 ("Tone", ("mono", "solar", "edges", "lines")),
                 ("Grain", ("grain",)),
-                ("Motion", ("zoom", "trails", "glitch", "rgb", "reverse")),
+                ("Motion", ("zoom", "trails", "slit", "glitch", "rgb", "reverse")),
                 ("Frame", ("vign", "kaleido", "clean"))]
         labels = {k: lbl for k, lbl, _, _ in VIDEO_EFFECTS}
         for title, keys in rows:
@@ -8033,6 +8109,7 @@ All three sit next to the program.</li>
         self.perf_auto_fx_drums.setChecked(sv("perform/auto_fx_drums", False, type=bool))
         self.perf_auto_fx_mc.setChecked(sv("perform/auto_fx_mc", False, type=bool))
         self.perf_auto_song.setChecked(sv("perform/auto_song", False, type=bool))
+        self.perf_auto_material.setChecked(sv("perform/auto_material", False, type=bool))
         combo(self.rep_div, "perform/rep_div", REPEAT_DEFAULT)
         combo(self.speed_sync, "perform/speed_sync", SPEED_SYNC_DEFAULT)
         combo(self.pitch_mode, "perform/pitch", PITCH_MODES[0])
@@ -8378,7 +8455,18 @@ All three sit next to the program.</li>
                 "a sample shaped into that drum), 1 = as carved, 0 = the voice left "
                 "out of the pattern. Live, the Perform tab's M buttons mute a voice "
                 "without a render.")
-        form.addRow("Samples", self._row([(r, w) for r, w in self.gain.items()]))
+        self.kit_listen = QCheckBox("listen")
+        self.kit_listen.setChecked(True)
+        self.kit_listen.setToolTip(
+            "On: every sample is listened to for its onsets and each drum takes the "
+            "sample, and the spot in it, that sounds like it: the bassiest hit for the "
+            "kick (its lowpass set just over the low peak found), a noisy one around "
+            "1 kHz for the snare, the brightest for the hats and the ride; one of the "
+            "four best, drawn, so seeds still differ. Off: random samples, each cut at "
+            "its loudest transient, which tends to be a mid event, so the kit leans "
+            "mid-high. Live, a change re-carves the material's kit at the next section.")
+        form.addRow("Samples", self._row([(r, w) for r, w in self.gain.items()]
+                                         + [("", self.kit_listen)]))
 
         # synthesized 909/808-style kit, layered on the same patterns
         self.synth = {}
@@ -9101,7 +9189,8 @@ All three sit next to the program.</li>
                  "sub_pan": self.sub_pan.value(),
                  "sub_chance": self.sub_chance.value(),
                  "sub_release": self.sub_release.value(),
-                 "sub_follow": self.sub_follow.isChecked()}
+                 "sub_follow": self.sub_follow.isChecked(),
+                 "kit_listen": self.kit_listen.isChecked()}
         for role, w in self.gain.items():
             knobs[f"gain_{role}"] = w.value()
         for role, w in self.synth.items():
@@ -9587,8 +9676,9 @@ All three sit next to the program.</li>
     def _perf_material_key(self):
         mode = self.perf_material.currentIndex()
         take_ids = tuple(t.idx for t in self.takes.takes if len(t.audio))
+        listen = self.kit_listen.isChecked()           # the kit carved by ear, or not
         if take_ids and mode != 2:
-            return ("takes", take_ids)
+            return ("takes", take_ids, listen)
         if mode == 1:
             return None
         # only what is ticked: the samples, and the ticked videos' soundtracks
@@ -9598,10 +9688,11 @@ All three sit next to the program.</li>
         videos = ()
         if self.video_audio.isChecked() or not files:
             videos = tuple(str(p) for p in self.videos_tree.checked())
-        return ("samples", files, videos) if files or videos else None
+        return ("samples", files, videos, listen) if files or videos else None
 
     def _perf_bank(self, key):
-        """Material for `key`, built if needed (call on the render thread)."""
+        """Material for `key`, built if needed (call on the render thread);
+        the key's last field says whether the kit is carved by ear."""
         if self._perf_material and self._perf_material[0] == key:
             return self._perf_material[1]
         if key[0] == "takes":
@@ -9614,7 +9705,8 @@ All three sit next to the program.</li>
                     tracks = E.extract_video_audio(key[2])   # once and cached (ffmpeg)
                     files += [E.VIDEO_AUDIO_DIR / n for n in tracks]
                 bank = E.load_samples(files)
-        mat = Material(bank, seed=random.randrange(1 << 30))
+        mat = Material(bank, seed=random.randrange(1 << 30),
+                       knobs=E.Knobs(kit_listen=bool(key[-1])))
         self._perf_material = (key, mat)
         return mat
 
@@ -9888,7 +9980,9 @@ All three sit next to the program.</li>
 
     def _perf_play(self, sec, stems):
         pl = self.through.player
-        bar_t0 = self._link_bar_t0() if not pl.playing else None   # from silence: Link's bar
+        bar_t0 = None
+        if not pl.playing:                  # from silence: the running clock's bar, or Link's
+            bar_t0 = self._clock_bar_t0() if self._clock_run else self._link_bar_t0()
         if not pl.playing:                  # from silence: a new song for the picture too,
             self._pick_song_video()         # a ticked video instead of whatever was on
             self._live_switch_t = time.monotonic()
@@ -9934,13 +10028,22 @@ All three sit next to the program.</li>
         return now + (LinkClock.QUANTUM - phase) * beat_s
 
     def perform_stop(self):
-        """Shift+N: stop the section on the bar; with none playing, start
-        the current one again (a Link peer's stop and play do the same)."""
+        """Shift+N: stop the section on the bar, and the clock with it; with
+        none playing, stop the clock when it runs, else start it (a Link
+        peer's stop and play do the same)."""
         la = self.through
         pl = la.player if la is not None and la.running else None
+        if pl is None:                                 # N says so too: nothing can start
+            self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
         if pl is not None and not pl.playing and pl.pending is None:
-            self.perform_start()
+            if self._clock_run:
+                self._clock_stop("stop")
+            else:
+                self.perform_start()
             return
+        if self._clock_run and pl is not None and not pl.playing:
+            self._clock_stop("stop")                   # queued, never sounded: the clock stops now
+        self._clock_run = False                        # (playing: the engine's Stop leaves with the clear)
         self._perf_want = False                        # a render on its way stays quiet
         if la is not None:
             la.player.clear()
@@ -9953,23 +10056,55 @@ All three sit next to the program.</li>
         self.perf_status.setText("no section")
 
     def perform_start(self, source="stop"):
-        """Start the current section again, as it was: the one that played
-        last (stopped by Shift+N or a Link peer), nothing new is rendered.
-        Nothing to bring back: says so and waits for N."""
-        if self.through is None or not self.through.running:
+        """Start the clock: its bar restarts now (on the Link session's bar
+        with peers), a MIDI Start leaves on it and the peers get play; the
+        current section, the one that played last (stopped by Shift+N or a
+        Link peer), comes back on that bar as it was, nothing new is
+        rendered. With none the clock runs alone and N lands on its bar."""
+        la = self.through
+        if la is None or not la.running:
             self.log.appendPlainText("perform: the audio output is not open (Settings tab)")
             return False
-        pl = self.through.player
-        if pl.playing or pl.pending is not None:
+        pl = la.player
+        if pl.playing or pl.pending is not None or self._clock_run:
             return True                                # already on, or on its way
+        t0 = self._link_bar_t0()                       # the session's bar, or (alone) ours, now
+        if t0 is None:
+            t0 = time.monotonic()
+        self.tempo.downbeat(t0)
+        self._clock_run = True
+        la.clock_cmd = ("start", t0)
+        self._link_transport(True)
         cur = self._perf_current
-        if cur is None or cur[2] != self.through.sr:
-            self.log.appendPlainText(f"{source}: no section to start yet, press N for one")
-            return False
+        if cur is None or cur[2] != la.sr:
+            self.log.appendPlainText(f"{source}: the clock starts, N for a section")
+            return True
         sec, stems, _sr = cur
         self._perf_play(sec, stems)
-        self.log.appendPlainText(f"{source}: the section starts again")
+        self.log.appendPlainText(f"{source}: the clock starts, the section again with it")
         return True
+
+    def _clock_stop(self, source):
+        """The clock stopped with no section on: a MIDI Stop, the peers get
+        stop, the clock runs free again (the bar keeps counting)."""
+        self._clock_run = False
+        la = self.through
+        if la is not None and la.running:
+            la.clock_cmd = ("stop",)
+        self._link_transport(False)
+        self.log.appendPlainText(f"{source}: the clock stops")
+
+    def _clock_bar_t0(self):
+        """The clock running: the monotonic time of its bar to land a
+        section on, the next one, or the one that began less than
+        LINK_GRACE beats ago (entered that far in, as with a Link bar)."""
+        now = time.monotonic()
+        bar_s = 4 * 60.0 / max(1e-6, self.tempo.bpm)
+        k = math.floor((now - self.tempo.anchor) / bar_s)
+        t0 = self.tempo.anchor + k * bar_s
+        if now - t0 < self.LINK_GRACE * bar_s / 4:
+            return t0
+        return t0 + bar_s
 
     PAD_ROLL = 4                   # a hat stutter pad: this many hits, a 1/32 apart
 
@@ -10151,6 +10286,7 @@ All three sit next to the program.</li>
         off, everything auto song holds let go (its mutes, the repeat run,
         the freeze) and the plan dropped."""
         self.settings.setValue("perform/auto_song", bool(on))
+        self.perf_auto_material.setEnabled(bool(on))   # auto material is auto song's
         if not on:
             self._auto_song_release()
             self.log.appendPlainText("auto song: off")
@@ -10202,6 +10338,10 @@ All three sit next to the program.</li>
             if dk != self.perf_drum_kind.currentText():
                 self.perf_drum_kind.setCurrentText(dk)
                 said.append(f"drum kind {dk}")
+        if self.perf_auto_material.isChecked() and random.random() < C["material"]:
+            drawn = self._auto_song_material()
+            if drawn:
+                said.append(drawn)
         first_ok, last_ok = max(1.0, cur + 0.5), float(T - 2)
         events = []
         stems = [s for s, _w in C["mute_stems"]]
@@ -10242,6 +10382,34 @@ All three sit next to the program.</li>
             f"auto song: {how}{' ' + kind if kind else ''} at bar {T}"
             + (f" ({', '.join(said)})" if said else "")
             + (f"; {len(events)} move(s) on the way" if events else ""))
+
+    def _auto_song_material(self):
+        """Auto material: the material's tree (the samples, or the videos
+        when they are the material) ticked anew, one to four of its files
+        at random (AUTO_SONG["material_n"]), the rest unticked; takes as the
+        material are left alone. The next section renders from it (the
+        key changes, _perf_refresh_ready). Returns a word for the log, or
+        None when nothing was drawn."""
+        key = self._perf_material_key()
+        if key is None or key[0] != "samples":
+            return None
+        tree = self.samples_tree if key[1] else self.videos_tree
+        leaves = tree._leaves()
+        if not leaves:
+            return None
+        C = AUTO_SONG
+        n = random.choices([k for k, _w in C["material_n"]], [w for _k, w in C["material_n"]])[0]
+        pick = set(random.sample(range(len(leaves)), min(n, len(leaves))))
+        tree._loading = True                           # one save, one changed signal
+        try:
+            for i, it in enumerate(leaves):
+                it.setCheckState(0, Qt.Checked if i in pick else Qt.Unchecked)
+        finally:
+            tree._loading = False
+        tree._on_changed()
+        what = "videos" if tree is self.videos_tree else "samples"
+        names = ", ".join(tree.name(leaves[i].data(0, Qt.UserRole)) for i in sorted(pick))
+        return f"{what} <- {names}"
 
     def _auto_song_tick(self, pl):
         """Every poll while a section plays: the bars since the plan's
@@ -11063,8 +11231,9 @@ All three sit next to the program.</li>
             self.backdrop.override_ab = 1.0
         if pl is None or not pl.playing:
             if self._perf_sounding:                    # our section just stopped (on the bar,
-                self._perf_sounding = False            # or the output closed): the peers stop
-                self._link_transport(False)            # with it; idling alone sends nothing
+                self._perf_sounding = False            # or the output closed): the clock and
+                self._clock_run = False                # the peers stop with it (the engine's
+                self._link_transport(False)            # Stop left on the clear)
                 self._auto_fx_idle()                   # the engine's moves off, the grid as set
                 self._auto_song_stop()                 # nothing to conduct until the next one
                 if "ui" in self._rep_sources:          # the latched repeat ends with it
@@ -11083,20 +11252,34 @@ All three sit next to the program.</li>
                     else self.perf_ab.value() / 100.0  # without a stream, the slider
             if self._perf_playing is not None and pl is None:
                 self._perf_playing = None
+            if pl is None:
+                self._clock_run = False                # no stream: no transport
             wait = pl.waiting_for() if pl is not None else None
-            if wait is not None:                       # a timed start: Link's bar
+            if wait is not None:                       # a timed start: the clock's or Link's bar
                 self.perf_status.setText(
-                    f"starts on the Link bar in {max(0.0, wait - time.monotonic()):.1f} s...")
-                self.perf_meter.set_state("waiting for the Link bar...")
+                    f"starts on the bar in {max(0.0, wait - time.monotonic()):.1f} s...")
+                self.perf_meter.set_state("waiting for the bar...")
             elif self._perf_busy:
                 self.perf_status.setText("rendering...")
                 self.perf_meter.set_state("rendering...")
+            elif self._clock_run:
+                self.perf_status.setText("clock running, N for a section")
+                self.perf_meter.set_state("clock running")
             else:
                 self.perf_meter.set_state("no section")
             base = "play" if self._perf_current is None else "next section"
             txt = f"{base}: rendering... (N)" if self._perf_busy else f"{base} (N)"
             if self.perf_next_btn.text() != txt:         # the render's word on the button here too
                 self.perf_next_btn.setText(txt)
+            # the stop button: a press stops what is on its way, else starts
+            # the clock (the engine's proxy shows `pending` as a bare True,
+            # never the tuple: a timed start is read off waiting_for())
+            if self._clock_run or wait is not None:
+                stop_txt = "stop clock"                      # the clock runs, or a start is on its way
+            else:
+                stop_txt = "start clock"
+            if self.perf_stop_btn.text() != stop_txt:
+                self.perf_stop_btn.setText(stop_txt)
             return
         self._perf_sounding = True
         if pl.swapped:                                 # the live clock follows the loop
@@ -11162,6 +11345,8 @@ All three sit next to the program.</li>
         txt = f"next section: {state} (N)" if state else "next section (N)"
         if self.perf_next_btn.text() != txt:
             self.perf_next_btn.setText(txt)
+        if self.perf_stop_btn.text() != "stop clock":    # playing: a press stops it, and the section
+            self.perf_stop_btn.setText("stop clock")
         note = self._auto_song_note(pl)
         if note:
             ready = f"{ready}  ·  {note}" if ready else note
@@ -11911,6 +12096,8 @@ All three sit next to the program.</li>
             elif pl is not None and (pl.playing or pl.pending is not None):
                 self.log.appendPlainText("link: stop, the section stops on the bar")
                 self.perform_stop()
+            elif self._clock_run:
+                self._clock_stop("link")
         self._link_ticks += 1
         if self._link_ticks % 4 == 0:
             peers = self.link.peers
@@ -12160,6 +12347,10 @@ All three sit next to the program.</li>
         # kaleidoscope: strength is the chance a section gets it
         kal = self.vfx["kaleido"].value() if self.vfx_on["kaleido"].isChecked() else 0.0
         self._kaleido = random.choice([4, 6, 8]) if random.random() < kal else 0
+        # slit-scan: the ramp per section, down the picture most often
+        # (the classic), else across it, out from the centre, or by
+        # brightness; reversed now and then
+        self._slit = (random.choice([0, 0, 0, 1, 2, 3]), random.random() < 0.3)
         if self.shader.currentText() == "random":
             self._pick_section_shader()
         # mono: hard tones with probability = strength, else smooth gray
@@ -12454,6 +12645,11 @@ All three sit next to the program.</li>
             st["zoom"] = 0.3 * lk("zoom") * env
         if lk("trails"):
             st["trails"] = min(1.0, lk("trails"))
+        if lk("slit"):
+            # how deep in time, breathing with the loudness (idle: the
+            # per-beat pulse), all the way on a drop
+            depth = min(1.0, lk("slit")) * (0.55 + 0.45 * env)
+            st["slit"] = (min(1.0, depth + drop), self._slit[0], self._slit[1])
         if lk("glitch"):
             st["glitch"] = min(1.0, lk("glitch")) * (0.3 + 0.7 * env)
             st["glitch_mode"] = self._glitch_mode

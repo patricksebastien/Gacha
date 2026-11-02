@@ -111,6 +111,9 @@ class Knobs:
     sub_release: float = 1.5          # seconds of release after a one-beat hold
     sub_follow: bool = False          # per bar: the sub on the bar's own pitch (the key's
                                       # tonic, fifth, fourth or relative), not the roll
+    kit_listen: bool = True           # the kit cut where each drum is heard in the samples
+                                      # (the bassiest onset for the kick...), see sample_hits;
+                                      # False = at the loudest transient of random samples
     # sections
     break_chance: float = 0.25        # a middle section becomes a break
     section_bars: list = field(
@@ -168,6 +171,7 @@ class Knobs:
         k.fx_max = max(k.fx_min, k.fx_max)
         if k.synth_style not in SYNTH_STYLES:
             k.synth_style = "auto"
+        k.kit_listen = bool(k.kit_listen)
         if k.random_start is True:                 # older job files used a bool
             k.random_start = "all"
         if k.random_start not in RANDOM_START_MODES:
@@ -338,6 +342,165 @@ def strongest_onset(clip):
         return 0
     env = np.convolve(m, np.ones(256) / 256, mode="same")
     return max(0, int(np.argmax(env)) - 128)
+
+
+# ---- listening: where in a sample each drum should be cut from ---------
+# The loudest transient of a tape is nearly always a broadband mid event,
+# so a kit cut there leans mid-high whatever the filters do afterwards:
+# the kick's lowpass cannot invent lows the chunk never had. With the
+# "listen" tick (Knobs.kit_listen, the default) every sample is scanned for
+# its onsets, the 80 ms after each is weighed (how much of it sits under
+# 150 Hz, where its spectral centre is, how noisy it is, how much it jumps
+# out of what follows), and each drum picks the onset, and the sample,
+# that sounds most like it: the bassiest hit for the kick, a noisy one
+# around 1 kHz for the snare, the brightest for the hats and the ride. The
+# kick's lowpass then sits just over the low peak it found. Off, the kit
+# is cut at the loudest transient of samples drawn at random, as before.
+HIT_WINDOW_S = 0.08        # analysed after an onset
+HIT_SPACING_S = 0.05       # two onsets at least this far apart
+HIT_CANDIDATES = 48        # the loudest onsets per sample that get weighed
+HIT_LOW_HZ = 150.0         # "low" is under this
+HIT_PICK_FROM = 4          # a drum draws its sample among this many of the best
+_hit_cache = {}            # sample fingerprint -> [Hit], see sample_hits
+
+
+@dataclass
+class Hit:
+    """One candidate drum hit in a sample: where, and what it sounds like."""
+    start: int              # sample index to cut at (the onset, a touch early)
+    loud: float             # its envelope peak against the sample's loudest, 0..1
+    low: float              # share of the window's energy under HIT_LOW_HZ, 0..1
+    centroid: float         # the window's spectral centre, Hz
+    flat: float             # spectral flatness 200 Hz-16 kHz, 0..1 (1 = white noise)
+    punch: float            # the peak over the window's mean, 0..1 (1 = a lone click)
+    low_hz: float           # the strongest bin under 200 Hz, the kick's fundamental
+
+
+def _clip_fingerprint(clip):
+    sub = np.ascontiguousarray(clip[::1024])
+    return (len(clip), hashlib.blake2b(sub.tobytes(), digest_size=8).digest())
+
+
+def sample_hits(clip):
+    """The candidate drum hits of a sample, its loudest onsets weighed
+    (see Hit), loudest first; [] for a clip too short or silent. Cached
+    on a fingerprint of the clip, so a bank is listened to once."""
+    key = _clip_fingerprint(clip)
+    got = _hit_cache.get(key)
+    if got is None:
+        got = _listen(clip)
+        if len(_hit_cache) >= 1024:
+            _hit_cache.clear()
+        _hit_cache[key] = got
+    return got
+
+
+def _listen(clip):
+    from scipy.signal import find_peaks
+    sig = mono(clip).astype("float64")
+    n = len(sig)
+    if n < 512:
+        return []
+    env = np.convolve(np.abs(sig), np.ones(256) / 256, mode="same")
+    top = float(env.max())
+    if top <= 1e-6:
+        return []
+    hop = 256                                   # the envelope by blocks of 5.8 ms
+    nb = n // hop
+    blocks = env[: nb * hop].reshape(nb, hop).max(axis=1)
+    spacing = max(1, int(HIT_SPACING_S * SR) // hop)
+    peaks, props = find_peaks(blocks, distance=spacing, height=0.05 * top)
+    if len(peaks) == 0:
+        peaks = np.array([int(np.argmax(blocks))])
+        props = {"peak_heights": np.array([top])}
+    order = np.argsort(props["peak_heights"])[::-1][:HIT_CANDIDATES]
+    win = int(HIT_WINDOW_S * SR)
+    hann = np.hanning(win)
+    freqs = np.fft.rfftfreq(win, 1.0 / SR)
+    low_band = freqs < HIT_LOW_HZ
+    mid_band = (freqs >= 200.0) & (freqs <= 16000.0)
+    fund_band = (freqs >= 30.0) & (freqs < 200.0)
+    hits = []
+    for b in peaks[order]:
+        b = int(b)
+        i = b * hop + int(np.argmax(env[b * hop:(b + 1) * hop]))
+        start = max(0, i - 128)
+        w = sig[start:start + win]
+        if len(w) < win:
+            w = np.concatenate([w, np.zeros(win - len(w))])
+        P = np.abs(np.fft.rfft(w * hann)) ** 2
+        tot = float(P.sum())
+        if tot <= 1e-12:
+            continue
+        low = float(P[low_band].sum() / tot)
+        centroid = float((freqs * P).sum() / tot)
+        band = P[mid_band] + 1e-18
+        flat = float(np.exp(np.mean(np.log(band))) / np.mean(band))
+        seg = env[start:start + win]
+        ratio = float(env[i] / (seg.mean() + 1e-12))
+        punch = max(0.0, 1.0 - 1.0 / max(1.0, ratio))
+        fund = freqs[fund_band][int(np.argmax(P[fund_band]))]
+        hits.append(Hit(start, float(env[i] / top), low, centroid, flat, punch, float(fund)))
+    return hits
+
+
+def _snare_like(centroid):
+    """How close a spectral centre is to a snare's, around 1.2 kHz, one
+    octave either way as the width."""
+    return math.exp(-0.5 * math.log2(max(20.0, centroid) / 1200.0) ** 2)
+
+
+def _bright(centroid):
+    """0 at 1.5 kHz and under, 1 at 12 kHz and over, by octaves."""
+    return min(1.0, max(0.0, math.log2(max(20.0, centroid) / 1500.0) / 3.0))
+
+
+def hit_score(hit, role):
+    """How much a candidate sounds like `role`, 0..1-ish: the kick wants
+    the lows and a punch, the snare a noisy mid band and a punch, the
+    hats brightness and a punch, the ride brightness and some sustain."""
+    loud = 0.4 + 0.6 * hit.loud
+    if role == "kick":
+        return hit.low * loud * (0.5 + 0.5 * hit.punch)
+    if role == "snare":
+        noisy = 0.5 + 0.5 * min(1.0, hit.flat * 3.0)
+        return _snare_like(hit.centroid) * noisy * loud * (0.5 + 0.5 * hit.punch)
+    if role == "ride":
+        return _bright(hit.centroid) * loud * (1.0 - 0.5 * hit.punch)
+    return _bright(hit.centroid) * loud * (0.5 + 0.5 * hit.punch)       # hihat, ohat
+
+
+def best_hit(clip, role):
+    """(the sample's best candidate for `role`, its score); (None, 0.0)
+    when it has none."""
+    best, best_s = None, 0.0
+    for h in sample_hits(clip):
+        sc = hit_score(h, role)
+        if best is None or sc > best_s:
+            best, best_s = h, sc
+    return best, best_s
+
+
+def pick_source(rng, bank, pool, role):
+    """A sample for `role` by listening: every sample in `pool` is ranked by
+    its best candidate's score, and one of the HIT_PICK_FROM best is drawn,
+    the better the likelier, so two seeds still give two kits. Returns
+    (name, hit), the hit None for a sample with no onsets to weigh."""
+    ranked = []
+    for name in pool:
+        hit, sc = best_hit(bank[name], role)
+        ranked.append((-sc, name, hit))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    top = ranked[:max(1, HIT_PICK_FROM)]
+    weights = [max(1e-6, -sc) for sc, _n, _h in top]
+    _s, name, hit = rng.choices(top, weights=weights)[0]
+    return name, hit
+
+
+def hit_start(clip, hit):
+    """Where a kit entry's sample was cut: the hit's onset, or the
+    loudest transient without one."""
+    return hit.start if hit is not None else strongest_onset(clip)
 
 
 def panned(clip, p):
@@ -768,15 +931,22 @@ def grain_cloud(rng, clip, n, grains, grain_ms=(2.0, 8.0)):
     return out / peak if peak > 0 else out
 
 
-def carve_drum(rng, clip, role):
-    """Cut a short chunk from any sample and sculpt it into a drum hit."""
-    start = strongest_onset(clip)
+def carve_drum(rng, clip, role, hit=None):
+    """Cut a short chunk from any sample and sculpt it into a drum hit: at
+    `hit` (a listened-for onset, see sample_hits) or, without one, at the
+    loudest transient. A listened-for kick's lowpass sits just over the
+    low peak the hit was picked for, so the body it has is kept."""
+    start = hit_start(clip, hit)
     if role in ("hihat", "ohat"):
         return carve_hat(rng, clip, start, open_=(role == "ohat"))
     if role == "kick":
         length = rng.uniform(0.12, 0.28)
+        if hit is None:
+            cutoff = rng.uniform(120, 300)
+        else:
+            cutoff = min(300.0, max(90.0, hit.low_hz * rng.uniform(1.6, 2.6)))
         board = Pedalboard([
-            LowpassFilter(cutoff_frequency_hz=rng.uniform(120, 300)),
+            LowpassFilter(cutoff_frequency_hz=cutoff),
             Distortion(drive_db=rng.uniform(6, 18)),
             Gain(gain_db=6),
         ])
@@ -2293,7 +2463,7 @@ def compose(seed, duration, sample_files, intro_bars=None,
     kit = {}
     kit_src = {}                  # role -> [(sample name, onset sample)] per variant
     kit_sources = set()
-    hat_sources = []
+    hat_sources = []              # [(sample name, Hit | None)]
     for role in ("kick", "snare", "hihat", "ride"):
         variants = []
         kit_src[role] = []
@@ -2302,19 +2472,23 @@ def compose(seed, duration, sample_files, intro_bars=None,
         want = gains[role] > 0 or (role == "hihat" and gains["ohat"] > 0)
         for _ in range((1 if role == "ride" else rng.randint(1, 3)) if want else 0):
             pool = [n for n in names if n not in kit_sources] or names
-            src = rng.choice(pool)
+            if k.kit_listen:          # the sample, and the spot, that sound like the drum
+                src, hit = pick_source(rng, bank, pool, role)
+            else:
+                src, hit = rng.choice(pool), None
             kit_sources.add(src)
             used.add(src)
-            variants.append(velocity_layers(carve_drum(rng, bank[src], role)))
-            kit_src[role].append((src, strongest_onset(bank[src])))
+            variants.append(velocity_layers(carve_drum(rng, bank[src], role, hit)))
+            kit_src[role].append((src, hit_start(bank[src], hit)))
             if role == "hihat":
-                hat_sources.append(src)
-            print(f"  {role:6s} <- {src}")
+                hat_sources.append((src, hit))
+            print(f"  {role:6s} <- {src}"
+                  + (f" @ {hit.start / SR:.2f}s" if hit is not None else ""))
         kit[role] = variants
     # the open hat is the same instrument as the closed one: same sources
-    kit["ohat"] = [velocity_layers(carve_drum(rng, bank[src], "ohat"))
-                   for src in hat_sources]
-    kit_src["ohat"] = [(src, strongest_onset(bank[src])) for src in hat_sources]
+    kit["ohat"] = [velocity_layers(carve_drum(rng, bank[src], "ohat", hit))
+                   for src, hit in hat_sources]
+    kit_src["ohat"] = [(src, hit_start(bank[src], hit)) for src, hit in hat_sources]
     # synthesized kit, layered at its own levels (all 0 by default)
     synth = {}
     if any(v > 0 for v in sgains.values()):

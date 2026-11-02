@@ -74,6 +74,7 @@ occasional over- or underrun over long runs is normal.
     la.stats()                             # peaks, load, drops, latency
     la.midi_out = MidiOut()                # the drum hits as notes (gacha_midi)
     la.midi_lead_ms = 25.0                 # sent this early: the receiver's latency
+    la.clock_cmd = ("start", t0)           # the clock alone: a MIDI Start on that bar; ("stop",)
 
 MIDI out: every drum hit of the section and the song is in their event
 timelines (role, time, velocity), rendered before it sounds, so the block
@@ -1811,6 +1812,12 @@ class LiveAudio:
         self._limiter = Limiter(threshold_db=-1.0, release_ms=100.0)
         self.freeze = Freeze(self.sr)        # the master freeze (gacha_freeze): .held from any thread
         self.metro = Metronome(self.sr)      # the metronome (gacha_metro): .on, .note, .anchor, .beat_s
+        # the clock's transport without a section (the GUI writes it): a
+        # ("start", bar_t0) puts a MIDI Start on that bar (monotonic, as
+        # heard), ("stop",) a Stop; the ticks follow the live clock's beat
+        # meanwhile (metro.anchor, smoothed: the stamp is coarse on Windows)
+        self.clock_cmd = None
+        self._clk = None                     # [downbeat in the MIDI time base, beat_s, anchor]
         self.inserts = None                  # gacha_vst.InsertChain on the master, or None
         # the drum hits as MIDI notes (see the module note): a gacha_midi.MidiOut
         self.midi_out = None
@@ -2506,23 +2513,50 @@ class LiveAudio:
         self._moved = set(per)
         self.move_values = {f"afx_{ch}_{k}": round(v, 3) for ch, d in per.items() for k, v in d.items()}
 
-    def _midi_sync(self, mo, heard, sr):
+    CLK_EMA = 0.02                 # the clock's downbeat smoothing: ~50 blocks to settle
+
+    def _midi_sync(self, mo, heard, sr, now, out_lat):
         """The MIDI clock's grid and the transport from this block: `heard`
         is when the block's first frame is heard, less the lead, the time
-        base the notes leave in. The section's beat grid while one plays
-        (a break included), the live tempo otherwise; Start on a section's
-        downbeat from silence (or the next bar, entered late), Stop on a
-        clear."""
+        base the notes leave in; `now` the block's monotonic stamp (the
+        clock's and a Link bar's base), `out_lat` the output latency. The
+        section's beat grid while one plays (a break included), the live
+        clock's beat otherwise (its downbeat as heard, smoothed); Start on
+        a section's downbeat from silence (or the next bar, entered late)
+        and on the clock's bar when the GUI starts the clock alone, Stop on
+        a clear and on the clock's stop."""
         pl = self.player
         bf = pl.beat_frames
+        bar_perf = heard - out_lat - now        # + a monotonic instant as heard = its MIDI due
         if pl.playing and bf and pl.grid_i0 is not None:
             r = pl.rate                               # the transport's rate: its beat
             beat_s = bf / (sr * r)
             b = (pl.grid_i0 // bf) * bf               # the beat this block sits in
             mo.grid(heard + pl.grid_lead / sr + (b - pl.grid_i0) / (sr * r), beat_s)
+            self._clk = None
         else:
-            beat_s = float(self.beat_s)
-            mo.grid(None, beat_s)
+            beat_s = float(self.metro.beat_s)         # the live clock (the GUI keeps it)
+            anchor = self.metro.anchor
+            if anchor is None or beat_s <= 0:
+                beat_s = float(self.beat_s)
+                mo.grid(None, beat_s)
+            else:
+                meas = bar_perf + anchor              # the clock's downbeat, this block's reading
+                c = self._clk
+                if c is None or c[1] != beat_s or c[2] != anchor:
+                    self._clk = c = [meas, beat_s, anchor]   # snapped: a tempo change, a tap,
+                else:                                 # a downbeat, the clock's start
+                    c[0] += self.CLK_EMA * (meas - c[0])
+                mo.grid(c[0], beat_s)
+        cmd, self.clock_cmd = self.clock_cmd, None
+        if cmd is not None:
+            if cmd[0] == "start" and beat_s > 0:
+                due = bar_perf + float(cmd[1])
+                while due < heard - beat_s:           # a bar gone by: the next one
+                    due += 4 * beat_s
+                mo.start(due)                         # a little late: sent at once, the
+            elif cmd[0] == "stop":                    # ticks catch up within the beat
+                mo.stop()
         if pl.started is not None:
             lead, pos = pl.started
             pl.started = None
@@ -2654,7 +2688,9 @@ class LiveAudio:
         # before it keep what was audible, those from it on take the new state
         sw_off = self._land_switches(self.player.grid_off)
         if midi or (mo is not None and mo.mirrored):   # a mirror (the Erae) wants the grid too
-            self._midi_sync(mo, t_block + out_lat - lead_s, sr)
+            self._midi_sync(mo, t_block + out_lat - lead_s, sr, now, out_lat)
+        elif self.clock_cmd is not None:
+            self.clock_cmd = None                     # no port: a Start kept would fire stale
         if midi and (self.mc_moves is not None or self._mc_next is not None or self._mc_rt):
             self._run_mc(mo, t_block + out_lat - lead_s + L / sr, bs, L, sr)   # auto fx m:c
         if midi and (self.player.hits or self.song.hits or self.pad_hits):

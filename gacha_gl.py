@@ -55,6 +55,7 @@ GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER = 0x2801, 0x2800
 GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T = 0x2802, 0x2803
 GL_LINEAR, GL_CLAMP_TO_EDGE = 0x2601, 0x812F
 GL_FRAMEBUFFER = 0x8D40
+GL_TEXTURE_2D_ARRAY = 0x8C1A
 
 BLEND_MODES = ["mix", "add", "screen"]
 
@@ -64,7 +65,10 @@ BLEND_MODES = ["mix", "add", "screen"]
 # the canvas or works over the whole screen, the background included
 KEEP_FX = ["color", "tint", "pump", "flash", "pixel", "bits", "dither", "mono", "solar",
            "edges", "lines", "grain", "zoom", "trails", "glitch", "rgb", "vign",
-           "kaleido"]
+           "kaleido", "slit"]
+# the slit-scan's history: the last SLIT_N decoded frames, each shrunk to
+# SLIT_W wide (44 MB at 16:9), a ring in a 2D array texture
+SLIT_N, SLIT_W = 48, 640
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 CANVAS_FITS = ["fill", "fit"]
 CANVAS_DEFAULT = {"fit": "fill", "crop": (0.0, 0.0, 0.0, 0.0), "x": 0.0, "y": 0.0,
@@ -236,6 +240,12 @@ uniform float uBrightness, uSaturation, uHue, uTintHue, uTintAmt, uInvert;
 uniform float uBits, uDither, uMonoTones, uMonoThr, uSolar, uEdges, uScan;
 uniform float uGrain, uVign, uPixel, uRgbShift, uGlitch, uGlitchMode, uTrails, uZoom;
 uniform float uKaleido, uRepeat, uRepeatK, uRepeatFrac, uSwell;
+// slit-scan: every pixel reads the frame `ramp x depth` frames back
+uniform sampler2DArray uSlitHist;   // the last SLIT_N decoded frames, a ring
+uniform float uSlit, uSlitMode, uSlitFlip;   // depth 0..1 (0 = off), the ramp, reversed
+uniform int uSlitHead, uSlitCount;           // the ring's next slot, frames held
+const int SLIT_N = //@SLIT_N;
+float gSlitR = 0.0;      // the ramp under this pixel: 0 now .. 1 the deepest, set by main
 // source grade (colour correction of the picture itself, before any effect)
 uniform float uGExposure, uGBlack, uGGamma, uGContrast, uGSat, uGWarm, uGTint, uGSharpen;
 uniform float uAB;             // 0 = the live picture, 1 = the take frame
@@ -264,8 +274,37 @@ vec3 ap(int k, vec3 col, vec3 e, float ins) { return keep(k) ? mix(col, e, ins) 
 // plain dissolve, add and screen superimpose the two at full strength
 // halfway (each side fades in over the first half of its travel and out
 // over the second), add clipping bright on bright, screen never clipping.
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+// the picture d frames back (0 = the newest held, the frame on uVideo),
+// the two nearest frames mixed; a history shorter than d gives its oldest
+vec3 hist(vec2 pv, float d) {
+    d = clamp(d, 0.0, float(max(uSlitCount, 1) - 1));
+    float f = floor(d);
+    int l0 = (uSlitHead - 1 - int(f) + 2 * SLIT_N) % SLIT_N;
+    int l1 = (l0 - 1 + SLIT_N) % SLIT_N;
+    vec3 a = texture(uSlitHist, vec3(pv, float(l0))).rgb;
+    vec3 b = texture(uSlitHist, vec3(pv, float(l1))).rgb;
+    return mix(a, b, d - f);
+}
+// the live picture at pv: now, or, under the slit-scan, as it was some
+// frames ago: the ramp (down the picture, across it, out from the centre
+// as main set it, or by brightness: the bright parts now, the dark ones
+// the past) times the depth, in frames; within the first frame the full
+// resolution picture fades to the history
+vec3 live(vec2 pv) {
+    vec3 now = texture(uVideo, pv).rgb;
+    if (uSlit <= 0.0 || uSlitCount < 2) return now;
+    float r = gSlitR;
+    if (uSlitMode > 2.5) r = 1.0 - luma(now);
+    if (uSlitFlip > 0.5) r = 1.0 - r;
+    float d = clamp(r, 0.0, 1.0) * uSlit * float(SLIT_N - 1);
+    if (d < 1.0) return mix(now, hist(pv, 1.0), d);
+    return hist(pv, d);
+}
+
 vec3 src(vec2 pv, vec2 pt) {
-    vec3 a = texture(uVideo, pv).rgb;
+    vec3 a = live(pv);
     if (uAB <= 0.0) return a;
     vec3 b = texture(uTake, pt).rgb;
     if (uABMode < 0.5) return mix(a, b, uAB);
@@ -289,7 +328,6 @@ vec3 grade(vec3 c) {
 }
 
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
 vec3 hueRotate(vec3 c, float turns) {
     float a = 6.2831853 * turns, co = cos(a), si = sin(a);
@@ -415,6 +453,18 @@ void main() {
     if (uPixel > 0.0 && keep(K_PIXEL)) z = pixelate(z, vec2(uPixel, uPixel * aspect) * uZoneK);
     if (uGlitch > 0.0 && keep(K_GLITCH)) z = glitch(z, uZoneK.x);
     z = clamp(z, 0.0, 1.0);
+    // the slit-scan's ramp: down the picture (the top now, the bottom the
+    // past), across it (the left now) or out from the centre; on the
+    // canvas alone, or down the whole screen with the picture a part of it
+    if (uSlit > 0.0) {
+        vec2 q = keep(K_SLIT) ? z : s;
+        float qa = keep(K_SLIT) ? zaspect : aspect;
+        float r;
+        if (uSlitMode < 0.5)      r = 1.0 - q.y;
+        else if (uSlitMode < 1.5) r = q.x;
+        else r = length((q - 0.5) * vec2(qa, 1.0)) / length(vec2(qa, 1.0) * 0.5);
+        gSlitR = clamp(r, 0.0, 1.0);
+    }
     vec3 col;
     if (uRgbShift > 0.0) {                           // chromatic aberration
         vec2 d = vec2(uRgbShift, 0.0);
@@ -486,7 +536,7 @@ void main() {
     fragColor = vec4(col, 1.0);
 }
 """.replace("//@KEEP", "\n".join(f"const int K_{k.upper()} = {i};" for i, k in enumerate(KEEP_FX))) \
-   .replace("//@ZONE", ZONE_GLSL)
+   .replace("//@ZONE", ZONE_GLSL).replace("//@SLIT_N", str(SLIT_N))
 
 # Final pass: video layer + generative layer + the legibility scrim. A
 # shader that kept to the canvas was drawn at the canvas's own size and is
@@ -816,6 +866,10 @@ class GLBackdrop(QOpenGLWidget):
         self._fbo_gen = [None, None]      # the shader layer's pair: the screen's size,
         self._gen_size = None             # or the canvas's for a shader keeping to it
         self._fbo_zone = None             # the canvas cut out of the effects pass, then
+        self._slit_tex = None             # the slit-scan's ring of past frames (a 2D array)
+        self._slit_size = None
+        self._fbo_slit = None             # the frame shrunk into it
+        self._slit_head = self._slit_count = 0
         self._ping = 0
         self._has_prev = False
         self._fbo_size = None
@@ -841,6 +895,9 @@ class GLBackdrop(QOpenGLWidget):
         self._fbo_fx = [None, None]
         self._fbo_gen = [None, None]
         self._fbo_zone = None
+        if self._slit_tex is not None:
+            self._slit_tex.destroy()
+        self._slit_tex = self._fbo_slit = None
         self._gen_size = None
         self._gen_prog = None
         self.doneCurrent()
@@ -985,6 +1042,43 @@ class GLBackdrop(QOpenGLWidget):
         ta = tw / th
         return (aspect / ta, 1.0) if ta > aspect else (1.0, ta / aspect)
 
+    def _slit_push(self):
+        """The live picture, shrunk to SLIT_W wide, into the next slot of
+        the slit-scan's ring: one small pass and a copy per decoded frame,
+        kept whether or not the effect is on so a tick shows the past at
+        once. The ring is remade (and emptied) when the picture's shape
+        changes."""
+        gl = self.gl
+        vw, vh = self._vid_size
+        size = (SLIT_W, max(1, int(round(SLIT_W * vh / max(1, vw)))))
+        if self._slit_tex is None or self._slit_size != size:
+            if self._slit_tex is not None:
+                self._slit_tex.destroy()
+            tex = QOpenGLTexture(QOpenGLTexture.Target2DArray)
+            tex.setFormat(QOpenGLTexture.RGBA8_UNorm)
+            tex.setSize(*size)
+            tex.setLayers(SLIT_N)
+            tex.allocateStorage()
+            tex.setMinMagFilters(QOpenGLTexture.Linear, QOpenGLTexture.Linear)
+            tex.setWrapMode(QOpenGLTexture.ClampToEdge)
+            self._slit_tex, self._slit_size = tex, size
+            self._fbo_slit = QOpenGLFramebufferObject(*size)
+            self._slit_head = self._slit_count = 0
+        self._fbo_slit.bind()
+        gl.glViewport(0, 0, *size)
+        x = self._extract
+        x.bind()
+        self._bind_tex(0, self._video_tex.textureId())
+        x.setUniformValue1i("uFx", 0)
+        x.setUniformValue("uToScreen", _mat3(np.eye(3)))
+        self._draw()
+        gl.glBindTexture(GL_TEXTURE_2D_ARRAY, self._slit_tex.textureId())
+        gl.glCopyTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, self._slit_head,
+                               0, 0, *size)
+        gl.glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+        self._slit_head = (self._slit_head + 1) % SLIT_N
+        self._slit_count = min(SLIT_N, self._slit_count + 1)
+
     def _bind_tex(self, unit, tex_id):
         self.gl.glActiveTexture(GL_TEXTURE0 + unit)
         self.gl.glBindTexture(GL_TEXTURE_2D, tex_id)
@@ -1021,6 +1115,7 @@ class GLBackdrop(QOpenGLWidget):
         # the B layer: a take frame or burst set by the window, else the
         # second input (the webcam) when it stands in for them
         ov = self.override
+        new_frame = False                        # a frame went up this paint
         if ov is None:
             ov = self.second_frame()
         if ov is not None and ov.img is not None and ov is not self._shown_ov \
@@ -1038,6 +1133,7 @@ class GLBackdrop(QOpenGLWidget):
                     and not self._frozen:
                 self._upload_frame(fr.img)
                 self._shown = fr                 # keeps fr.arr alive with it
+                new_frame = True
         # the background: a photo (uploaded once), a clip's frames as they
         # come, or nothing (the colour)
         bg = None
@@ -1065,6 +1161,8 @@ class GLBackdrop(QOpenGLWidget):
             take, ab = vid, 0.0
         self._ensure_fbos()
         W, H = self._fbo_size
+        if new_frame or (self._slit_count == 0 and self._video_tex is not None):
+            self._slit_push()                # the slit-scan's history, always kept
         now = time.monotonic()
         dt = now - self._last_t
         self._last_t = now
@@ -1102,6 +1200,10 @@ class GLBackdrop(QOpenGLWidget):
         p.setUniformValue("uCrop", float(l), float(r), float(tp), float(bt))
         self._bind_tex(3, self._bg_tex.textureId() if bg_on else 0)
         p.setUniformValue1i("uBg", 3)
+        gl.glActiveTexture(GL_TEXTURE0 + 4)
+        gl.glBindTexture(GL_TEXTURE_2D_ARRAY,
+                         self._slit_tex.textureId() if self._slit_tex is not None else 0)
+        p.setUniformValue1i("uSlitHist", 4)
         p.setUniformValue1f("uBgOn", 1.0 if bg_on else 0.0)
         p.setUniformValue("uBgRes", QVector2D(*(self._bg_size if bg_on else (1, 1))))
         cr, cg, cb = self.background.get("colour", BG_DEFAULT["colour"])
@@ -1249,3 +1351,9 @@ class GLBackdrop(QOpenGLWidget):
         f("uRepeatK", float(rpt[0]) if rpt else 0.0)
         f("uRepeatFrac", float(rpt[1]) if rpt else 0.0)
         f("uSwell", float(g("swell", 0.0)))
+        slit = g("slit")                    # (depth 0..1, ramp 0..3, reversed)
+        f("uSlit", float(slit[0]) if slit else 0.0)
+        f("uSlitMode", float(slit[1]) if slit else 0.0)
+        f("uSlitFlip", 1.0 if slit and slit[2] else 0.0)
+        p.setUniformValue1i("uSlitHead", int(self._slit_head))
+        p.setUniformValue1i("uSlitCount", int(self._slit_count))

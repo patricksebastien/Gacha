@@ -141,16 +141,24 @@ class Material:
                 if not self.names:
                     break
                 pool = [n for n in self.names if n not in kit_sources] or self.names
-                src = rng.choice(pool)
+                src, hit = self._draw(rng, pool, role)
                 kit_sources.add(src)
-                variants.append(E.velocity_layers(E.carve_drum(rng, self.bank[src], role)))
-                srcs.append((src, E.strongest_onset(self.bank[src])))
+                variants.append(E.velocity_layers(E.carve_drum(rng, self.bank[src], role, hit)))
+                srcs.append((src, E.hit_start(self.bank[src], hit)))
                 if role == "hihat":
-                    hat_sources.append(src)
+                    hat_sources.append((src, hit))
             self.kit[role], self.kit_src[role] = variants, srcs
-        self.kit["ohat"] = [E.velocity_layers(E.carve_drum(rng, self.bank[s], "ohat"))
-                            for s in hat_sources]
-        self.kit_src["ohat"] = [(s, E.strongest_onset(self.bank[s])) for s in hat_sources]
+        self.kit["ohat"] = [E.velocity_layers(E.carve_drum(rng, self.bank[s], "ohat", hit))
+                            for s, hit in hat_sources]
+        self.kit_src["ohat"] = [(s, E.hit_start(self.bank[s], hit)) for s, hit in hat_sources]
+
+    def _draw(self, rng, pool, role):
+        """A sample for `role` out of `pool`, as (name, hit): by listening
+        (the knobs' kit_listen, see gacha_engine.sample_hits) the one that
+        sounds like the drum and where; else any, cut at its loudest."""
+        if self.k.kit_listen:
+            return E.pick_source(rng, self.bank, pool, role)
+        return rng.choice(pool), None
 
     @property
     def ok(self):
@@ -178,10 +186,10 @@ class Material:
                 pool = [n for n in self.names if n not in current] or self.names
                 variants, srcs = [], []
                 for _ in range(len(base)):
-                    src = rng.choice(pool)
+                    src, hit = self._draw(rng, pool, role)
                     pool = [n for n in pool if n != src] or pool   # the variants apart, as the kit's
-                    variants.append(E.velocity_layers(E.carve_drum(rng, self.bank[src], role)))
-                    srcs.append((src, E.strongest_onset(self.bank[src])))
+                    variants.append(E.velocity_layers(E.carve_drum(rng, self.bank[src], role, hit)))
+                    srcs.append((src, E.hit_start(self.bank[src], hit)))
                 got = (variants, srcs)
             self._kits[key] = got
         return got
